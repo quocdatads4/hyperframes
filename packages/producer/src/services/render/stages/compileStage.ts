@@ -70,6 +70,11 @@ export async function runCompileStage(input: CompileStageInput): Promise<Compile
   const compiled = await compileForRender(projectDir, htmlPath, join(workDir, "downloads"));
   assertNotAborted();
   const compileOnlyMs = Date.now() - compileStart;
+  // TODO(distributed-render): `applyRenderModeHints` mutates `cfg.forceScreenshot`
+  // on a caller-owned object. Before freezePlan wires up, this side-effect
+  // needs to move into the result (e.g. `forceScreenshot: boolean` on
+  // `CompileStageResult`) so the value can be baked into `LockedRenderConfig`
+  // and survive across processes / replays.
   applyRenderModeHints(cfg, compiled, log);
   writeCompiledArtifacts(compiled, workDir, Boolean(job.config.debug));
 
