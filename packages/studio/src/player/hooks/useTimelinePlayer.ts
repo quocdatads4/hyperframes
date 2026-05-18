@@ -59,7 +59,7 @@ export function useTimelinePlayer() {
   const iframeShortcutCleanupRef = useRef<(() => void) | null>(null);
   const lastTimelineMessageRef = useRef<number>(0);
   const staticSeekAdapterRef = useRef<{
-    player: RuntimePlaybackAdapter;
+    player: RuntimePlaybackAdapter | PlaybackAdapter;
     duration: number;
     adapter: PlaybackAdapter;
   } | null>(null);
@@ -125,10 +125,12 @@ export function useTimelinePlayer() {
         return playerAdapter;
       }
 
+      let timelineAdapter: PlaybackAdapter | null = null;
       if (win.__timeline) {
         const adapter = wrapTimeline(win.__timeline);
         const dur = getAdapterDuration(adapter);
         if (dur > 0 && docDuration <= dur) return adapter;
+        if (dur > 0) timelineAdapter ??= adapter;
       }
 
       if (win.__timelines) {
@@ -145,40 +147,44 @@ export function useTimelinePlayer() {
           const adapter = wrapTimeline(win.__timelines[key]);
           const dur = getAdapterDuration(adapter);
           if (dur > 0 && docDuration <= dur) return adapter;
+          if (dur > 0) timelineAdapter ??= adapter;
         }
       }
 
+      // The document timeline extends past every native adapter's duration.
+      // Wrap the best available adapter with the effective duration so the
+      // seek slider, seek clamping, and duration display cover the full range.
+      const bestAdapter = playerAdapter ?? timelineAdapter;
       const effectiveDuration = Math.max(
         usePlayerStore.getState().duration,
         docDuration,
         adapterDur,
       );
-      const baseAdapter = playerAdapter;
       if (
-        baseAdapter &&
+        bestAdapter &&
         effectiveDuration > 0 &&
-        (typeof baseAdapter.renderSeek === "function" || typeof baseAdapter.seek === "function")
+        ("renderSeek" in bestAdapter || typeof bestAdapter.seek === "function")
       ) {
         const cached = staticSeekAdapterRef.current;
-        if (cached?.player === baseAdapter && cached.duration === effectiveDuration) {
+        if (cached?.player === bestAdapter && cached.duration === effectiveDuration) {
           return cached.adapter;
         }
         cached?.adapter.pause();
         const adapter = createStaticSeekPlaybackAdapter(
-          baseAdapter,
+          bestAdapter,
           effectiveDuration,
           getDefaultStaticSeekPlaybackClock(win),
           () => usePlayerStore.getState().playbackRate,
         );
         staticSeekAdapterRef.current = {
-          player: baseAdapter,
+          player: bestAdapter,
           duration: effectiveDuration,
           adapter,
         };
         return adapter;
       }
 
-      return playerAdapter;
+      return bestAdapter;
     } catch (err) {
       console.warn("[useTimelinePlayer] Could not get playback adapter (cross-origin)", err);
       return null;
