@@ -18,7 +18,9 @@ export function Tooltip({ label, children, delay = 400, side = "top" }: TooltipP
     timerRef.current = setTimeout(() => {
       const el = triggerRef.current;
       if (!el) return;
-      const rect = el.getBoundingClientRect();
+      const child = el.firstElementChild as HTMLElement | null;
+      const rect = (child ?? el).getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) return;
       setPos({
         x: rect.left + rect.width / 2,
         y: side === "top" ? rect.top - 6 : rect.bottom + 6,
