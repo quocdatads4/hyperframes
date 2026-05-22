@@ -27,12 +27,14 @@ Score each item 1–5. If any item scores below 3, fix it before continuing. **D
 
 The skill ran for months on agents reading "REQUIRED" and skipping anyway. The verify script ends that — it computes facts the agent cannot fudge:
 
-- **Asset usage %** (assets referenced in compositions ÷ assets captured)
-- **Shader transitions consistency** (shaders declared in STORYBOARD.md vs shaders present in index.html)
-- **SFX timestamp drift** (storyboard `t=X.Xs` vs index.html `data-start=X.X`)
-- **animation-map.json existence**
-- **Rendered MP4 existence**
 - **Required artifacts present** (STORYBOARD.md, DESIGN.md, SCRIPT.md, index.html)
+- **Brand visuals used** — at least 1 beat must reference a captured `hero-*`, `image-*`, or `svgs/*.svg` asset (logo doesn't count). Catches the "9% asset usage / brand isn't visually present" failure.
+- **Headline font-size** — per-beat, the largest CSS `font-size` must be ≥80px. Catches the "headlines too small to read" failure that surfaces later as inspect `clipped_text` errors.
+- **Timeline coverage** — per-beat, GSAP event positions must span ≥70% of the beat's `data-duration`. Catches "webpage not shot" failures where the beat has entrance tweens then goes static.
+- **Shader transitions consistency** — shaders declared in STORYBOARD.md must appear in index.html (with HyperShader runtime present, not just as SFX file references).
+- **SFX timestamp drift** — storyboard `t=X.Xs` vs index.html `data-start=X.X`, picks the closest index timestamp per file for multi-timestamp SFX.
+- **Beat duration consistency** — storyboard's beat ranges (`B4 — Name | 16.600 – 21.000s |`) must match `data-duration` in index.html within ±0.5s. Catches storyboard staleness.
+- **Rendered MP4 existence** — INFO only; flagged when claiming verified motion without rendering.
 
 Run it as the LAST gate in your DoD pass, after fixing everything else:
 
