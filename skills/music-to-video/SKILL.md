@@ -48,6 +48,12 @@ Goal: Produce the one canonical timing analysis the whole video is built on.
 
 `analyze-beatgrid.py` is the **only** beat analyzer — never re-measure beats with another tool or by ear. It reads the track once and writes `audiomap.json`: energy phases (level / density / feel), onsets + `onset_rate`, rolls, silences, `hard_stops`, `key_moments`, phrases, tempo / grid, and `audio.duration_sec`. It's deterministic — the same file always gives the same map. Most fields are reliable on any music; `bpm` and `beats_sec` are reliable only when the music is genuinely rhythmic, and judging that is the call you make at Step 2.
 
+Prerequisites: Python 3 with `librosa`, `numpy`, and `soundfile` available. If import fails, install them into the active Python environment before running the analyzer:
+
+```bash
+python3 -m pip install librosa numpy soundfile
+```
+
 ```bash
 python3 <SKILL_DIR>/scripts/analyze-beatgrid.py "$PROJECT_DIR/assets/bgm.mp3" \
   -o "$PROJECT_DIR/audiomap.json" --print
@@ -185,7 +191,7 @@ music-to-video/
   references/   frame-skeleton.md · planning.md · storyboard-format.md
                 template-catalog.md · motion-primitive-catalog.md · montage.md
                 templates/<id>/          { index.html (+ assets/ · program.json) }  ← L1 catalog impls
-                motion-primitives/<id>/  { index.html } (+ shared assets/gsap.min.js) ← L0 catalog impls
+                motion-primitives/<id>/  { index.html } (+ ../assets/gsap.min.js shared by recipes) ← L0 catalog impls
   scripts/      analyze-beatgrid.py · assemble-index.mjs · validate-plan.mjs · stage-assets.mjs · lib/storyboard.mjs
   sub-agents/   frame-worker.md   ← the one subagent (one per frame)
 ```
