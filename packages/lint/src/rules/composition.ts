@@ -15,6 +15,14 @@ const MAX_COMPOSITION_LINES = 300;
 const MAX_TIMED_ELEMENTS_PER_TRACK = 3;
 const TRACK_DENSITY_EXEMPT_TAGS = new Set(["audio", "script", "style", "video"]);
 
+// `parseFloat("0.1") + parseFloat("0.2") = 0.30000000000000004`. Sub-second
+// authored adjacencies survive parse + add as a value a few ulps above the
+// next clip's start; a strict `>` fires the overlap rule on adjacencies that
+// are exact in the source HTML. 1μs sits ~11 orders of magnitude above the
+// observed drift (worst ~2e-16s across every realistic decimal pair) and 4
+// below one 60fps frame (~16.67ms), so this only ever swallows float slop.
+const OVERLAP_EPSILON_SECONDS = 1e-6;
+
 function countPhysicalLines(source: string): number {
   if (source.length === 0) return 0;
 
@@ -406,7 +414,7 @@ export const compositionRules: Array<(ctx: LintContext) => HyperframeLintFinding
         const current = clips[i];
         const next = clips[i + 1];
         if (!current || !next) continue;
-        if (current.end > next.start) {
+        if (current.end - next.start > OVERLAP_EPSILON_SECONDS) {
           findings.push({
             code: "overlapping_clips_same_track",
             severity: "error",
