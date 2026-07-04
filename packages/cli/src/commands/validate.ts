@@ -32,6 +32,7 @@ interface ContrastEntry {
 
 const CONTRAST_SAMPLES = 5;
 const SEEK_SETTLE_MS = 150;
+const PREFERRED_SEEK_TARGET_WAIT_MS = 500;
 const MEDIA_EXTENSIONS = /\.(aac|flac|m4a|mov|mp3|mp4|oga|ogg|wav|webm)$/i;
 // Floor for the initial page navigation. A blocking external <script> (GSAP
 // from a CDN, etc.) delays `domcontentloaded`; the actual render (much larger
@@ -84,7 +85,24 @@ async function getCompositionDuration(page: import("puppeteer-core").Page): Prom
 }
 
 async function seekTo(page: import("puppeteer-core").Page, time: number): Promise<void> {
+  await waitForPreferredSeekTarget(page);
   await page.evaluate((t: number) => {
+    // window.__player.renderSeek is exposed directly by the composition
+    // runtime (packages/core/src/runtime/init.ts) on every page load, and
+    // — unlike raw timeline.seek() — it also runs the runtime's own
+    // [data-start]/[data-duration] visibility sync, hiding clips outside
+    // their timeline window. window.__hf.seek only exists when the
+    // producer's render-pipeline bridge script has been injected, which
+    // validate's static preview server never does, so it was always
+    // falling through to the raw __timelines seek below and skipping that
+    // sync — leaving off-window elements looking fully visible to any
+    // check (e.g. the contrast audit) that reads computed style afterward.
+    const player = (window as unknown as { __player?: { renderSeek?: (t: number) => void } })
+      .__player;
+    if (player && typeof player.renderSeek === "function") {
+      player.renderSeek(t);
+      return;
+    }
     if (window.__hf && typeof window.__hf.seek === "function") {
       window.__hf.seek(t);
       return;
@@ -99,6 +117,32 @@ async function seekTo(page: import("puppeteer-core").Page, time: number): Promis
     }
   }, time);
   await new Promise((r) => setTimeout(r, SEEK_SETTLE_MS));
+}
+
+interface WaitForFunctionPage {
+  waitForFunction: (pageFunction: () => boolean, options: { timeout: number }) => Promise<unknown>;
+}
+
+export async function waitForPreferredSeekTarget(
+  page: WaitForFunctionPage,
+  timeoutMs = PREFERRED_SEEK_TARGET_WAIT_MS,
+): Promise<void> {
+  try {
+    await page.waitForFunction(
+      () => {
+        const w = window as unknown as {
+          __hf?: { seek?: unknown };
+          __player?: { renderSeek?: unknown };
+        };
+        return typeof w.__player?.renderSeek === "function" || typeof w.__hf?.seek === "function";
+      },
+      { timeout: timeoutMs },
+    );
+  } catch {
+    // Older/static pages may only expose raw window.__timelines. Keep the
+    // legacy fallback path rather than turning a missing player API into a
+    // validate failure.
+  }
 }
 
 /**
