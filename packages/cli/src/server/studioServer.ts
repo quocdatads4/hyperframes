@@ -18,14 +18,17 @@ import {
 import { VERSION as version } from "../version.js";
 import { buildStudioHeadScripts, resolveCliTelemetryDistinctId } from "./telemetryIdentity.js";
 import { emitStudioRenderComplete, emitStudioRenderError } from "./studioRenderTelemetry.js";
+import { isDevMode } from "../utils/env.js";
 import {
   createStudioManualEditsRenderBodyScript,
   createStudioApi,
   createProjectSignature,
+  createBackgroundRemovalJob,
   getMimeType,
   type StudioApiAdapter,
   type ResolvedProject,
   type RenderJobState,
+  type BackgroundRemovalRender,
 } from "@hyperframes/studio-server";
 import { getElementScreenshotClip } from "@hyperframes/studio-server/screenshot-clip";
 import type { ScreenshotClip } from "@hyperframes/studio-server/screenshot-clip";
@@ -34,6 +37,12 @@ import type { RenderJob } from "@hyperframes/producer";
 const STUDIO_MANUAL_EDITS_PATH = ".hyperframes/studio-manual-edits.json";
 const REMOTE_GIF_IMG_SRC_RE =
   /<img\b[^>]*?\bsrc\s*=\s*["'](https?:\/\/[^"']+\.gif(?:[?#][^"']*)?)["'][^>]*>/gi;
+
+async function loadStudioProducer() {
+  return isDevMode()
+    ? await import("../../../producer/src/index.js")
+    : await import("@hyperframes/producer");
+}
 
 // ── Path resolution ─────────────────────────────────────────────────────────
 
@@ -302,7 +311,10 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
         // we can point it at our hot-reloadable local runtime endpoint. Inlining
         // ~150 KB of runtime body on every preview render would defeat browser
         // caching across composition edits.
-        let html = await bundleToSingleHtml(dir, { runtime: "placeholder" });
+        let html = await bundleToSingleHtml(dir, {
+          runtime: "placeholder",
+          inlineColorGradingLuts: false,
+        });
         html = html.replace(
           'data-hyperframes-preview-runtime="1" src=""',
           'data-hyperframes-preview-runtime="1" src="/api/runtime.js"',
@@ -361,7 +373,7 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
       (async () => {
         let renderJob: RenderJob | undefined;
         try {
-          const { createRenderJob, executeRenderJob } = await import("@hyperframes/producer");
+          const { createRenderJob, executeRenderJob } = await loadStudioProducer();
           const { ensureBrowser } = await import("../browser/manager.js");
 
           try {
@@ -416,6 +428,16 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
       return state;
     },
 
+    startBackgroundRemoval(opts) {
+      return createBackgroundRemovalJob(opts, async (renderOpts) => {
+        const sourcePipelinePath = "../background-removal/pipeline.ts";
+        const pipeline = (await import("../background-removal/pipeline.js").catch(
+          () => import(sourcePipelinePath),
+        )) as { render: BackgroundRemovalRender };
+        return pipeline.render(renderOpts);
+      });
+    },
+
     async generateThumbnail(opts): Promise<Buffer | null> {
       const browser = await getThumbnailBrowser();
       if (!browser) {
@@ -438,6 +460,7 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
             { timeout: 5000 },
           )
           .catch(() => {});
+        // fallow-ignore-next-line code-duplication
         await page.evaluate((t: number) => {
           const w = window as Window & {
             __player?: { seek?: (time: number) => void };

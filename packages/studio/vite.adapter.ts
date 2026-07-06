@@ -15,6 +15,8 @@ import {
   type ResolvedProject,
   type RenderJobState,
   type StudioApiAdapter,
+  type BackgroundRemovalRender,
+  createBackgroundRemovalJob,
   createProjectSignature,
 } from "@hyperframes/studio-server";
 import type { RegistryItem } from "@hyperframes/core/registry";
@@ -32,7 +34,10 @@ export function isPathWithin(parentDir: string, childPath: string): boolean {
 
 export function createViteAdapter(dataDir: string, server: ViteDevServer): StudioApiAdapter {
   let _bundler:
-    | ((dir: string, options?: { runtime?: "inline" | "placeholder" }) => Promise<string>)
+    | ((
+        dir: string,
+        options?: { runtime?: "inline" | "placeholder"; inlineColorGradingLuts?: boolean },
+      ) => Promise<string>)
     | null = null;
   let _producerModuleLoader:
     | (() => Promise<{
@@ -162,7 +167,7 @@ export function createViteAdapter(dataDir: string, server: ViteDevServer): Studi
     async bundle(dir: string) {
       const bundler = await getBundler();
       if (!bundler) return null;
-      let html = await bundler(dir, { runtime: "placeholder" });
+      let html = await bundler(dir, { runtime: "placeholder", inlineColorGradingLuts: false });
       html = html.replace(
         'data-hyperframes-preview-runtime="1" src=""',
         `data-hyperframes-preview-runtime="1" src="${this.runtimeUrl}"`,
@@ -249,6 +254,16 @@ export function createViteAdapter(dataDir: string, server: ViteDevServer): Studi
       })();
 
       return state;
+    },
+
+    startBackgroundRemoval(opts) {
+      return createBackgroundRemovalJob(opts, async (renderOpts) => {
+        const mod = await server.ssrLoadModule(
+          resolve(__dirname, "../cli/src/background-removal/pipeline.ts"),
+        );
+        const render = mod.render as BackgroundRemovalRender;
+        return render(renderOpts);
+      });
     },
 
     async generateThumbnail(opts) {
