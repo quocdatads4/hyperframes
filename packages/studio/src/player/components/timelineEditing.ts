@@ -1,10 +1,93 @@
 import { formatTime } from "../lib/time";
 import { roundToCenti } from "../../utils/rounding";
+import { resolveContextOrder, resolveStackingContextKey } from "../lib/layerOrdering";
 
 const roundToCentiseconds = roundToCenti;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
+}
+
+/**
+ * A timeline clip described for stacking-order math: its track (timeline row),
+ * resolved z-index, and stacking-context identity. Structurally satisfied by the
+ * app's TimelineElement.
+ */
+export interface TimelineStackingElement {
+  id: string;
+  key?: string;
+  track: number;
+  zIndex?: number;
+  stackingContextId?: string | null;
+  parentCompositionId?: string | null;
+  compositionAncestors?: string[];
+}
+
+/** A resolved vertical reorder: move the dragged clip from `fromIndex` to
+ *  `toIndex` within its stacking context's ordered siblings (top = front). */
+export interface TimelineStackingReorderIntent {
+  contextKey: string;
+  fromIndex: number;
+  toIndex: number;
+  siblingKeys: string[];
+}
+
+interface TimelineStackingOrderItem {
+  key: string;
+  track: number;
+  zIndex: number;
+  stackingContextId: string | null;
+  parentCompositionId: string | null;
+  compositionAncestors: readonly string[];
+}
+
+function toStackingOrderItem(element: TimelineStackingElement): TimelineStackingOrderItem {
+  return {
+    key: element.key ?? element.id,
+    track: element.track,
+    zIndex: element.zIndex ?? 0,
+    stackingContextId: element.stackingContextId ?? null,
+    parentCompositionId: element.parentCompositionId ?? null,
+    compositionAncestors: element.compositionAncestors ?? [],
+  };
+}
+
+/** Ordered siblings of `element` within its own stacking context (z-index desc,
+ *  DOM order tiebreak) — the unit a vertical reorder operates on. */
+function resolveContextSiblings(
+  element: TimelineStackingElement,
+  elements: readonly TimelineStackingElement[],
+): TimelineStackingOrderItem[] {
+  const contextKey = resolveStackingContextKey(toStackingOrderItem(element));
+  const items = elements
+    .map(toStackingOrderItem)
+    .filter((item) => resolveStackingContextKey(item) === contextKey);
+  return resolveContextOrder(items);
+}
+
+/**
+ * Resolve the reorder implied by dropping `element` onto `targetTrack` (the track
+ * of the sibling whose slot it lands in). Returns null when the element has no
+ * reorderable siblings or the target track matches no sibling.
+ */
+export function resolveTimelineStackingReorderByTargetTrack(args: {
+  element: TimelineStackingElement;
+  elements: readonly TimelineStackingElement[];
+  targetTrack: number;
+}): TimelineStackingReorderIntent | null {
+  const orderedSiblings = resolveContextSiblings(args.element, args.elements);
+  if (orderedSiblings.length <= 1) return null;
+  const draggedKey = args.element.key ?? args.element.id;
+  const fromIndex = orderedSiblings.findIndex((sibling) => sibling.key === draggedKey);
+  if (fromIndex < 0) return null;
+  const toIndex = orderedSiblings.findIndex((sibling) => sibling.track === args.targetTrack);
+  if (toIndex < 0) return null;
+  return {
+    contextKey: resolveStackingContextKey(toStackingOrderItem(args.element)),
+    fromIndex,
+    toIndex,
+    siblingKeys: orderedSiblings.map((sibling) => sibling.key),
+  };
 }
 
 const EDGE_TRACK_CREATE_THRESHOLD = 0.55;
@@ -25,6 +108,10 @@ export interface TimelineMoveInput {
   trackHeight: number;
   maxStart: number;
   trackOrder: number[];
+  /** When provided, vertical movement is resolved as a z-index stacking reorder
+   *  within `stackingElement`'s context instead of a raw track change. */
+  stackingElement?: TimelineStackingElement;
+  stackingElements?: TimelineStackingElement[];
 }
 
 export interface TimelineResizeInput {
@@ -73,7 +160,7 @@ export function resolveTimelineMove(
   input: TimelineMoveInput,
   clientX: number,
   clientY: number,
-): { start: number; track: number } {
+): { start: number; track: number; stackingReorder?: TimelineStackingReorderIntent } {
   const scrollDeltaX = (input.currentScrollLeft ?? 0) - (input.originScrollLeft ?? 0);
   const scrollDeltaY = (input.currentScrollTop ?? 0) - (input.originScrollTop ?? 0);
   const deltaTime =
@@ -81,6 +168,33 @@ export function resolveTimelineMove(
   const trackDeltaRaw =
     (clientY - input.originClientY + scrollDeltaY) / Math.max(input.trackHeight, 1);
   const deltaTrack = Math.round(trackDeltaRaw);
+  const nextStart = clamp(
+    roundToCentiseconds(input.start + deltaTime),
+    0,
+    Math.max(0, input.maxStart),
+  );
+
+  // Stacking mode: vertical movement reorders z-index within the dragged clip's
+  // stacking context (top = front), rather than changing the raw track number.
+  if (input.stackingElement && input.stackingElements) {
+    const orderedSiblings = resolveContextSiblings(input.stackingElement, input.stackingElements);
+    const draggedKey = input.stackingElement.key ?? input.stackingElement.id;
+    const fromIndex = orderedSiblings.findIndex((sibling) => sibling.key === draggedKey);
+    if (fromIndex >= 0 && orderedSiblings.length > 1) {
+      const toIndex = clamp(fromIndex + deltaTrack, 0, orderedSiblings.length - 1);
+      return {
+        start: nextStart,
+        track: orderedSiblings[toIndex]!.track,
+        stackingReorder: {
+          contextKey: resolveStackingContextKey(toStackingOrderItem(input.stackingElement)),
+          fromIndex,
+          toIndex,
+          siblingKeys: orderedSiblings.map((sibling) => sibling.key),
+        },
+      };
+    }
+  }
+
   const currentTrackIndex = Math.max(0, input.trackOrder.indexOf(input.track));
   const desiredTrackIndex = currentTrackIndex + deltaTrack;
   const nextTrackIndex = clamp(desiredTrackIndex, 0, Math.max(0, input.trackOrder.length - 1));
@@ -106,7 +220,7 @@ export function resolveTimelineMove(
   }
 
   return {
-    start: clamp(roundToCentiseconds(input.start + deltaTime), 0, Math.max(0, input.maxStart)),
+    start: nextStart,
     track: nextTrack,
   };
 }

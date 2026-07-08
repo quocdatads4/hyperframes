@@ -21,6 +21,7 @@ import {
   resolveDroppedAssetDuration,
 } from "../utils/studioHelpers";
 import {
+  applyTimelineStackingReorder,
   buildPatchTarget,
   patchIframeDomTiming,
   resolveResizePlaybackStart,
@@ -32,12 +33,17 @@ import {
   scaleGsapPositions,
 } from "./timelineEditingHelpers";
 import type { PersistTimelineEditInput } from "./timelineEditingHelpers";
+import type { TimelineStackingReorderIntent } from "../player/components/timelineEditing";
 import {
   useTimelineElementVisibilityEditing,
   useTimelineTrackVisibilityEditing,
 } from "./timelineTrackVisibility";
 import { sdkTimingPersist } from "../utils/sdkCutover";
 import type { UseTimelineEditingOptions } from "./useTimelineEditingTypes";
+
+type TimelineMoveUpdates = Pick<TimelineElement, "start" | "track"> & {
+  stackingReorder?: TimelineStackingReorderIntent | null;
+};
 
 // ── Hook ──
 
@@ -56,6 +62,7 @@ export function useTimelineEditing({
   isRecordingRef,
   sdkSession,
   forceReloadSdkSession,
+  handleDomZIndexReorderCommitRef,
 }: UseTimelineEditingOptions) {
   const projectIdRef = useRef(projectId);
   projectIdRef.current = projectId;
@@ -115,22 +122,34 @@ export function useTimelineEditing({
   // fallow-ignore-next-line complexity
   const handleTimelineElementMove = useCallback(
     // fallow-ignore-next-line complexity
-    (element: TimelineElement, updates: Pick<TimelineElement, "start" | "track">) => {
-      patchIframeDomTiming(previewIframeRef.current, element, [
-        ["data-start", formatTimelineAttributeNumber(updates.start)],
-        ["data-track-index", String(updates.track)],
-      ]);
+    (element: TimelineElement, updates: TimelineMoveUpdates) => {
       const targetPath = element.sourceFile || activeCompPath || "index.html";
+      const startChanged = updates.start !== element.start;
+
+      if (startChanged) {
+        patchIframeDomTiming(previewIframeRef.current, element, [
+          ["data-start", formatTimelineAttributeNumber(updates.start)],
+        ]);
+      }
+
+      applyTimelineStackingReorder({
+        element,
+        targetTrack: updates.track,
+        stackingReorder: updates.stackingReorder,
+        timelineElements,
+        iframe: previewIframeRef.current,
+        activeCompPath,
+        commit: handleDomZIndexReorderCommitRef?.current,
+        keyOf: (el) => el.key ?? el.id,
+      });
+
+      if (!startChanged) return;
+
       const buildMovePatches: PersistTimelineEditInput["buildPatches"] = (original, target) => {
-        let patched = applyPatchByTarget(original, target, {
+        return applyPatchByTarget(original, target, {
           type: "attribute",
           property: "start",
           value: formatTimelineAttributeNumber(updates.start),
-        });
-        return applyPatchByTarget(patched, target, {
-          type: "attribute",
-          property: "track-index",
-          value: String(updates.track),
         });
       };
       // Server-path fallback (no SDK session): persist the attr patch, then
@@ -155,7 +174,7 @@ export function useTimelineEditing({
         return sdkTimingPersist(
           element.hfId,
           targetPath,
-          { start: updates.start, trackIndex: updates.track },
+          { start: updates.start },
           sdkSession,
           {
             editHistory: { recordEdit },
@@ -183,6 +202,8 @@ export function useTimelineEditing({
       writeProjectFile,
       reloadPreview,
       domEditSaveTimestampRef,
+      timelineElements,
+      handleDomZIndexReorderCommitRef,
     ],
   );
 

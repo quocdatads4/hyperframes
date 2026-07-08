@@ -10,6 +10,17 @@ interface RecordEditInput {
   files: Record<string, { before: string; after: string }>;
 }
 
+export type TimelineZIndexReorderCommit = (
+  entries: Array<{
+    element: HTMLElement;
+    zIndex: number;
+    id?: string;
+    selector?: string;
+    selectorIndex?: number;
+    sourceFile: string;
+  }>,
+) => void;
+
 export interface UseTimelineEditingOptions {
   projectId: string | null;
   activeCompPath: string | null;
@@ -27,4 +38,5 @@ export interface UseTimelineEditingOptions {
   sdkSession?: Composition | null;
   /** Resync the SDK session after a server-authoritative timeline write. */
   forceReloadSdkSession?: () => void;
+  handleDomZIndexReorderCommitRef?: MutableRefObject<TimelineZIndexReorderCommit | null>;
 }

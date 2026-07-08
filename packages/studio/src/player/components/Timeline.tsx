@@ -23,6 +23,7 @@ import {
 import { useTimelineClipDrag } from "./useTimelineClipDrag";
 import { ClipContextMenu } from "./ClipContextMenu";
 import { TimelineShortcutHint } from "./TimelineShortcutHint";
+import { buildStackingTimelineTracks, insertPreviewTrackOrder } from "./timelineTrackOrder";
 import {
   GUTTER,
   generateTicks,
@@ -186,15 +187,7 @@ export const Timeline = memo(function Timeline({
     return Number.isFinite(result) ? result : safeDur;
   }, [rawElements, duration]);
 
-  const tracks = useMemo(() => {
-    const map = new Map<number, typeof expandedElements>();
-    for (const el of expandedElements) {
-      const list = map.get(el.track) ?? [];
-      list.push(el);
-      map.set(el.track, list);
-    }
-    return Array.from(map.entries()).sort(([a], [b]) => a - b);
-  }, [expandedElements]);
+  const tracks = useMemo(() => buildStackingTimelineTracks(expandedElements), [expandedElements]);
 
   const trackStyles = useMemo(() => {
     const map = new Map<number, TrackVisualStyle>();
@@ -207,6 +200,8 @@ export const Timeline = memo(function Timeline({
   const trackOrder = useMemo(() => tracks.map(([trackNum]) => trackNum), [tracks]);
   const trackOrderRef = useRef(trackOrder);
   trackOrderRef.current = trackOrder;
+  const expandedElementsRef = useRef(expandedElements);
+  expandedElementsRef.current = expandedElements;
 
   const ppsRef = useRef(100);
   const durationRef = useRef(effectiveDuration);
@@ -228,6 +223,7 @@ export const Timeline = memo(function Timeline({
     ppsRef,
     durationRef,
     trackOrderRef,
+    timelineElementsRef: expandedElementsRef,
     onMoveElement,
     onResizeElement,
     onBlockedEditAttempt,
@@ -242,7 +238,7 @@ export const Timeline = memo(function Timeline({
       trackOrder.includes(draggedClip.previewTrack)
     )
       return trackOrder;
-    return [...trackOrder, draggedClip.previewTrack].sort((a, b) => a - b);
+    return insertPreviewTrackOrder(trackOrder, draggedClip.previewTrack);
   }, [draggedClip, trackOrder]);
 
   const totalH = getTimelineCanvasHeight(displayTrackOrder.length);

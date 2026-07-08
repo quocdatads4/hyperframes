@@ -401,6 +401,7 @@ export const TimelineCanvas = memo(function TimelineCanvas({
                               pointerOffsetY: e.clientY - rect.top,
                               previewStart: el.start,
                               previewTrack: el.track,
+                              previewStackingReorder: null,
                               snapBeatTime: null,
                               started: false,
                             });
@@ -450,6 +451,10 @@ export const TimelineCanvas = memo(function TimelineCanvas({
                             clipWidthPx={Math.max(previewElement.duration * pps, 4)}
                             clipHeightPx={TRACK_H - 2 * CLIP_Y}
                             beatsActive={beatStripOnTrack}
+                            beatTimes={beatAnalysis?.beatTimes}
+                            clipStart={previewElement.start}
+                            clipDurationSeconds={previewElement.duration}
+                            pixelsPerSecond={pps}
                             accentColor={clipStyle.accent}
                             isSelected={isSelected}
                             currentPercentage={

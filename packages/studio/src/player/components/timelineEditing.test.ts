@@ -10,6 +10,7 @@ import {
   resolveTimelineAutoScroll,
   resolveTimelineMove,
   resolveTimelineResize,
+  snapKeyframePctToBeat,
   type TimelinePromptElement,
 } from "./timelineEditing";
 
@@ -154,6 +155,69 @@ describe("resolveTimelineMove", () => {
         200,
       ),
     ).toEqual({ start: 2, track: 2 });
+  });
+
+  it("resolves vertical stacking movement within the dragged clip's context siblings", () => {
+    const result = resolveTimelineMove(
+      {
+        start: 0,
+        track: 1,
+        duration: 2,
+        originClientX: 0,
+        originClientY: 0,
+        pixelsPerSecond: 100,
+        trackHeight: 72,
+        maxStart: 8,
+        trackOrder: [0, 99, 1],
+        stackingElement: {
+          id: "root-back",
+          track: 1,
+          zIndex: 1,
+          stackingContextId: "root",
+          parentCompositionId: null,
+          compositionAncestors: ["root"],
+        },
+        stackingElements: [
+          {
+            id: "root-front",
+            track: 0,
+            zIndex: 2,
+            stackingContextId: "root",
+            parentCompositionId: null,
+            compositionAncestors: ["root"],
+          },
+          {
+            id: "nested-row",
+            track: 99,
+            zIndex: 100,
+            stackingContextId: "scene",
+            parentCompositionId: "scene",
+            compositionAncestors: ["root", "scene"],
+          },
+          {
+            id: "root-back",
+            track: 1,
+            zIndex: 1,
+            stackingContextId: "root",
+            parentCompositionId: null,
+            compositionAncestors: ["root"],
+          },
+        ],
+      },
+      0,
+      -72,
+    );
+
+    expect(result).toEqual({
+      start: 0,
+      track: 0,
+      stackingReorder: {
+        contextKey: "root",
+        fromIndex: 1,
+        toIndex: 0,
+        siblingKeys: ["root-front", "root-back"],
+      },
+    });
   });
 });
 
@@ -611,5 +675,36 @@ describe("buildPromptCopyText", () => {
     expect(buildPromptCopyText("  Tighten the headline timing  ")).toBe(
       "Tighten the headline timing",
     );
+  });
+});
+
+describe("snapKeyframePctToBeat", () => {
+  // el spans 0–10s, so clip-% maps to composition time as pct * 0.1s.
+  // At pps=100 the snap window is 8 / 100 = 0.08s.
+  const el = { start: 0, duration: 10 };
+  const beats = [2, 5, 8];
+
+  it("snaps a keyframe within ~8px of a beat exactly onto it", () => {
+    // pct 50.5 → 5.05s, 0.05s from the beat at 5s (inside 0.08s window) → 50%.
+    expect(snapKeyframePctToBeat(el, 50.5, beats, 100)).toBe(50);
+  });
+
+  it("leaves a keyframe unchanged when no beat is within the window", () => {
+    // pct 55 → 5.5s, 0.5s from the nearest beat → free.
+    expect(snapKeyframePctToBeat(el, 55, beats, 100)).toBe(55);
+  });
+
+  it("is a no-op when there are no beats", () => {
+    expect(snapKeyframePctToBeat(el, 50.5, [], 100)).toBe(50.5);
+    expect(snapKeyframePctToBeat(el, 50.5, undefined, 100)).toBe(50.5);
+  });
+
+  it("is a no-op for a zero-duration clip", () => {
+    expect(snapKeyframePctToBeat({ start: 0, duration: 0 }, 50.5, beats, 100)).toBe(50.5);
+  });
+
+  it("widens the snap window as zoom (pps) decreases", () => {
+    // pct 53 → 5.3s, 0.3s from the beat at 5s. At pps=20 the window is 0.4s → snaps to 50%.
+    expect(snapKeyframePctToBeat(el, 53, beats, 20)).toBe(50);
   });
 });

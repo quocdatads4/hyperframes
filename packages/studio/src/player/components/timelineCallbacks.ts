@@ -1,7 +1,7 @@
 // fallow-ignore-file code-duplication
 // fallow-ignore-file dead-code
 import type { TimelineElement } from "../store/playerStore";
-import type { BlockedTimelineEditIntent } from "./timelineEditing";
+import type { BlockedTimelineEditIntent, TimelineStackingReorderIntent } from "./timelineEditing";
 
 /**
  * Shared callback signatures for timeline editing operations.
@@ -26,7 +26,9 @@ export interface TimelineDropCallbacks {
 export interface TimelineEditCallbacks {
   onMoveElement?: (
     element: TimelineElement,
-    updates: Pick<TimelineElement, "start" | "track">,
+    updates: Pick<TimelineElement, "start" | "track"> & {
+      stackingReorder?: TimelineStackingReorderIntent | null;
+    },
   ) => Promise<void> | void;
   onResizeElement?: (
     element: TimelineElement,

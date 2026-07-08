@@ -41,8 +41,7 @@ export function computeReorderZValues(
   return hasDupes ? reordered.map((_, i) => reordered.length - i) : sorted;
 }
 
-// Exported in a later unit when the timeline consumes it; internal-only for now.
-function resolveStackingContextKey(item: StackingContextDescriptor): string {
+export function resolveStackingContextKey(item: StackingContextDescriptor): string {
   return item.stackingContextId ?? item.parentCompositionId ?? item.compositionAncestors[0] ?? "";
 }
 

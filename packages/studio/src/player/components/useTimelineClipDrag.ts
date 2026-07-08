@@ -5,6 +5,7 @@ import {
   resolveTimelineResize,
   resolveTimelineAutoScroll,
   type BlockedTimelineEditIntent,
+  type TimelineStackingReorderIntent,
 } from "./timelineEditing";
 import { usePlayerStore } from "../store/playerStore";
 import type { TimelineElement } from "../store/playerStore";
@@ -83,6 +84,8 @@ export interface DraggedClipState {
   previewTrack: number;
   /** Beat time the clip will snap to on drop, for the grid-line highlight. */
   snapBeatTime: number | null;
+  /** Sibling-scoped z-index reorder intent resolved from the vertical drag. */
+  previewStackingReorder: TimelineStackingReorderIntent | null;
   started: boolean;
 }
 
@@ -110,9 +113,12 @@ interface UseTimelineClipDragInput {
   ppsRef: React.RefObject<number>;
   durationRef: React.RefObject<number>;
   trackOrderRef: React.RefObject<number[]>;
+  timelineElementsRef: React.RefObject<TimelineElement[]>;
   onMoveElement?: (
     element: TimelineElement,
-    updates: Pick<TimelineElement, "start" | "track">,
+    updates: Pick<TimelineElement, "start" | "track"> & {
+      stackingReorder?: TimelineStackingReorderIntent | null;
+    },
   ) => Promise<void> | void;
   onResizeElement?: (
     element: TimelineElement,
@@ -129,6 +135,7 @@ export function useTimelineClipDrag({
   ppsRef,
   durationRef,
   trackOrderRef,
+  timelineElementsRef,
   onMoveElement,
   onResizeElement,
   onBlockedEditAttempt,
@@ -204,6 +211,8 @@ export function useTimelineClipDrag({
           trackHeight: TRACK_H,
           maxStart: Math.max(0, durationRef.current - drag.element.duration),
           trackOrder: trackOrderRef.current,
+          stackingElement: drag.element,
+          stackingElements: timelineElementsRef.current,
         },
         clientX,
         clientY,
@@ -225,10 +234,11 @@ export function useTimelineClipDrag({
         pointerClientY: clientY,
         previewStart: snap.start,
         previewTrack: nextMove.track,
+        previewStackingReorder: nextMove.stackingReorder ?? null,
         snapBeatTime: snap.beat,
       };
     },
-    [scrollRef, ppsRef, durationRef, trackOrderRef],
+    [scrollRef, ppsRef, durationRef, trackOrderRef, timelineElementsRef],
   );
 
   const stopClipDragAutoScroll = useCallback(() => {
@@ -299,6 +309,7 @@ export function useTimelineClipDrag({
       });
     };
 
+    // fallow-ignore-next-line complexity
     const handleWindowPointerMove = (e: PointerEvent) => {
       const drag = draggedClipRef.current;
       const resize = resizingClipRef.current;
@@ -434,6 +445,7 @@ export function useTimelineClipDrag({
       syncClipDragAutoScrollRef.current(e.clientX, e.clientY);
     };
 
+    // fallow-ignore-next-line complexity
     const handleWindowPointerUp = () => {
       stopClipDragAutoScrollRef.current();
 
@@ -492,24 +504,30 @@ export function useTimelineClipDrag({
       suppressClickRef.current = true;
       clearSuppressedClick();
 
+      const hasStackingReorder =
+        drag.previewStackingReorder != null &&
+        drag.previewStackingReorder.fromIndex !== drag.previewStackingReorder.toIndex;
       const hasChanged =
-        drag.previewStart !== drag.element.start || drag.previewTrack !== drag.element.track;
+        drag.previewStart !== drag.element.start ||
+        drag.previewTrack !== drag.element.track ||
+        hasStackingReorder;
       if (!hasChanged) return;
 
       updateElement(drag.element.key ?? drag.element.id, {
         start: drag.previewStart,
-        track: drag.previewTrack,
+        ...(hasStackingReorder ? {} : { track: drag.previewTrack }),
       });
 
       Promise.resolve(
         onMoveElementRef.current?.(drag.element, {
           start: drag.previewStart,
           track: drag.previewTrack,
+          stackingReorder: drag.previewStackingReorder,
         }),
       ).catch((error) => {
         updateElement(drag.element.key ?? drag.element.id, {
           start: drag.element.start,
-          track: drag.element.track,
+          ...(hasStackingReorder ? {} : { track: drag.element.track }),
         });
         console.error("[Timeline] Failed to persist clip move", error);
       });

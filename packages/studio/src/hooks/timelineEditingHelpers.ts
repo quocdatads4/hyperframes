@@ -1,8 +1,99 @@
-import type { TimelineElement } from "../player/store/playerStore";
+import { type TimelineElement, usePlayerStore } from "../player/store/playerStore";
 import { applyPatchByTarget, readAttributeByTarget } from "../utils/sourcePatcher";
-import { formatTimelineAttributeNumber } from "../player/components/timelineEditing";
+import {
+  formatTimelineAttributeNumber,
+  resolveTimelineStackingReorderByTargetTrack,
+  type TimelineStackingReorderIntent,
+} from "../player/components/timelineEditing";
+import { computeReorderZValues, getElementZIndex } from "../player/lib/layerOrdering";
 import { saveProjectFilesWithHistory } from "../utils/studioFileHistory";
+import { selectedKeyframePercentagesForElement } from "../utils/keyframeSelection";
 import type { EditHistoryKind } from "../utils/editHistory";
+import type { TimelineZIndexReorderCommit } from "./useTimelineEditingTypes";
+
+function isHTMLElement(element: Element | null): element is HTMLElement {
+  return element != null && element instanceof HTMLElement;
+}
+
+/**
+ * Resolve a timeline vertical move to a z-index stacking reorder and commit it
+ * through the shared layers-panel reorder path. Reads live sibling z-index from
+ * the preview DOM, remaps with the dup-preserving reorder math, and writes only
+ * z-index (never data-track-index). No-op when the move isn't a reorder or the
+ * live siblings can't be resolved. Extracted from StudioApp's timeline hook to
+ * keep it under the studio 600-LOC cap.
+ */
+export function applyTimelineStackingReorder(input: {
+  element: TimelineElement;
+  targetTrack: number;
+  stackingReorder: TimelineStackingReorderIntent | null | undefined;
+  timelineElements: readonly TimelineElement[];
+  iframe: HTMLIFrameElement | null;
+  activeCompPath: string | null;
+  commit: TimelineZIndexReorderCommit | null | undefined;
+  keyOf: (element: TimelineElement) => string;
+}): void {
+  const intent =
+    input.stackingReorder ??
+    (input.targetTrack !== input.element.track
+      ? resolveTimelineStackingReorderByTargetTrack({
+          element: input.element,
+          elements: input.timelineElements,
+          targetTrack: input.targetTrack,
+        })
+      : null);
+  if (intent == null || intent.fromIndex === intent.toIndex) return;
+
+  const siblingByKey = new Map(input.timelineElements.map((el) => [input.keyOf(el), el]));
+  const orderedSiblings = intent.siblingKeys
+    .map((key) => siblingByKey.get(key) ?? null)
+    .filter((sibling): sibling is TimelineElement => sibling != null);
+  if (orderedSiblings.length !== intent.siblingKeys.length) return;
+
+  const liveEntries = orderedSiblings
+    .map((sibling) => ({ sibling, element: findTimelineElementInIframe(input.iframe, sibling) }))
+    .filter((entry): entry is { sibling: TimelineElement; element: HTMLElement } =>
+      isHTMLElement(entry.element),
+    );
+  if (liveEntries.length !== orderedSiblings.length) return;
+
+  const reordered = [...liveEntries];
+  const [moved] = reordered.splice(intent.fromIndex, 1);
+  if (!moved) return;
+  reordered.splice(intent.toIndex, 0, moved);
+
+  const existingValues = liveEntries.map((entry) => getElementZIndex(entry.element));
+  const zValues = computeReorderZValues(existingValues, intent.fromIndex, intent.toIndex);
+  input.commit?.(
+    reordered.map((entry, index) => ({
+      element: entry.element,
+      zIndex: zValues[index] ?? 0,
+      id: entry.sibling.domId ?? entry.sibling.id,
+      selector: entry.sibling.selector,
+      selectorIndex: entry.sibling.selectorIndex,
+      sourceFile: entry.sibling.sourceFile || input.activeCompPath || "index.html",
+    })),
+  );
+}
+
+/**
+ * Remove the keyframes currently selected in the player store from the active
+ * element's GSAP animation. Reads selection lazily so it stays correct when
+ * invoked from a ref callback. Extracted from StudioApp to keep it under the
+ * studio 600-LOC cap.
+ */
+export function deleteSelectedKeyframes(session: {
+  selectedGsapAnimations: readonly { id: string; keyframes?: unknown }[];
+  handleGsapRemoveKeyframe: (animId: string, pct: number) => void;
+}): void {
+  const { selectedKeyframes, selectedElementId } = usePlayerStore.getState();
+  const animation = session.selectedGsapAnimations.find((anim) => anim.keyframes);
+  if (!animation) return;
+  // Only the active element's keyframes; a stale cross-element selection must not delete here.
+  for (const pct of selectedKeyframePercentagesForElement(selectedKeyframes, selectedElementId)) {
+    session.handleGsapRemoveKeyframe(animation.id, pct);
+  }
+}
 
 // ── Types ──
 
