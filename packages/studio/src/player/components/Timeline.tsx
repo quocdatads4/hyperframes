@@ -24,6 +24,7 @@ import { useTimelineClipDrag } from "./useTimelineClipDrag";
 import { ClipContextMenu } from "./ClipContextMenu";
 import { TimelineShortcutHint } from "./TimelineShortcutHint";
 import { buildStackingTimelineLayers, insertPreviewTrackOrder } from "./timelineTrackOrder";
+import { getTimelineLayerGroupHeaderTotalHeight } from "./TimelineLayerGroupHeader";
 import {
   GUTTER,
   generateTicks,
@@ -251,7 +252,9 @@ export const Timeline = memo(function Timeline({
     );
   }, [draggedClip, trackOrder]);
 
-  const totalH = getTimelineCanvasHeight(displayTrackOrder.length);
+  const totalH =
+    getTimelineCanvasHeight(displayTrackOrder.length) +
+    getTimelineLayerGroupHeaderTotalHeight(displayTrackOrder, tracks);
   const keyframeCache = usePlayerStore((s) => s.keyframeCache);
   const selectedKeyframes = usePlayerStore((s) => s.selectedKeyframes);
   const toggleSelectedKeyframe = usePlayerStore((s) => s.toggleSelectedKeyframe);
