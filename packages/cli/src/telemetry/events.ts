@@ -1,8 +1,11 @@
 import { redactTelemetryString, type OutputResolutionIssueKind } from "@hyperframes/core";
+import type { SubTimelineWaitOutcome } from "@hyperframes/engine";
 import { trackEvent } from "./client.js";
 import { readConfig } from "./config.js";
 
 export interface RenderObservabilityTelemetryPayload {
+  /** Worst sub-composition timeline wait outcome across sessions. */
+  subTimelineWait?: SubTimelineWaitOutcome;
   observabilityRenderJobId?: string;
   observabilityCompositionHash?: string;
   observabilityEventCount?: number;
@@ -47,6 +50,7 @@ export interface RenderObservabilityTelemetryPayload {
 
 function renderObservabilityEventProperties(props: RenderObservabilityTelemetryPayload) {
   return {
+    sub_timeline_wait: props.subTimelineWait,
     observability_render_job_id: props.observabilityRenderJobId,
     observability_composition_hash: props.observabilityCompositionHash,
     observability_event_count: props.observabilityEventCount,
@@ -148,7 +152,6 @@ export function trackRenderComplete(
     captureAvgMs?: number;
     /** Warmup-robust per-frame capture median (basis for speedup estimates). */
     captureP50Ms?: number;
-    subTimelineWait?: string;
     /** <video> element count (speedup segmentation: injection comps read lower). */
     videoCount?: number;
     capturePeakMs?: number;
@@ -222,7 +225,6 @@ export function trackRenderComplete(
       speed_ratio: props.speedRatio,
       capture_avg_ms: props.captureAvgMs,
       capture_p50_ms: props.captureP50Ms,
-      sub_timeline_wait: props.subTimelineWait,
       video_count: props.videoCount,
       capture_peak_ms: props.capturePeakMs,
       peak_memory_mb: props.peakMemoryMb,

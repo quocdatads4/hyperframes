@@ -50,6 +50,7 @@ import type {
   CaptureResult,
   CaptureBufferResult,
   CapturePerfSummary,
+  SubTimelineWaitOutcome,
 } from "../types.js";
 
 export type { CaptureOptions, CaptureResult, CaptureBufferResult, CapturePerfSummary };
@@ -104,7 +105,7 @@ export interface CaptureSession {
    */
   scriptLoadFailures: string[];
   /** Outcome of the sub-composition timeline wait: ready | timeout | script_failure. */
-  subTimelineWaitOutcome?: "ready" | "timeout" | "script_failure";
+  subTimelineWaitOutcome?: SubTimelineWaitOutcome;
   initTelemetry?: {
     initDurationMs: number;
     tweenCount: number;
@@ -1159,7 +1160,7 @@ export async function pollSubCompositionTimelines(
   // is cut to `scriptFailureGraceMs` from its start.
   getScriptLoadFailures?: () => readonly string[],
   scriptFailureGraceMs: number = 2_000,
-): Promise<"ready" | "timeout" | "script_failure"> {
+): Promise<SubTimelineWaitOutcome> {
   // Hosts may opt out of the timeline wait with `data-no-timeline` —
   // compositions driven purely by CSS animations / rAF (the render-compat
   // contract) never register window.__timelines[id], and without the opt-out
@@ -1408,6 +1409,16 @@ async function waitForOptionalTailwindReady(page: Page, timeoutMs: number): Prom
   }
 }
 
+// A 4xx `response` and a `requestfailed` can both fire for the same script
+// (e.g. a `requestfailed` following the 4xx), and repeated <script> tags for
+// the same URL duplicate it further — dedupe so the fail-fast warning names
+// each failed URL once.
+function recordScriptLoadFailure(session: CaptureSession, url: string): void {
+  if (!session.scriptLoadFailures.includes(url)) {
+    session.scriptLoadFailures.push(url);
+  }
+}
+
 // fallow-ignore-next-line unit-size
 export async function initializeSession(session: CaptureSession): Promise<void> {
   const { page, serverUrl } = session;
@@ -1439,7 +1450,7 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
 
   page.on("requestfailed", (request) => {
     if (request.resourceType() === "script") {
-      session.scriptLoadFailures.push(request.url());
+      recordScriptLoadFailure(session, request.url());
     }
     appendBrowserDiagnostic(
       session,
@@ -1458,7 +1469,7 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
 
     const request = response.request();
     if (request.resourceType() === "script") {
-      session.scriptLoadFailures.push(response.url());
+      recordScriptLoadFailure(session, response.url());
     }
     appendBrowserDiagnostic(
       session,
