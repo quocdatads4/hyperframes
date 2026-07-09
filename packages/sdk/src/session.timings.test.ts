@@ -151,6 +151,83 @@ describe("getElementTimings — relative data-start references", () => {
     const timings = comp.getElementTimings();
     expect(timings["hf-orphan"]).toMatchObject({ enterAt: 0, exitAt: 2 });
   });
+
+  it("resolves a chained reference (A -> B -> C) through the recursive resolver", async () => {
+    const html = `
+      <div data-hf-id="hf-stage" data-hf-root style="width:1280px;height:720px">
+        <h1 data-hf-id="hf-a" data-start="0" data-duration="2">A</h1>
+        <p  data-hf-id="hf-b" data-start="hf-a" data-duration="3">B</p>
+        <p  data-hf-id="hf-c" data-start="hf-b + 1" data-duration="1">C</p>
+      </div>
+    `.trim();
+    const comp = await openComposition(html);
+    const timings = comp.getElementTimings();
+
+    expect(timings["hf-a"]).toMatchObject({ enterAt: 0, exitAt: 2 });
+    // hf-b: "hf-a" (no offset) = a's exitAt (2)
+    expect(timings["hf-b"]).toMatchObject({ enterAt: 2, exitAt: 5 });
+    // hf-c: "hf-b + 1" = b's exitAt (5) + 1 = 6
+    expect(timings["hf-c"]).toMatchObject({ enterAt: 6, exitAt: 7 });
+  });
+
+  it("terminates (not an infinite loop) on a direct self-reference", async () => {
+    const html = `
+      <div data-hf-id="hf-stage" data-hf-root style="width:1280px;height:720px">
+        <p data-hf-id="hf-self" data-start="hf-self" data-duration="2"></p>
+      </div>
+    `.trim();
+    const comp = await openComposition(html);
+    const timings = comp.getElementTimings();
+    // The cycle guard fires on the re-entrant call, contributing 0 for the
+    // self-reference's own start — the element's OWN duration (2) still applies on
+    // top of that, so enterAt=2, not 0. The guard's job is termination, not zeroing
+    // the whole chain.
+    expect(timings["hf-self"]).toMatchObject({ enterAt: 2, exitAt: 4 });
+    expect(Number.isFinite(timings["hf-self"]?.enterAt)).toBe(true);
+  });
+
+  it("terminates (not an infinite loop) on a mutual A <-> B reference cycle", async () => {
+    const html = `
+      <div data-hf-id="hf-stage" data-hf-root style="width:1280px;height:720px">
+        <p data-hf-id="hf-a" data-start="hf-b" data-duration="2"></p>
+        <p data-hf-id="hf-b" data-start="hf-a" data-duration="3"></p>
+      </div>
+    `.trim();
+    const comp = await openComposition(html);
+    const timings = comp.getElementTimings();
+    // Document order resolves hf-a first: it recurses into hf-b, which recurses back
+    // into hf-a — the guard fires there (returns 0), so hf-b's start = 0 + hf-a's
+    // duration (2) = 2. Back in hf-a's own resolution: start = hf-b's start (2) +
+    // hf-b's duration (3) = 5. Neither number is "correct" for a genuine cycle —
+    // the point is both are finite and the recursion terminates.
+    expect(timings["hf-a"]).toMatchObject({ enterAt: 5, exitAt: 7 });
+    expect(timings["hf-b"]).toMatchObject({ enterAt: 2, exitAt: 5 });
+    expect(Number.isFinite(timings["hf-a"]?.enterAt)).toBe(true);
+    expect(Number.isFinite(timings["hf-b"]?.enterAt)).toBe(true);
+  });
+
+  it("resolves a colliding bare id to the TOP-LEVEL match, not a same-scope sibling", async () => {
+    // Bare ids have no scope syntax — resolveScoped's bare-id rule prefers the
+    // canonical top-level match when one exists, same as the runtime's own (also
+    // global, not scope-aware) resolver. Both the outer document AND the sub-comp
+    // author an element with the SAME bare id "hf-intro" — a genuine collision.
+    const html = `
+      <!DOCTYPE html><html><body>
+        <h1 data-hf-id="hf-intro" data-start="0" data-duration="10">Outer intro</h1>
+        <div data-hf-id="hf-host" data-composition-file="sub.html">
+          <h1 data-hf-id="hf-intro" data-start="0" data-duration="1">Inner intro (same bare id)</h1>
+          <p data-hf-id="hf-outro" data-start="hf-intro + 1" data-duration="1">Inner outro</p>
+        </div>
+      </body></html>
+    `.trim();
+    const comp = await openComposition(html);
+    const timings = comp.getElementTimings();
+    // "hf-intro + 1", authored on an element INSIDE the sub-comp, still resolves
+    // against the OUTER hf-intro (exitAt=10) — 10 + 1 = 11 — not the same-scope
+    // inner hf-intro (exitAt=1, which would give 2). This pins current behavior;
+    // it is a real authoring footgun, not a claim that it's the ideal semantics.
+    expect(timings["hf-host/hf-outro"]).toMatchObject({ enterAt: 11, exitAt: 12 });
+  });
 });
 
 // ─── setElementTiming — sparse map + batched dispatch ────────────────────────

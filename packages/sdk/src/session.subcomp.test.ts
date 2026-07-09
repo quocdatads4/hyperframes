@@ -13,6 +13,7 @@
 import { describe, it, expect } from "vitest";
 import { parseHTML } from "linkedom";
 import { ensureHfIds } from "@hyperframes/core/hf-ids";
+import { RUNTIME_BOOTSTRAP_ATTR } from "@hyperframes/core";
 import { resolveScoped, findById, isNewHostBoundary, bareId } from "./engine/model.js";
 import { parseMutable } from "./engine/model.js";
 import { buildRoots, flatElements } from "./document.js";
@@ -646,5 +647,12 @@ describe("serialize({ stripRuntime })", () => {
     const out = comp.serialize({ stripRuntime: true });
     expect(out).not.toContain("hyperframe.runtime");
     expect(out).toContain('data-hf-id="hf-a"');
+  });
+
+  it("re-exports RUNTIME_BOOTSTRAP_ATTR from @hyperframes/core, matching the marker generators stamp", async () => {
+    expect(RUNTIME_BOOTSTRAP_ATTR).toBe("data-hyperframes-preview-runtime");
+    // The fixture's marker attribute above is authored by hand — confirm it's not
+    // drifted from the real constant a generator would actually stamp.
+    expect(RUNTIME_SCRIPT).toContain(RUNTIME_BOOTSTRAP_ATTR);
   });
 });

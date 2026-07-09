@@ -77,6 +77,8 @@ class CompositionImpl implements Composition {
 
   /** Lazily-built element snapshot, invalidated on every mutation. */
   private elementsCache: ElementSnapshot[] | null = null;
+  /** Lazily-built root snapshot (getRootElements), invalidated alongside elementsCache. */
+  private rootsCache: ElementSnapshot[] | null = null;
 
   private currentSelection: string[] = [];
 
@@ -183,8 +185,24 @@ class CompositionImpl implements Composition {
     // resolve to 0 (parseFloat("intro + 2") is NaN). Node-safe static counterpart of the
     // runtime's own resolver (runtime/startResolver.ts): no live GSAP timeline to fall back
     // on, so an unauthored sub-composition duration still resolves to 0, same as before.
+    //
+    // refId is always a BARE id (the reference grammar has no scope syntax), resolved via
+    // resolveScoped's bare-id rule: prefer the canonical top-level match, else document
+    // order. An element inside a sub-composition referencing a bare id that also exists at
+    // the top level resolves to the TOP-LEVEL one, not a same-scope sibling — this matches
+    // the runtime's own resolver (also a global, not scope-aware, lookup), so the two stay
+    // consistent, but it means a bare-id collision across scopes is a real footgun for
+    // authored content.
     const startCache = new Map<Element, number>();
     const visiting = new Set<Element>();
+    // Split out of resolveStart so its own branching stays low — this is the ONE
+    // path that recurses + calls resolveDuration, kept here so that's visible at a
+    // glance rather than buried inside resolveStart's try block.
+    const resolveReferenceStart = (refId: string, offset: number): number => {
+      const target = resolveScoped(this.parsed.document, refId);
+      if (!target) return 0;
+      return Math.max(0, resolveStart(target) + (resolveDuration(target) ?? 0) + offset);
+    };
     const resolveStart = (el: Element): number => {
       const cached = startCache.get(el);
       if (cached !== undefined) return cached;
@@ -195,10 +213,9 @@ class CompositionImpl implements Composition {
         const startStr = el.getAttribute("data-start");
         const expr = parseStartExpression(startStr);
         if (expr?.kind === "reference") {
-          const target = resolveScoped(this.parsed.document, expr.refId);
-          resolved = target
-            ? Math.max(0, resolveStart(target) + (resolveDuration(target) ?? 0) + expr.offset)
-            : 0;
+          resolved = resolveReferenceStart(expr.refId, expr.offset);
+        } else if (expr?.kind === "absolute") {
+          resolved = expr.value;
         } else {
           resolved = startStr !== null ? parseFloat(startStr) : 0;
         }
@@ -344,9 +361,12 @@ class CompositionImpl implements Composition {
    * includes every descendant a second time as its own top-level entry, since each
    * snapshot in it still carries its children. `buildRoots` already computes true roots
    * internally for `getElements()` to flatten — this just returns them unflattened.
+   * Cached like elementsCache — a layer panel calling this every render tick shouldn't
+   * repay the DOM walk each time.
    */
   getRootElements(): ElementSnapshot[] {
-    return buildRoots(this.parsed.document);
+    this.rootsCache ??= buildRoots(this.parsed.document);
+    return [...this.rootsCache];
   }
 
   getElement(id: HfId): ElementSnapshot | null {
@@ -443,6 +463,7 @@ class CompositionImpl implements Composition {
     }
 
     this.elementsCache = null;
+    this.rootsCache = null;
 
     // Update override-set from forward patches
     for (const p of forward) {
@@ -547,6 +568,7 @@ class CompositionImpl implements Composition {
             applyPatchesToDocument(this.parsed, [...this.batchInverse].reverse());
             this.overrides = { ...this.batchOverridesSnapshot };
             this.elementsCache = null;
+            this.rootsCache = null;
           }
           this.resetBatchState();
           // Empty no-op batch: fire changeHandlers (parity with dispatch)
@@ -612,9 +634,10 @@ class CompositionImpl implements Composition {
   serialize(opts?: { stripRuntime?: boolean }): string {
     const html = serializeDocument(this.parsed);
     // Newer agent-generated compositions embed hyperframe.runtime.iife.js in their own
-    // HTML. A host driving its own clock (an editing iframe) must not let that runtime
-    // self-init — it races the host's first seek and resets the timeline to t=0. Opt-in
-    // (default false) since a host playing the composition normally wants the runtime.
+    // HTML. Any host driving its own clock (not just an editing iframe — anything that
+    // owns seeking/playback itself) must not let that runtime self-init: it races the
+    // host's first seek and resets the timeline to t=0. Opt-in (default false) since a
+    // host playing the composition normally wants the runtime.
     return opts?.stripRuntime ? stripEmbeddedRuntimeScripts(html) : html;
   }
 
@@ -634,6 +657,7 @@ class CompositionImpl implements Composition {
     // Emit a patch event so subscribers stay in sync.
     applyPatchesToDocument(this.parsed, patches);
     this.elementsCache = null;
+    this.rootsCache = null;
 
     // Update override-set
     for (const p of patches) {

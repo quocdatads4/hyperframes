@@ -142,6 +142,9 @@ export function resolveScoped(document: Document, id: string): Element | null {
  */
 export function bareId(scopedId: string): string {
   const parts = scopedId.split("/");
+  // split() always returns >=1 element, so this never actually falls through at
+  // runtime — the fallback exists to satisfy noUncheckedIndexedAccess, not as a
+  // reachable safety net.
   return parts[parts.length - 1] ?? scopedId;
 }
 

@@ -500,7 +500,8 @@ export interface Composition {
   on(event: "persist:error", handler: (event: PersistErrorEvent) => void): () => void;
 
   // ── Serialization ──────────────────────────────────────────────────────────
-  serialize(): string;
+  /** stripRuntime removes an embedded preview-runtime script — for a host driving its own clock. */
+  serialize(opts?: { stripRuntime?: boolean }): string;
 
   // ── T3 embedded-mode extras ────────────────────────────────────────────────
   /** Current override-set — serialize for host storage */
