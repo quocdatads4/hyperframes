@@ -13,12 +13,18 @@ import { TRACK_H } from "./timelineLayout";
 import { isMusicTrack } from "../../utils/timelineInspector";
 import { mergeUserBeats } from "../../utils/beatEditing";
 import type { StackingTimelineLayer, TimelineLayerId } from "./timelineTrackOrder";
+import type {
+  TimelineGroupMoveChange,
+  TimelineGroupResizeChange,
+} from "../../hooks/useTimelineGroupEditing";
 import {
   buildTimelineSnapTargets,
   snapEdgesToTargets,
   snapResizeEdgeToTargets,
   type TimelineSnapKind,
 } from "./timelineSnapTargets";
+import { resolveDragPreviewPlacement } from "./timelineClipDragPreview";
+import { useTimelineClipGroupDrag } from "./useTimelineClipGroupDrag";
 
 const EMPTY_BEAT_TIMES: number[] = [];
 
@@ -83,9 +89,13 @@ interface UseTimelineClipDragInput {
     element: TimelineElement,
     updates: Pick<TimelineElement, "start" | "duration" | "playbackStart">,
   ) => Promise<void> | void;
+  onMoveElements?: (changes: TimelineGroupMoveChange[]) => Promise<void> | void;
+  onResizeElements?: (changes: TimelineGroupResizeChange[]) => Promise<void> | void;
+  onPreviewMoveElements?: (changes: TimelineGroupMoveChange[]) => void;
+  onPreviewResizeElements?: (changes: TimelineGroupResizeChange[]) => void;
   onBlockedEditAttempt?: (element: TimelineElement, intent: BlockedTimelineEditIntent) => void;
   setShowPopover: (show: boolean) => void;
-  /** Stable ref to the range selection setter — wired after mount to break circular dependency. */
+  /** Stable ref to the range selection setter, wired after mount to break circular dependency. */
   setRangeSelectionRef: React.RefObject<((sel: null) => void) | null>;
 }
 
@@ -97,6 +107,10 @@ export function useTimelineClipDrag({
   timelineElementsRef,
   onMoveElement,
   onResizeElement,
+  onMoveElements,
+  onResizeElements,
+  onPreviewMoveElements,
+  onPreviewResizeElements,
   onBlockedEditAttempt,
   setShowPopover,
   setRangeSelectionRef,
@@ -140,14 +154,21 @@ export function useTimelineClipDrag({
   compositionDurationRef.current = compositionDuration;
 
   const buildSnapTargets = useCallback(
-    (element: TimelineElement) =>
-      buildTimelineSnapTargets({
+    (element: TimelineElement) => {
+      const draggedKey = element.key ?? element.id;
+      const selected = selectedElementIdsRef.current;
+      // In a group drag every selected clip moves together, so none of them may act
+      // as a snap target for the others; exclude the whole set, not just the grabbed clip.
+      const excludedKeys =
+        selected.size > 1 && selected.has(draggedKey) ? selected : new Set([draggedKey]);
+      return buildTimelineSnapTargets({
         elements: timelineElementsRef.current,
-        draggedKey: element.key ?? element.id,
+        excludedKeys,
         playhead: playheadRef.current,
         compDuration: compositionDurationRef.current,
         beats: isMusicTrack(element) ? EMPTY_BEAT_TIMES : beatTimesRef.current,
-      }),
+      });
+    },
     [timelineElementsRef],
   );
 
@@ -166,10 +187,35 @@ export function useTimelineClipDrag({
   onMoveElementRef.current = onMoveElement;
   const onResizeElementRef = useRef(onResizeElement);
   onResizeElementRef.current = onResizeElement;
+  const onMoveElementsRef = useRef(onMoveElements);
+  onMoveElementsRef.current = onMoveElements;
+  const onResizeElementsRef = useRef(onResizeElements);
+  onResizeElementsRef.current = onResizeElements;
+  const onPreviewMoveElementsRef = useRef(onPreviewMoveElements);
+  onPreviewMoveElementsRef.current = onPreviewMoveElements;
+  const onPreviewResizeElementsRef = useRef(onPreviewResizeElements);
+  onPreviewResizeElementsRef.current = onPreviewResizeElements;
+  const selectedElementIdsRef = useRef(usePlayerStore.getState().selectedElementIds);
+  selectedElementIdsRef.current = usePlayerStore((s) => s.selectedElementIds);
 
   const clipDragScrollRaf = useRef(0);
   const clipDragPointerRef = useRef<{ clientX: number; clientY: number } | null>(null);
+  const {
+    previewGroupMove,
+    previewGroupResize,
+    commitGroupMove,
+    commitGroupResize,
+    clearGroupDragSessions,
+  } = useTimelineClipGroupDrag({
+    timelineElementsRef,
+    updateElement,
+    onMoveElementsRef,
+    onResizeElementsRef,
+    onPreviewMoveElementsRef,
+    onPreviewResizeElementsRef,
+  });
 
+  // fallow-ignore-next-line complexity
   const updateDraggedClipPreview = useCallback(
     (drag: DraggedClipState, clientX: number, clientY: number): DraggedClipState => {
       const scroll = scrollRef.current;
@@ -203,22 +249,28 @@ export function useTimelineClipDrag({
         ppsRef.current,
         { maxStart: Number.POSITIVE_INFINITY },
       );
+      const groupMove = previewGroupMove(drag.element, selectedElementIdsRef.current, snap.start);
+      const placement = resolveDragPreviewPlacement(drag, nextMove, groupMove);
       return {
         ...drag,
         started: true,
         pointerClientX: clientX,
         pointerClientY: clientY,
-        previewStart: snap.start,
-        previewTrack: nextMove.track,
-        previewLayerId: nextMove.previewLayerId ?? drag.previewLayerId,
-        previewLayerIndex: nextMove.previewLayerIndex ?? drag.previewLayerIndex,
-        previewStackingReorder: nextMove.stackingReorder ?? null,
+        ...placement,
         snapBeatTime: snap.snapKind === "beat" ? snap.snapTime : null,
         snapGuideTime: snap.snapTime,
         snapGuideKind: snap.snapKind,
       };
     },
-    [scrollRef, ppsRef, trackOrderRef, timelineLayersRef, timelineElementsRef, buildSnapTargets],
+    [
+      scrollRef,
+      ppsRef,
+      trackOrderRef,
+      timelineLayersRef,
+      timelineElementsRef,
+      buildSnapTargets,
+      previewGroupMove,
+    ],
   );
 
   const stopClipDragAutoScroll = useCallback(() => {
@@ -277,6 +329,12 @@ export function useTimelineClipDrag({
 
   const updateDraggedClipPreviewRef = useRef(updateDraggedClipPreview);
   updateDraggedClipPreviewRef.current = updateDraggedClipPreview;
+  const commitGroupMoveRef = useRef(commitGroupMove);
+  commitGroupMoveRef.current = commitGroupMove;
+  const commitGroupResizeRef = useRef(commitGroupResize);
+  commitGroupResizeRef.current = commitGroupResize;
+  const clearGroupDragSessionsRef = useRef(clearGroupDragSessions);
+  clearGroupDragSessionsRef.current = clearGroupDragSessions;
   const syncClipDragAutoScrollRef = useRef(syncClipDragAutoScroll);
   syncClipDragAutoScrollRef.current = syncClipDragAutoScroll;
   const stopClipDragAutoScrollRef = useRef(stopClipDragAutoScroll);
@@ -360,7 +418,15 @@ export function useTimelineClipDrag({
             };
           }
         }
-
+        const groupResize = previewGroupResize(
+          resize.element,
+          selectedElementIdsRef.current,
+          resize.edge,
+          nextResize,
+        );
+        if (groupResize.active) {
+          nextResize = groupResize.updates;
+        }
         setResizingClip((prev) =>
           prev
             ? {
@@ -421,6 +487,8 @@ export function useTimelineClipDrag({
         suppressClickRef.current = true;
         clearSuppressedClick();
 
+        if (commitGroupResizeRef.current(resize.element)) return;
+
         const hasChanged =
           resize.previewStart !== resize.element.start ||
           resize.previewDuration !== resize.element.duration ||
@@ -467,6 +535,8 @@ export function useTimelineClipDrag({
       suppressClickRef.current = true;
       clearSuppressedClick();
 
+      if (commitGroupMoveRef.current(drag.element)) return;
+
       const hasStackingReorder =
         drag.previewStackingReorder != null && drag.previewStackingReorder.zIndexChanges.length > 0;
       const hasChanged = drag.previewStart !== drag.element.start || hasStackingReorder;
@@ -494,6 +564,7 @@ export function useTimelineClipDrag({
     window.addEventListener("pointerup", handleWindowPointerUp);
     window.addEventListener("pointercancel", handleWindowPointerUp);
     return () => {
+      clearGroupDragSessionsRef.current();
       stopClipDragAutoScrollRef.current();
       window.removeEventListener("pointermove", handleWindowPointerMove);
       window.removeEventListener("pointerup", handleWindowPointerUp);

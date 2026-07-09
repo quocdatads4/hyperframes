@@ -11,7 +11,7 @@ import {
   type TimelineRangeSelection,
 } from "./timelineEditing";
 import { getRenderedTimelineElement, type TimelineTheme } from "./timelineTheme";
-import { GUTTER, TRACK_H, RULER_H, CLIP_Y, CLIP_HANDLE_W } from "./timelineLayout";
+import { GUTTER, TRACK_H, CLIP_Y, CLIP_HANDLE_W } from "./timelineLayout";
 import {
   usePlayerStore,
   type TimelineElement,
@@ -32,6 +32,8 @@ import {
 import { resolveTimelineDropIndicator } from "./timelineDropIndicator";
 import { TimelineDropInsertionLine } from "./TimelineDropInsertionLine";
 import { TimelineDragGhost } from "./TimelineDragGhost";
+import { TimelineSelectionOverlays } from "./TimelineSelectionOverlays";
+import type { TimelineMarqueeOverlayRect } from "./useTimelineMarqueeSelection";
 
 function ClipLintDot({ element }: { element: TimelineElement }) {
   const lint = usePlayerStore((s) => s.lintFindingsByElement.get(element.key ?? element.id));
@@ -54,6 +56,7 @@ interface TimelineCanvasProps {
   effectiveDuration: number;
   majorTickInterval: number;
   rangeSelection: TimelineRangeSelection | null;
+  marqueeRect: TimelineMarqueeOverlayRect | null;
   theme: TimelineTheme;
   displayTrackOrder: TimelineLayerId[];
   trackOrder: TimelineLayerId[];
@@ -112,6 +115,7 @@ export const TimelineCanvas = memo(function TimelineCanvas({
   effectiveDuration,
   majorTickInterval,
   rangeSelection,
+  marqueeRect,
   theme,
   displayTrackOrder,
   trackOrder,
@@ -158,6 +162,7 @@ export const TimelineCanvas = memo(function TimelineCanvas({
     onRazorSplitAll,
   } = useTimelineEditContextOptional();
   const beatDragging = usePlayerStore((s) => s.beatDragging);
+  const selectedElementIds = usePlayerStore((s) => s.selectedElementIds);
   const activeSnapGuideTime = draggedClip?.started
     ? (draggedClip.snapBeatTime ?? draggedClip.snapGuideTime)
     : resizingClip?.started
@@ -359,7 +364,7 @@ export const TimelineCanvas = memo(function TimelineCanvas({
                       const clipStyle = getTrackStyle(el.tag);
                       const elementKey = el.key ?? el.id;
                       const capabilities = getTimelineEditCapabilities(el);
-                      const isSelected = selectedElementId === elementKey;
+                      const isSelected = selectedElementIds.has(elementKey);
                       const isComposition = !!el.compositionSrc;
                       // elementKey (el.key ?? el.id) is already unique per clip; do NOT
                       // fold in the map index, or a splice/reorder remounts every clip
@@ -560,22 +565,12 @@ export const TimelineCanvas = memo(function TimelineCanvas({
         </TimelineDragGhost>
       )}
 
-      {/* Range highlight */}
-      {rangeSelection && (
-        <div
-          className="absolute pointer-events-none"
-          style={{
-            left: GUTTER + Math.min(rangeSelection.start, rangeSelection.end) * pps,
-            width: Math.abs(rangeSelection.end - rangeSelection.start) * pps,
-            top: RULER_H,
-            bottom: 0,
-            backgroundColor: "rgba(59, 130, 246, 0.12)",
-            borderLeft: "1px solid rgba(59, 130, 246, 0.4)",
-            borderRight: "1px solid rgba(59, 130, 246, 0.4)",
-            zIndex: 50,
-          }}
-        />
-      )}
+      <TimelineSelectionOverlays
+        rangeSelection={rangeSelection}
+        marqueeRect={marqueeRect}
+        pps={pps}
+        accentColor={getTrackStyle("").accent}
+      />
 
       {/* Playhead — hidden while dragging a beat so its guideline doesn't
           track the scrub and clutter the beat being moved. */}

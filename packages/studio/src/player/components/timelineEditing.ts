@@ -2,7 +2,22 @@ import { formatTime } from "../lib/time";
 import { roundToCenti } from "../../utils/rounding";
 import type { StackingTimelineLayer, TimelineLayerId } from "./timelineTrackOrder";
 import { resolveTimelineLayerStackingMove } from "./timelineLayerDrag";
+import { shouldShowTimelineLayerGroupHeader } from "./TimelineLayerGroupHeader";
 import type { TimelineStackingElement, TimelineStackingReorderIntent } from "./timelineStacking";
+
+import {
+  applyClipStartTrimDelta,
+  clipStartTrimDeltaBounds,
+  resolveTimelineMinDuration,
+} from "./timelineGroupEditing";
+
+export {
+  clampTimelineGroupResizeDelta,
+  resolveTimelineGroupMove,
+  resolveTimelineGroupResize,
+  type TimelineGroupResizeEdge,
+  type TimelineGroupTimingMember,
+} from "./timelineGroupEditing";
 
 export {
   type TimelineStackingElement,
@@ -109,7 +124,7 @@ export function resolveTimelineMove(
 
   // Stacking mode: the two axes never fight. Horizontal movement writes time
   // (nextStart); vertical movement writes z-index. Lane/overlap resolution
-  // uses the clip's authored time span, NOT the dragged start — otherwise a
+  // uses the clip's authored time span, NOT the dragged start, otherwise a
   // diagonal drag that drifts the clip out of overlap silently flips the
   // placement from "restack" to "join lane" and cancels the reorder.
   if (input.stackingElement) {
@@ -194,7 +209,7 @@ export function resolveTimelineResize(
   edge: "start" | "end",
   clientX: number,
 ): { start: number; duration: number; playbackStart?: number } {
-  const minDuration = Math.max(0.05, input.minDuration ?? 0.1);
+  const minDuration = resolveTimelineMinDuration(input.minDuration);
   const deltaTime = (clientX - input.originClientX) / Math.max(input.pixelsPerSecond, 1);
 
   if (edge === "end") {
@@ -210,23 +225,15 @@ export function resolveTimelineResize(
     };
   }
 
-  const playbackRate = Math.max(0.1, input.playbackRate ?? 1);
-  const maxLeftExtensionFromMedia =
-    input.playbackStart != null ? input.playbackStart / playbackRate : Number.POSITIVE_INFINITY;
-  const minDelta = -Math.min(input.start - input.minStart, maxLeftExtensionFromMedia);
-  const maxDelta = input.duration - minDuration;
+  const { minDelta, maxDelta } = clipStartTrimDeltaBounds(input, input.minStart, minDuration);
   const clampedDelta = clamp(deltaTime, minDelta, maxDelta);
-  const nextStart = roundToCentiseconds(input.start + clampedDelta);
-  const nextDuration = roundToCentiseconds(input.duration - clampedDelta);
-  const nextPlaybackStart =
-    input.playbackStart != null
-      ? roundToCentiseconds(Math.max(0, input.playbackStart + clampedDelta * playbackRate))
-      : undefined;
+  const trimmed = applyClipStartTrimDelta(input, clampedDelta);
 
   return {
-    start: nextStart,
-    duration: nextDuration,
-    playbackStart: nextPlaybackStart,
+    start: roundToCentiseconds(trimmed.start),
+    duration: roundToCentiseconds(trimmed.duration),
+    playbackStart:
+      trimmed.playbackStart != null ? roundToCentiseconds(trimmed.playbackStart) : undefined,
   };
 }
 
@@ -251,6 +258,108 @@ export interface TimelineRangeSelection {
   end: number;
   anchorX: number;
   anchorY: number;
+}
+
+export interface TimelineMarqueeSelectionRect {
+  startTime: number;
+  endTime: number;
+  top: number;
+  bottom: number;
+}
+
+export interface TimelineMarqueeSelectionInput {
+  rect: TimelineMarqueeSelectionRect;
+  layers: readonly StackingTimelineLayer[];
+  layerOrder: readonly TimelineLayerId[];
+  rulerHeight: number;
+  trackHeight: number;
+  groupHeaderHeight?: number;
+}
+
+interface NormalizedTimelineMarqueeRect {
+  startTime: number;
+  endTime: number;
+  top: number;
+  bottom: number;
+}
+
+function timelineIntervalsOverlap(
+  startA: number,
+  endA: number,
+  startB: number,
+  endB: number,
+): boolean {
+  return startA < endB && startB < endA;
+}
+
+function normalizeTimelineMarqueeRect(
+  rect: TimelineMarqueeSelectionRect,
+): NormalizedTimelineMarqueeRect | null {
+  const normalized = {
+    startTime: Math.max(0, Math.min(rect.startTime, rect.endTime)),
+    endTime: Math.max(0, Math.max(rect.startTime, rect.endTime)),
+    top: Math.min(rect.top, rect.bottom),
+    bottom: Math.max(rect.top, rect.bottom),
+  };
+  if (normalized.endTime <= normalized.startTime || normalized.bottom <= normalized.top) {
+    return null;
+  }
+  return normalized;
+}
+
+function buildTimelineLayerMap(layers: readonly StackingTimelineLayer[]) {
+  const layerById = new Map<TimelineLayerId, StackingTimelineLayer>();
+  for (const layer of layers) layerById.set(layer.id, layer);
+  return layerById;
+}
+
+function appendMarqueeLayerSelection(
+  selected: string[],
+  layer: StackingTimelineLayer,
+  rect: NormalizedTimelineMarqueeRect,
+) {
+  for (const element of layer.elements) {
+    if (
+      timelineIntervalsOverlap(
+        rect.startTime,
+        rect.endTime,
+        element.start,
+        element.start + element.duration,
+      )
+    ) {
+      selected.push(element.key ?? element.id);
+    }
+  }
+}
+
+export function selectTimelineElementsInMarquee({
+  rect,
+  layers,
+  layerOrder,
+  rulerHeight,
+  trackHeight,
+  groupHeaderHeight = 0,
+}: TimelineMarqueeSelectionInput): string[] {
+  const normalized = normalizeTimelineMarqueeRect(rect);
+  if (!normalized) return [];
+  const layerById = buildTimelineLayerMap(layers);
+  const selected: string[] = [];
+  let previousContextKey = "";
+  let rowTop = rulerHeight;
+  for (const layerId of layerOrder) {
+    const layer = layerById.get(layerId);
+    if (!layer) continue;
+    if (shouldShowTimelineLayerGroupHeader(layer.contextKey, previousContextKey)) {
+      rowTop += groupHeaderHeight;
+    }
+    const rowBottom = rowTop + trackHeight;
+    if (timelineIntervalsOverlap(normalized.top, normalized.bottom, rowTop, rowBottom)) {
+      appendMarqueeLayerSelection(selected, layer, normalized);
+    }
+    previousContextKey = layer.contextKey;
+    rowTop = rowBottom;
+  }
+  return selected;
 }
 
 function isDeterministicTimelineWindow(input: {
@@ -356,13 +465,13 @@ export function buildTimelineAgentPrompt({
   const elementLines = elements
     .map(
       (el) =>
-        `- #${el.id} (${el.tag}) — ${formatTime(el.start)} to ${formatTime(el.start + el.duration)}, track ${el.track}`,
+        `- #${el.id} (${el.tag}) - ${formatTime(el.start)} to ${formatTime(el.start + el.duration)}, track ${el.track}`,
     )
     .join("\n");
 
   return `Edit the following HyperFrames composition:
 
-Time range: ${formatTime(start)} — ${formatTime(end)}
+Time range: ${formatTime(start)} - ${formatTime(end)}
 
 Elements in range:
 ${elementLines || "(none)"}

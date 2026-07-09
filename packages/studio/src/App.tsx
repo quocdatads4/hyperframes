@@ -519,6 +519,8 @@ export function StudioApp() {
                       handleTimelineFileDrop={timelineEditing.handleTimelineFileDrop}
                       handleTimelineElementMove={timelineEditing.handleTimelineElementMove}
                       handleTimelineElementResize={timelineEditing.handleTimelineElementResize}
+                      handleTimelineGroupMove={timelineEditing.handleTimelineGroupMove}
+                      handleTimelineGroupResize={timelineEditing.handleTimelineGroupResize}
                       handleToggleTrackHidden={timelineEditing.handleToggleTrackHidden}
                       handleToggleElementHidden={timelineEditing.handleToggleElementHidden}
                       handleBlockedTimelineEdit={timelineEditing.handleBlockedTimelineEdit}
