@@ -151,4 +151,15 @@ window.__timelines = { t: tl };</script>
     const liveStyle = iframe.contentDocument!.querySelector("style")!.textContent ?? "";
     expect(liveStyle).toContain("green");
   });
+
+  it("does not throw when a patch arrives after the iframe is removed from the DOM", async () => {
+    const iframe = mountIframe(BASE_HTML);
+    const comp = await openComposition(BASE_HTML);
+    const adapter = createIframePreviewAdapter(iframe);
+    adapter.attachSync(comp);
+
+    iframe.remove(); // contentDocument becomes null (or inaccessible) once detached
+
+    expect(() => comp.setStyle("hf-title", { color: "#0f0" })).not.toThrow();
+  });
 });
