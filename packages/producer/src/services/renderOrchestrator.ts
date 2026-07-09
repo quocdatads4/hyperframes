@@ -387,6 +387,10 @@ export interface RenderPerfSummary {
     workerInversion?: string;
     /** Worker count the auto-resolution chose BEFORE the inversion pinned it to 1 — the parallel counterfactual for speedup math. Only set when the inversion fired. */
     preInversionWorkers?: number;
+    /** DE parallel-router outcome: "routed" (fired, held), "reverted" (fired, self-verify retry rolled back), "none". Mutually exclusive with workerInversion. */
+    parallelRouter?: string;
+    /** Worker count the auto-resolution chose BEFORE the router pinned it to 3 — the single-worker-inversion counterfactual. Only set when the router fired. */
+    preRouterWorkers?: number;
     /** Engine init-time gate: swiftshader | css_effect:* | at_risk_timeline | 3d_init_failed | supersampling | render_mode_hint. */
     gateReason?: string;
     /** Worker-encode drain (the verified path) was active. */
@@ -1065,6 +1069,96 @@ export function resolveInversionRetryPlan(args: {
   };
 }
 
+/**
+ * DE parallel-router predicate: should an AUTO-resolved multi-worker render
+ * use VERIFIED PARALLEL drawElement streaming (HF_DE_PARALLEL_STREAM) instead
+ * of the #2026 single-worker inversion?
+ *
+ * Benchmarked 2026-07-08 (clean, quiet-machine re-run): par3/single 1.16–1.36x
+ * on real-work comps ≥2,000 frames (2,381f GSAP graphics 1.36x, 3,245f rAF
+ * high-variance 1.29x, 915f crossover probe 1.27x); the one comp that didn't
+ * clear 1.25x (3,600f, 39% static/dedup-heavy) still didn't LOSE to single-
+ * worker (1.16x) — dedup already skips the capture work parallelism would
+ * split, so there's mechanically less headroom, not a regression. No comp
+ * anywhere showed par3 < single. Default-off (HF_DE_PARALLEL_ROUTER): this
+ * promotes the opt-in mechanism from #2056 into the auto-routing decision,
+ * but the decision itself stays gated behind its own flag pending the
+ * telemetry soak (revert rate, de_verify_min_db distribution) on real wild
+ * traffic — there is currently none, since nothing routes here by default.
+ * Takes priority over the single-worker inversion when both would fire (a
+ * higher minFrames than HF_DE_SINGLE_MIN_FRAMES is the intended shape: this
+ * only picks up the long tail the inversion's own benchmark didn't cover).
+ */
+export function shouldPreferParallelDrawElement(args: {
+  workerCount: number;
+  /** job.config.workers — a number means the user explicitly chose. */
+  requestedWorkers: number | "auto" | undefined;
+  useDrawElement: boolean;
+  deCompileGate: string | undefined;
+  forceScreenshot: boolean;
+  outputFormat: NonNullable<RenderConfig["format"]>;
+  totalFrames: number;
+  /** Amortization threshold; <=0 disables the router. */
+  minFrames: number;
+  layeredOrEffectRoute: boolean;
+  supersampling: boolean;
+  probeDeGated: boolean;
+  experimentalParallelDeOptIn: boolean;
+  /** HF_DE_PARALLEL_ROUTER === "true" — the router's own kill switch, default off. */
+  routerEnabled: boolean;
+}): boolean {
+  return (
+    args.routerEnabled &&
+    args.workerCount > 1 &&
+    typeof args.requestedWorkers !== "number" &&
+    args.useDrawElement &&
+    !args.deCompileGate &&
+    !args.forceScreenshot &&
+    args.outputFormat === "mp4" &&
+    args.minFrames > 0 &&
+    args.totalFrames >= args.minFrames &&
+    !args.layeredOrEffectRoute &&
+    !args.supersampling &&
+    !args.probeDeGated &&
+    !args.experimentalParallelDeOptIn
+  );
+}
+
+/**
+ * Plan the self-verify retry for a router-routed render: the bet on verified
+ * parallel drawElement streaming lost, so the re-render falls back to the
+ * pre-router worker count on the ordinary (non-DE) parallel path. Unlike
+ * `resolveInversionRetryPlan`, the caller must also clear
+ * `process.env.HF_DE_PARALLEL_STREAM` (set by the router) BEFORE calling
+ * this — `shouldUseStreamingEncode` reads that env var directly, so an
+ * uncleared flag would keep resolving to the parallel-streaming shape on the
+ * retry instead of the well-tested parallel-disk fallback. Returns null when
+ * the render was not router-routed.
+ */
+export function resolveParallelRouterRetryPlan(args: {
+  deParallelRouter: "routed" | "reverted" | undefined;
+  preRouterWorkerCount: number;
+  cfg: Pick<EngineConfig, "enableStreamingEncode" | "streamingEncodeMaxDurationSeconds">;
+  outputFormat: NonNullable<RenderConfig["format"]>;
+  durationSeconds: number;
+}): {
+  workerCount: number;
+  useStreamingEncode: boolean;
+  deParallelRouter: "reverted";
+} | null {
+  if (args.deParallelRouter !== "routed") return null;
+  return {
+    workerCount: args.preRouterWorkerCount,
+    useStreamingEncode: shouldUseStreamingEncode(
+      args.cfg,
+      args.outputFormat,
+      args.preRouterWorkerCount,
+      args.durationSeconds,
+    ),
+    deParallelRouter: "reverted",
+  };
+}
+
 export function resolveCaptureForceScreenshotForPageSideCompositing(args: {
   forceScreenshot: boolean;
   usePageSideCompositing: boolean;
@@ -1341,6 +1435,11 @@ export async function executeRenderJob(
     // "inverted" = fired and held; "reverted" = fired but the self-verify
     // retry rolled back to the parallel path; undefined = never fired.
     let deWorkerInversion: "inverted" | "reverted" | undefined;
+    // "routed" = the parallel router fired and held; "reverted" = fired but
+    // the self-verify retry rolled back; undefined = never fired. Mutually
+    // exclusive with deWorkerInversion — the router takes priority when both
+    // would be eligible (see shouldPreferParallelDrawElement).
+    let deParallelRouter: "routed" | "reverted" | undefined;
     let deSelfVerifyFallback = false;
     let deFallbackReason: string | undefined;
     let deDrainStats: import("./render/stages/captureStreamingStage.js").DeDrainStats | undefined;
@@ -1718,12 +1817,46 @@ export async function executeRenderJob(
         // Verified parallel DE streaming (opt-in) wants its parallelism kept.
         process.env.HF_DE_PARALLEL_STREAM === "true",
     });
+    // DE parallel-router eligibility — see shouldPreferParallelDrawElement.
+    // Default-off (HF_DE_PARALLEL_ROUTER); HF_DE_PARALLEL_MIN_FRAMES defaults
+    // higher than the single-worker inversion's threshold since it targets
+    // the long tail the inversion's own benchmark didn't cover.
+    const deParallelRouterEnabled = process.env.HF_DE_PARALLEL_ROUTER === "true";
+    const deParallelMinFramesRaw = process.env.HF_DE_PARALLEL_MIN_FRAMES;
+    const deParallelMinFramesNum =
+      deParallelMinFramesRaw === undefined || deParallelMinFramesRaw.trim() === ""
+        ? 2000
+        : Number(deParallelMinFramesRaw);
+    const deParallelMinFrames = Number.isFinite(deParallelMinFramesNum)
+      ? deParallelMinFramesNum
+      : 2000;
+    const deParallelRouterEligible = shouldPreferParallelDrawElement({
+      workerCount: WOULD_RESOLVE_MULTI_WORKER,
+      requestedWorkers: job.config.workers,
+      useDrawElement: cfg.useDrawElement,
+      deCompileGate,
+      forceScreenshot: captureForceScreenshot,
+      outputFormat,
+      totalFrames,
+      minFrames: deParallelMinFrames,
+      layeredOrEffectRoute: hasHdrContent || compiled.hasShaderTransitions,
+      supersampling: deviceScaleFactor > 1,
+      probeDeGated:
+        probeSession !== null &&
+        probeSession.captureMode !== "drawelement" &&
+        !probeSession.deInitDeferred,
+      experimentalParallelDeOptIn:
+        process.env.PRODUCER_EXPERIMENTAL_FAST_CAPTURE === "true" ||
+        process.env.HF_DE_PARALLEL_STREAM === "true",
+      routerEnabled: deParallelRouterEnabled,
+    });
     if (
       job.config.workers === undefined &&
       totalFrames >= 60 &&
       !htmlInCanvasDetected &&
       !cfg.lowMemoryMode &&
-      !deInversionEligible
+      !deInversionEligible &&
+      !deParallelRouterEligible
     ) {
       const outcome = await observeRenderStage(
         observability,
@@ -1763,6 +1896,7 @@ export async function executeRenderJob(
         htmlInCanvasDetected,
         lowMemoryMode: Boolean(cfg.lowMemoryMode),
         deInversionEligible,
+        deParallelRouterEligible,
       });
     }
 
@@ -1785,7 +1919,25 @@ export async function executeRenderJob(
     // `preInversionWorkerCount` lets the self-verify retry return to the
     // parallel path when the drawElement bet loses.
     const preInversionWorkerCount = workerCount;
-    if (deInversionEligible && workerCount > 1) {
+    // Router takes priority over the single-worker inversion when both would
+    // fire — its higher frame threshold means this only ever picks up long-
+    // tail comps the inversion's own benchmark didn't cover (see
+    // shouldPreferParallelDrawElement).
+    if (deParallelRouterEligible && workerCount > 1) {
+      deParallelRouter = "routed";
+      // Fixed at 3, not calibration-derived: the benchmark validated exactly
+      // this worker count (par3 beat par2 consistently; W4/W5 unmeasured for
+      // this path), same shape as the single-worker inversion pinning to a
+      // fixed 1 rather than a calibrated count.
+      const ROUTER_WORKER_COUNT = 3;
+      log.info(
+        "[Render] Fast capture: verified parallel drawElement streaming preferred over " +
+          `single-worker inversion (${totalFrames} frames >= ${deParallelMinFrames}; ` +
+          "benchmark-validated at 3 workers). Set HF_DE_PARALLEL_ROUTER=false or --workers N to override.",
+      );
+      workerCount = ROUTER_WORKER_COUNT;
+      process.env.HF_DE_PARALLEL_STREAM = "true";
+    } else if (deInversionEligible && workerCount > 1) {
       deWorkerInversion = "inverted";
       log.info(
         "[Render] Fast capture: single-worker drawElement streaming preferred over " +
@@ -1795,10 +1947,11 @@ export async function executeRenderJob(
       );
       workerCount = 1;
     }
-    updateCaptureObservability({ workerCount, deWorkerInversion });
+    updateCaptureObservability({ workerCount, deWorkerInversion, deParallelRouter });
     observability.checkpoint("worker_resolution", "resolved", {
       workerCount,
       deWorkerInversion: deWorkerInversion ?? "none",
+      deParallelRouter: deParallelRouter ?? "none",
     });
 
     if (workerCount > 1 && probeSession) {
@@ -2101,9 +2254,21 @@ export async function executeRenderJob(
             deSelfVerifyFallback: true,
           });
           probeSession = null;
+          // HF_DE_PARALLEL_STREAM must be cleared BEFORE resolveParallelRouterRetryPlan
+          // recomputes useStreamingEncode, or shouldUseStreamingEncode's own env
+          // check would keep resolving to the parallel-streaming shape on the
+          // retry instead of the well-tested parallel-disk fallback.
+          if (deParallelRouter === "routed") delete process.env.HF_DE_PARALLEL_STREAM;
           const inversionRetryPlan = resolveInversionRetryPlan({
             deWorkerInversion,
             preInversionWorkerCount,
+            cfg,
+            outputFormat,
+            durationSeconds: job.duration,
+          });
+          const parallelRouterRetryPlan = resolveParallelRouterRetryPlan({
+            deParallelRouter,
+            preRouterWorkerCount: preInversionWorkerCount,
             cfg,
             outputFormat,
             durationSeconds: job.duration,
@@ -2124,6 +2289,23 @@ export async function executeRenderJob(
             });
             log.info(
               `[Render] Reverting worker inversion for the retry: ${workerCount} workers, ` +
+                `streaming=${useStreamingEncode}.`,
+            );
+          } else if (parallelRouterRetryPlan) {
+            // The router's bet on verified parallel streaming lost — re-render
+            // on the ordinary (non-DE) parallel path at the pre-router worker
+            // count, same "reverted, not cleared" telemetry contract as the
+            // inversion above.
+            deParallelRouter = parallelRouterRetryPlan.deParallelRouter;
+            workerCount = parallelRouterRetryPlan.workerCount;
+            useStreamingEncode = parallelRouterRetryPlan.useStreamingEncode;
+            updateCaptureObservability({
+              workerCount,
+              useStreamingEncode,
+              deParallelRouter,
+            });
+            log.info(
+              `[Render] Reverting parallel router for the retry: ${workerCount} workers, ` +
                 `streaming=${useStreamingEncode}.`,
             );
           }
@@ -2338,6 +2520,8 @@ export async function executeRenderJob(
         clampReason: deClampReason,
         workerInversion: deWorkerInversion,
         preInversionWorkers: deWorkerInversion ? preInversionWorkerCount : undefined,
+        parallelRouter: deParallelRouter,
+        preRouterWorkers: deParallelRouter ? preInversionWorkerCount : undefined,
         selfVerifyFallback: deSelfVerifyFallback,
         fallbackReason: deFallbackReason,
         drainStats: deDrainStats,
