@@ -101,6 +101,7 @@ try {
 
 import { defineCommand, runMain } from "citty";
 import type { ArgsDef, CommandDef } from "citty";
+import { getRunId } from "./telemetry/runId.js";
 import { reportCommandFailure, trackCommandFailures } from "./utils/command-failure-tracking.js";
 
 const isHelp = process.argv.includes("--help") || process.argv.includes("-h");
@@ -196,7 +197,13 @@ let _trackCliError:
     }) => void)
   | undefined;
 let _trackCommandResult:
-  | ((props: { command: string; success: boolean; exitCode: number; durationMs: number }) => void)
+  | ((props: {
+      command: string;
+      success: boolean;
+      exitCode: number;
+      durationMs: number;
+      runId?: string;
+    }) => void)
   | undefined;
 let _printUpdateNotice: (() => void) | undefined;
 let _printSkillsUpdateNotice: (() => void) | undefined;
@@ -211,7 +218,7 @@ if (!isHelp && command !== "telemetry" && command !== "events" && command !== "u
     _trackCliError = mod.trackCliError;
     _trackCommandResult = mod.trackCommandResult;
     mod.showTelemetryNotice();
-    mod.trackCommand(command);
+    mod.trackCommand(command, runId);
     if (mod.shouldTrack()) mod.incrementCommandCount();
   });
 }
@@ -242,6 +249,7 @@ if (!isHelp && !hasJsonFlag && command !== "upgrade" && command !== "events") {
 }
 
 const commandStart = Date.now();
+const runId = getRunId();
 
 // Async flush for normal exit. `beforeExit` re-fires every time the
 // event loop drains, and the async `_flush()` itself schedules new
@@ -265,6 +273,7 @@ process.on("exit", (code) => {
     success: code === 0 && !commandFailed,
     exitCode: code,
     durationMs: Date.now() - commandStart,
+    runId,
   });
   _flushSync?.();
 });

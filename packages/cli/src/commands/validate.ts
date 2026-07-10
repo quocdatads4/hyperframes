@@ -1,3 +1,8 @@
+// The media-metadata wait exists twice on purpose: once Node-side and once
+// inside a page.evaluate() body, which is serialized into the browser and
+// cannot import the Node helper. Line-level markers don't survive the clone
+// window drifting as the file is edited, hence the file-level suppression.
+// fallow-ignore-file code-duplication
 import { defineCommand } from "citty";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -110,8 +115,6 @@ export function raceMediaReady(
 ): Promise<void> {
   if (Number.isFinite(el.duration) && el.duration > 0) return Promise.resolve();
   return new Promise<void>((resolve) => {
-    // Clones its in-page twin below; evaluate() bodies can't import Node helpers.
-    // fallow-ignore-next-line code-duplication
     const onReady = () => {
       el.removeEventListener("loadedmetadata", onReady);
       el.removeEventListener("error", onReady);
@@ -156,9 +159,6 @@ async function auditClipDurations(
       nodes.map((el) => {
         if (Number.isFinite(el.duration) && el.duration > 0) return Promise.resolve();
         return new Promise<void>((resolve) => {
-          // fallow-ignore-next-line code-duplication
-          // Serialized twin of the Node-side metadata wait above.
-          // fallow-ignore-next-line code-duplication
           const cleanup = () => {
             el.removeEventListener("loadedmetadata", onReady);
             el.removeEventListener("error", onReady);

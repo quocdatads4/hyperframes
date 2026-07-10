@@ -1,5 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
+import { trackCheckReport } from "../telemetry/events.js";
+import { getRunId } from "../telemetry/runId.js";
 import type { ProjectDir } from "./project.js";
 import { lintProject, shouldBlockRender, type ProjectLintResult } from "./lintProject.js";
 import {
@@ -180,6 +182,7 @@ interface GridSamples {
   motionFrames: MotionFrame[];
   contrastEntries: ContrastAuditEntry[];
   screenshots: CheckScreenshot[];
+  contrastMs: number;
 }
 
 interface GeometrySeen {
@@ -349,6 +352,7 @@ async function collectGridSamples(
     motionFrames: [],
     contrastEntries: [],
     screenshots: [],
+    contrastMs: 0,
   };
   for (const time of mergeSampleTimes(grid.layoutSamples, motion.times)) {
     await driver.seek(time);
@@ -366,7 +370,9 @@ async function collectGridSamples(
       );
     }
     if (contrastSet.has(time)) {
+      const contrastStart = Date.now();
       const capture = await driver.collectContrast(time);
+      collected.contrastMs += Date.now() - contrastStart;
       collected.contrastEntries.push(...capture.entries);
       collected.screenshots.push({ time, pngBase64: capture.pngBase64 });
     }
@@ -382,7 +388,9 @@ export async function runAuditGrid(
   await driver.initialize(options.contrast);
   const grid = await buildSampleGrid(driver, options);
   const plan = await planMotionSampling(driver, motion, grid.duration);
+  const seekLoopStart = Date.now();
   const collected = await collectGridSamples(driver, options, grid, plan);
+  const seekLoopMs = Date.now() - seekLoopStart;
 
   let motionIssues = plan.preflightIssues;
   if (motion.kind === "valid" && motionIssues.length === 0 && collected.motionFrames.length > 0) {
@@ -408,6 +416,7 @@ export async function runAuditGrid(
     contrastChecked: collected.contrastEntries.length,
     contrastPassed: contrast.passed,
     screenshots: collected.screenshots,
+    timings: { launchSettleMs: 0, seekLoopMs, contrastMs: collected.contrastMs },
   };
 }
 
@@ -555,7 +564,7 @@ function buildReport(
     layout.errorCount +
     motionSection.errorCount +
     contrastSection.errorCount;
-  return {
+  const report: CheckReport = {
     ok: errorCount === 0 && (!options.strict || warningCount === 0),
     strict: options.strict,
     lint,
@@ -580,6 +589,32 @@ function buildReport(
       times: options.snapshots ? browser.screenshots.map((shot) => shot.time) : [],
     },
   };
+  trackCheckReport({
+    contrastGate: options.contrast,
+    motionGate: motion.kind !== "none",
+    captionZoneGate: options.captionZone !== undefined,
+    frameCheckGate: options.frameCheck !== undefined,
+    snapshotsGate: options.snapshots,
+    lintErrors: lint.errorCount,
+    lintWarnings: lint.warningCount,
+    runtimeErrors: runtime.errorCount,
+    runtimeWarnings: runtime.warningCount,
+    layoutErrors: layout.errorCount,
+    layoutWarnings: layout.warningCount,
+    motionErrors: motionSection.errorCount,
+    motionWarnings: motionSection.warningCount,
+    contrastErrors: contrastSection.errorCount,
+    contrastWarnings: contrastSection.warningCount,
+    launchSettleMs: browser.timings.launchSettleMs,
+    seekLoopMs: browser.timings.seekLoopMs,
+    contrastMs: browser.timings.contrastMs,
+    gridPoints: browser.layoutSamples.length,
+    contrastPoints: browser.contrastChecked,
+    ok: report.ok,
+    exitCode: checkExitCode(report),
+    runId: getRunId(),
+  });
+  return report;
 }
 
 function shapeLayoutSection(
@@ -651,6 +686,7 @@ function emptyBrowserResult(): CheckBrowserResult {
     contrastChecked: 0,
     contrastPassed: 0,
     screenshots: [],
+    timings: { launchSettleMs: 0, seekLoopMs: 0, contrastMs: 0 },
   };
 }
 

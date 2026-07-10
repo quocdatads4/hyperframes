@@ -98,8 +98,11 @@ function redactTelemetryMessage(value: string): string {
   return redactTelemetryString(value);
 }
 
-export function trackCommand(command: string): void {
-  trackEvent("cli_command", { command });
+export function trackCommand(command: string, runId?: string): void {
+  trackEvent("cli_command", {
+    command,
+    ...(runId !== undefined ? { run_id: runId } : {}),
+  });
 }
 
 export function trackRenderComplete(
@@ -544,11 +547,65 @@ export function trackCommandResult(props: {
   success: boolean;
   exitCode: number;
   durationMs: number;
+  runId?: string;
 }): void {
   trackEvent("cli_command_result", {
     command: props.command,
     success: props.success,
     exit_code: props.exitCode,
     duration_ms: props.durationMs,
+    ...(props.runId !== undefined ? { run_id: props.runId } : {}),
+  });
+}
+
+export function trackCheckReport(props: {
+  contrastGate: boolean;
+  motionGate: boolean;
+  captionZoneGate: boolean;
+  frameCheckGate: boolean;
+  snapshotsGate: boolean;
+  lintErrors: number;
+  lintWarnings: number;
+  runtimeErrors: number;
+  runtimeWarnings: number;
+  layoutErrors: number;
+  layoutWarnings: number;
+  motionErrors: number;
+  motionWarnings: number;
+  contrastErrors: number;
+  contrastWarnings: number;
+  launchSettleMs: number;
+  seekLoopMs: number;
+  contrastMs: number;
+  gridPoints: number;
+  contrastPoints: number;
+  ok: boolean;
+  exitCode: number;
+  runId?: string;
+}): void {
+  trackEvent("check_report", {
+    gate_contrast: props.contrastGate,
+    gate_motion: props.motionGate,
+    gate_caption_zone: props.captionZoneGate,
+    gate_frame_check: props.frameCheckGate,
+    gate_snapshots: props.snapshotsGate,
+    lint_errors: props.lintErrors,
+    lint_warnings: props.lintWarnings,
+    runtime_errors: props.runtimeErrors,
+    runtime_warnings: props.runtimeWarnings,
+    layout_errors: props.layoutErrors,
+    layout_warnings: props.layoutWarnings,
+    motion_errors: props.motionErrors,
+    motion_warnings: props.motionWarnings,
+    contrast_errors: props.contrastErrors,
+    contrast_warnings: props.contrastWarnings,
+    launch_settle_ms: props.launchSettleMs,
+    seek_loop_ms: props.seekLoopMs,
+    contrast_ms: props.contrastMs,
+    grid_points: props.gridPoints,
+    contrast_points: props.contrastPoints,
+    ok: props.ok,
+    exit_code: props.exitCode,
+    ...(props.runId !== undefined ? { run_id: props.runId } : {}),
   });
 }

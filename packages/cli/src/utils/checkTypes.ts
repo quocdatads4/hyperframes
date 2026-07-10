@@ -133,6 +133,12 @@ export interface CheckScreenshot {
   pngBase64: string;
 }
 
+export interface CheckTimings {
+  launchSettleMs: number;
+  seekLoopMs: number;
+  contrastMs: number;
+}
+
 export interface CheckBrowserResult {
   duration: number;
   layoutSamples: number[];
@@ -147,6 +153,7 @@ export interface CheckBrowserResult {
   contrastChecked: number;
   contrastPassed: number;
   screenshots: CheckScreenshot[];
+  timings: CheckTimings;
 }
 
 /** The seek-grid audit loop, injected into checkBrowser so it never imports checkPipeline back. */

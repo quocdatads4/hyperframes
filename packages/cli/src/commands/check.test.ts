@@ -1,6 +1,13 @@
 import { runCommand } from "citty";
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+const trackCheckReport = vi.fn();
+vi.mock("../telemetry/events.js", () => ({
+  trackCheckReport: (...args: unknown[]) => trackCheckReport(...args),
+  trackCommandFailure: vi.fn(),
+}));
+
 import { contrastRatio, parseColorRGBA } from "./contrast-bg.js";
 import { createCheckCommand } from "./check.js";
 import {
@@ -35,6 +42,7 @@ const ORIGINAL_EXIT_CODE = process.exitCode;
 
 afterEach(() => {
   process.exitCode = ORIGINAL_EXIT_CODE;
+  trackCheckReport.mockClear();
   vi.restoreAllMocks();
 });
 
@@ -210,6 +218,20 @@ async function gateCandidates(
 
 function noMotion(): MotionSpecResolution {
   return { kind: "none" };
+}
+
+function heroMotionFrame(time: number, visibleAt: (time: number) => boolean) {
+  return {
+    time,
+    data: {
+      "#hero": {
+        rect: { left: 10, top: 20, right: 310, bottom: 100, width: 300, height: 80 },
+        opacity: visibleAt(time) ? 1 : 0,
+        visible: visibleAt(time),
+      },
+    },
+    liveness: {},
+  };
 }
 
 function dependencies(
@@ -772,17 +794,7 @@ describe("check pipeline", () => {
     };
     const driver = fakeDriver({
       getDuration: vi.fn(async () => 1),
-      collectMotionFrame: vi.fn(async (time: number) => ({
-        time,
-        data: {
-          "#hero": {
-            rect: { left: 10, top: 20, right: 310, bottom: 100, width: 300, height: 80 },
-            opacity: time >= 0.5 ? 1 : 0,
-            visible: time >= 0.5,
-          },
-        },
-        liveness: {},
-      })),
+      collectMotionFrame: vi.fn(async (time: number) => heroMotionFrame(time, (t) => t >= 0.5)),
     });
     const { report } = await runScenario(driver, {}, { motion });
 
@@ -853,6 +865,148 @@ describe("check pipeline", () => {
       "Could not determine composition duration — no layout samples run",
     );
     expect(checkExitCode(report)).toBe(1);
+  });
+});
+
+describe("check report telemetry", () => {
+  it("reports one clean run with every gate and sampled-point count", async () => {
+    const motion: MotionSpecResolution = {
+      kind: "valid",
+      path: "/project/index.motion.json",
+      spec: { duration: 1, assertions: [{ kind: "appearsBy", selector: "#hero", bySec: 1 }] },
+    };
+    const driver = fakeDriver({
+      getDuration: vi.fn(async () => 1),
+      collectMotionFrame: vi.fn(async (time: number) => heroMotionFrame(time, () => true)),
+      collectContrast: vi.fn(async (time: number) => ({
+        entries: [contrastEntry({ time, ratio: 7, wcagAA: true })],
+        pngBase64: PNG_BASE64,
+      })),
+    });
+
+    const { report } = await runScenario(
+      driver,
+      {
+        samples: 1,
+        captionZone: { x0: 0, y0: 0.8, x1: 1, y1: 1 },
+        frameCheck: {},
+        snapshots: true,
+      },
+      { motion },
+    );
+
+    expect(trackCheckReport).toHaveBeenCalledTimes(1);
+    expect(trackCheckReport).toHaveBeenCalledWith(
+      expect.objectContaining({
+        contrastGate: true,
+        motionGate: true,
+        captionZoneGate: true,
+        frameCheckGate: true,
+        snapshotsGate: true,
+        gridPoints: 2,
+        contrastPoints: 1,
+        ok: true,
+        exitCode: 0,
+      }),
+    );
+    expect(report.ok).toBe(true);
+  });
+
+  it("reports one failing contrast run with its section error count", async () => {
+    const collectContrast = vi.fn(async (time: number) => ({
+      entries: time === 0.5 ? [contrastEntry()] : [],
+      pngBase64: PNG_BASE64,
+    }));
+
+    const { report } = await runScenario(fakeDriver({ collectContrast }));
+
+    expect(trackCheckReport).toHaveBeenCalledTimes(1);
+    expect(trackCheckReport).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ok: false,
+        exitCode: 1,
+        contrastErrors: report.contrast.errorCount,
+      }),
+    );
+    expect(report.contrast.errorCount).toBe(1);
+  });
+
+  it("reports zero browser samples and timings after a lint short circuit", async () => {
+    const lint = lintWith(
+      "error",
+      "root_missing_composition_id",
+      "Root element needs data-composition-id.",
+    );
+
+    const { report, browser } = await runScenario(fakeDriver(), {}, { lint });
+
+    expect(browser).not.toHaveBeenCalled();
+    expect(trackCheckReport).toHaveBeenCalledTimes(1);
+    expect(trackCheckReport).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ok: false,
+        exitCode: 1,
+        gridPoints: 0,
+        contrastPoints: 0,
+        launchSettleMs: 0,
+        seekLoopMs: 0,
+        contrastMs: 0,
+      }),
+    );
+    expect(report.ok).toBe(false);
+  });
+
+  it("matches report counts for mixed findings across classes", async () => {
+    const lint = lintWith("warning", "lint_warning", "Lint warning.");
+    const driver = fakeDriver({
+      collectLayout: vi.fn(async () => [layoutIssue(), layoutIssue("warning")]),
+      collectContrast: vi.fn(async () => ({
+        entries: [contrastEntry()],
+        pngBase64: PNG_BASE64,
+      })),
+    });
+
+    const { report } = await runScenario(
+      driver,
+      { samples: 1 },
+      { lint, runtime: [runtimeError()] },
+    );
+
+    expect(trackCheckReport).toHaveBeenCalledTimes(1);
+    expect(trackCheckReport).toHaveBeenCalledWith(
+      expect.objectContaining({
+        lintErrors: report.lint.errorCount,
+        lintWarnings: report.lint.warningCount,
+        runtimeErrors: report.runtime.errorCount,
+        runtimeWarnings: report.runtime.warningCount,
+        layoutErrors: report.layout.errorCount,
+        layoutWarnings: report.layout.warningCount,
+        motionErrors: report.motion.errorCount,
+        motionWarnings: report.motion.warningCount,
+        contrastErrors: report.contrast.errorCount,
+        contrastWarnings: report.contrast.warningCount,
+      }),
+    );
+    expect(report.lint.warningCount).toBe(1);
+    expect(report.runtime.errorCount).toBe(1);
+    expect(report.layout.errorCount).toBe(1);
+    expect(report.layout.warningCount).toBe(1);
+  });
+
+  it("measures contrast work inside the overall seek loop", async () => {
+    vi.spyOn(Date, "now")
+      .mockReturnValueOnce(100)
+      .mockReturnValueOnce(105)
+      .mockReturnValueOnce(110)
+      .mockReturnValueOnce(120);
+
+    const result = await runAuditGrid(
+      fakeDriver(),
+      { ...DEFAULT_CHECK_OPTIONS, samples: 1 },
+      noMotion(),
+    );
+
+    expect(result.timings).toEqual({ launchSettleMs: 0, seekLoopMs: 20, contrastMs: 5 });
   });
 });
 

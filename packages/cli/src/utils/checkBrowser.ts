@@ -93,6 +93,7 @@ export async function runBrowserCheck(
   let chromeBrowser: import("puppeteer-core").Browser | undefined;
 
   try {
+    const launchSettleStart = Date.now();
     const session = await openSettledCompositionPage(html, server.url, {
       renderReadyTimeoutMs: options.timeout,
       renderReadyWarningSuffix: "checking the current page state",
@@ -104,12 +105,14 @@ export async function runBrowserCheck(
     await waitForPreferredSeekTarget(page, 500);
 
     const rootAnchor = await resolveRootAnchor(page);
+    const launchSettleMs = Date.now() - launchSettleStart;
     const driver = createPageDriver(page, (time) => {
       currentTime = time;
     });
     const result = await runGrid(driver, options, motion);
     return {
       ...result,
+      timings: { ...result.timings, launchSettleMs },
       runtimeFindings: drafts.map((draft) => runtimeFinding(draft, rootAnchor)),
     };
   } finally {

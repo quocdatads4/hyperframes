@@ -44,6 +44,11 @@ afterEach(() => {
 });
 
 it("carries raw browser geometry through the page driver and pipeline", async () => {
+  vi.spyOn(Date, "now")
+    .mockReturnValueOnce(100)
+    .mockReturnValueOnce(160)
+    .mockReturnValueOnce(200)
+    .mockReturnValueOnce(240);
   document.body.innerHTML = `
     <div data-composition-id="main" data-duration="10" data-width="640" data-height="360">
       <section data-composition-file="scenes/hero.html">
@@ -85,6 +90,7 @@ it("carries raw browser geometry through the page driver and pipeline", async ()
       time: 5,
     }),
   ]);
+  expect(result.timings).toEqual({ launchSettleMs: 60, seekLoopMs: 40, contrastMs: 0 });
   expect(mocks.serverClose).toHaveBeenCalledOnce();
 });
 
