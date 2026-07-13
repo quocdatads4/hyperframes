@@ -101,7 +101,15 @@ export function AssetPreviewOverlay() {
   // so a stale render can never dismiss against the wrong reference time.
   useEffect(() => {
     if (!previewAsset) return;
-    const openedTime = usePlayerStore.getState().currentTime;
+    const opened = usePlayerStore.getState();
+    // Level-triggered, not edge-triggered: a preview opened while playback is
+    // ALREADY running gets no store change to react to (the RAF loop bypasses
+    // the store), so evaluate the current state once before subscribing.
+    if (opened.isPlaying) {
+      clearPreviewAsset();
+      return;
+    }
+    const openedTime = opened.currentTime;
     return usePlayerStore.subscribe((state) => {
       if (shouldDismissAssetPreview(openedTime, state)) clearPreviewAsset();
     });

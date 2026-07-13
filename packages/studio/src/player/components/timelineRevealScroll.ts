@@ -56,8 +56,11 @@ function revealAxis(
 ): number | null {
   const windowStart = scroll + stickyStart + REVEAL_SCROLL_PADDING_PX;
   const windowEnd = scroll + viewport - REVEAL_SCROLL_PADDING_PX;
-  if (start >= windowStart && end <= windowEnd) return null;
   const windowSize = windowEnd - windowStart;
+  // Degenerate viewport (container smaller than the sticky chrome + padding):
+  // there is no visible window to reveal into, so never scroll on this axis.
+  if (windowSize <= 0) return null;
+  if (start >= windowStart && end <= windowEnd) return null;
   // Oversized range (or start hidden): align the start edge to the window start.
   if (end - start > windowSize || start < windowStart) {
     return Math.max(0, start - stickyStart - REVEAL_SCROLL_PADDING_PX);

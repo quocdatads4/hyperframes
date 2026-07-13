@@ -13,6 +13,7 @@ import {
   type RecordEditInput,
 } from "./timelineEditingHelpers";
 import {
+  captureDurationRollback,
   finishGroupTimingGsapFallback,
   readFileContent,
   scaleGsapPositions,
@@ -223,6 +224,9 @@ export function useTimelineGroupEditing({
       }
 
       const maxEnd = Math.max(...changes.map((change) => change.start + change.element.duration));
+      // Snapshot the duration BEFORE the optimistic updates below so a failed
+      // persist can roll the readout + live root back (see captureDurationRollback).
+      const rollbackDuration = captureDurationRollback(previewIframeRef.current);
       // needsExtension gates the SDK path (setTiming can't grow the root duration),
       // so read the store BEFORE the readout sync below optimistically updates it.
       const needsExtension = extendRootDurationIfNeeded(maxEnd);
@@ -276,6 +280,11 @@ export function useTimelineGroupEditing({
             return shiftGsapPositions(projectId, changePath, domId, delta);
           },
         });
+      }).catch((error) => {
+        // Failed persist: revert the optimistic duration readout + live root
+        // alongside the gesture owner's store rollback.
+        rollbackDuration();
+        throw error;
       });
     },
     [
@@ -308,6 +317,9 @@ export function useTimelineGroupEditing({
       }
 
       const maxEnd = Math.max(...changes.map((change) => change.start + change.duration));
+      // Snapshot the duration BEFORE the optimistic updates below so a failed
+      // persist can roll the readout + live root back (see captureDurationRollback).
+      const rollbackDuration = captureDurationRollback(previewIframeRef.current);
       // needsExtension gates the SDK path (setTiming can't grow the root duration),
       // so read the store BEFORE the readout sync below optimistically updates it.
       const needsExtension = extendRootDurationIfNeeded(maxEnd);
@@ -371,6 +383,11 @@ export function useTimelineGroupEditing({
             );
           },
         });
+      }).catch((error) => {
+        // Failed persist: revert the optimistic duration readout + live root
+        // alongside the gesture owner's store rollback.
+        rollbackDuration();
+        throw error;
       });
     },
     [

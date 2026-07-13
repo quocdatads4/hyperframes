@@ -13,7 +13,7 @@ export async function readFileContent(projectId: string, targetPath: string): Pr
     throw new Error(`Unsafe path: ${targetPath}`);
   }
   const response = await fetch(
-    `/api/projects/${projectId}/files/${encodeURIComponent(targetPath)}`,
+    `/api/projects/${encodeURIComponent(projectId)}/files/${encodeURIComponent(targetPath)}`,
   );
   if (!response.ok) {
     throw new Error(`Failed to read ${targetPath}`);
@@ -53,6 +53,23 @@ export function syncPreviewContentDuration(iframe: HTMLIFrameElement | null): vo
     usePlayerStore.getState().setDuration(end);
     patchIframeRootDuration(iframe, end);
   }
+}
+
+/**
+ * Snapshot the store duration BEFORE an optimistic duration update
+ * (extendRootDurationIfNeeded + syncPreviewContentDuration) and return a
+ * rollback closure for the persist-failure path. The rollback restores BOTH
+ * the store duration and the live root's `data-duration` — otherwise a failed
+ * write leaves the readout/seek bar and the live root advertising a duration
+ * the saved source never got. No-op when the duration never changed.
+ */
+export function captureDurationRollback(iframe: HTMLIFrameElement | null): () => void {
+  const previousDuration = usePlayerStore.getState().duration;
+  return () => {
+    if (usePlayerStore.getState().duration === previousDuration) return;
+    usePlayerStore.getState().setDuration(previousDuration);
+    patchIframeRootDuration(iframe, previousDuration);
+  };
 }
 
 /**
@@ -151,6 +168,12 @@ const GSAP_HISTORY_COALESCE_MS = 10_000;
  * conflict. This snapshots every touched file, runs the mutation, then records a follow-up
  * edit under the same coalesceKey with a window wide enough to survive the GSAP round-trip,
  * folding both writes into one undo step. Returns the mutation status for caller reloads.
+ *
+ * Failure domains are separate: a MUTATION failure propagates (nothing was applied, so
+ * the caller must skip the preview sync), but a failure in the history-FOLD step
+ * (re-read / recordEdit) after a successful mutation is surfaced via `onFoldError` and
+ * the mutation status is still returned — the server rewrite already landed on disk, so
+ * the caller must still sync the preview or it shows stale GSAP positions.
  */
 async function foldGsapMutationIntoHistory(input: {
   projectId: string;
@@ -159,30 +182,37 @@ async function foldGsapMutationIntoHistory(input: {
   coalesceKey?: string;
   recordEdit: (edit: RecordEditInput) => Promise<void>;
   gsapMutation: () => Promise<GsapMutationStatus>;
+  onFoldError: (error: unknown) => void;
 }): Promise<GsapMutationStatus> {
   const uniquePaths = [...new Set(input.paths)];
   const before = new Map<string, string>();
+  // A `before`-snapshot failure propagates like a mutation failure: the mutation
+  // has not run yet, so nothing landed on disk and skipping the sync is correct.
   for (const path of uniquePaths) {
     before.set(path, await readFileContent(input.projectId, path));
   }
   const status = await input.gsapMutation();
   if (status.mutated) {
-    const files: Record<string, { before: string; after: string }> = {};
-    for (const path of uniquePaths) {
-      const priorContent = before.get(path);
-      const finalContent = await readFileContent(input.projectId, path);
-      if (priorContent !== undefined && finalContent !== priorContent) {
-        files[path] = { before: priorContent, after: finalContent };
+    try {
+      const files: Record<string, { before: string; after: string }> = {};
+      for (const path of uniquePaths) {
+        const priorContent = before.get(path);
+        const finalContent = await readFileContent(input.projectId, path);
+        if (priorContent !== undefined && finalContent !== priorContent) {
+          files[path] = { before: priorContent, after: finalContent };
+        }
       }
-    }
-    if (Object.keys(files).length > 0) {
-      await input.recordEdit({
-        label: input.label,
-        kind: "timeline",
-        coalesceKey: input.coalesceKey,
-        coalesceMs: GSAP_HISTORY_COALESCE_MS,
-        files,
-      });
+      if (Object.keys(files).length > 0) {
+        await input.recordEdit({
+          label: input.label,
+          kind: "timeline",
+          coalesceKey: input.coalesceKey,
+          coalesceMs: GSAP_HISTORY_COALESCE_MS,
+          files,
+        });
+      }
+    } catch (error) {
+      input.onFoldError(error);
     }
   }
   return status;
@@ -201,7 +231,7 @@ export async function shiftGsapPositions(
 ): Promise<GsapMutationStatus> {
   if (delta === 0 || !elementId) return { mutated: false, scriptText: null };
   const res = await fetch(
-    `/api/projects/${projectId}/gsap-mutations/${encodeURIComponent(filePath)}`,
+    `/api/projects/${encodeURIComponent(projectId)}/gsap-mutations/${encodeURIComponent(filePath)}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -233,7 +263,7 @@ export async function scaleGsapPositions(
   if (oldStart === newStart && oldDuration === newDuration)
     return { mutated: false, scriptText: null };
   const res = await fetch(
-    `/api/projects/${projectId}/gsap-mutations/${encodeURIComponent(filePath)}`,
+    `/api/projects/${encodeURIComponent(projectId)}/gsap-mutations/${encodeURIComponent(filePath)}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -298,6 +328,8 @@ export function finishClipTimingFallback(input: {
           edit.to.start,
           edit.to.duration,
         );
+  const onGsapError = (err: unknown) =>
+    console.error(`[Timeline] Failed to ${edit.kind} GSAP positions`, err);
   return finishTimelineTimingFallback({
     iframe: input.iframe,
     reloadPreview: input.reloadPreview,
@@ -311,9 +343,10 @@ export function finishClipTimingFallback(input: {
               coalesceKey: input.coalesceKey,
               recordEdit: input.recordEdit,
               gsapMutation: () => runMutation(projectId, domId),
+              onFoldError: onGsapError,
             })
         : undefined,
-    onGsapError: (err) => console.error(`[Timeline] Failed to ${edit.kind} GSAP positions`, err),
+    onGsapError,
   });
 }
 
@@ -346,6 +379,7 @@ export async function finishGroupTimingGsapFallback<C extends { element: Timelin
   const otherFileChanged = input.changes.some(
     (change) => input.resolveChangePath(change.element) !== activePath,
   );
+  const onGsapError = (err: unknown) => console.error(`[Timeline] ${input.errorLabel}`, err);
   await finishTimelineTimingFallback({
     iframe: input.iframe,
     reloadPreview: input.reloadPreview,
@@ -371,7 +405,8 @@ export async function finishGroupTimingGsapFallback<C extends { element: Timelin
           }
           return { mutated, scriptText: otherFileChanged ? null : scriptText };
         },
+        onFoldError: onGsapError,
       }),
-    onGsapError: (err) => console.error(`[Timeline] ${input.errorLabel}`, err),
+    onGsapError,
   });
 }

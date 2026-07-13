@@ -30,10 +30,14 @@ export interface TimelineElement {
   duration: number;
   track: number;
   /**
-   * The data-track-index as written in the source file, when it differs from
-   * the display lane in `track` (normalizeToZones packs sparse authored tracks
-   * onto contiguous display lanes). Lane edits must persist THIS space — writing
-   * a display-lane number into a sparse file re-targets the wrong track.
+   * The data-track-index as written in the source file. Set at the manifest
+   * translation boundary (createTimelineElementFromManifestClip) from the
+   * runtime clip's verbatim track, and preserved through display-lane remaps
+   * (normalizeToZones packs sparse authored tracks onto contiguous display
+   * lanes; expanded sub-comp children get synthetic display rows). Lane edits
+   * must persist THIS space — writing a display-lane number into a sparse file
+   * re-targets the wrong track. For an expanded child the value is in its OWN
+   * source file's coordinate space, not the host timeline's.
    */
   authoredTrack?: number;
   /** Resolved z-index for stacking-aware timeline ordering. */

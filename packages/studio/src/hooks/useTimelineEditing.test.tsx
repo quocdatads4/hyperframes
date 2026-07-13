@@ -639,6 +639,41 @@ describe("useTimelineEditing timeline z-index reorder", () => {
     unmount();
   });
 
+  it("persists a vertical-only lane move (start unchanged) through the single-element fallback", async () => {
+    // Regression: `if (!startChanged) return` ran BEFORE the file persist, so a
+    // pure lane change routed through onMoveElement (no onMoveElements wired)
+    // wrote NOTHING — the lane snapped back on the next reload.
+    const iframe = createPreviewIframe([{ id: "clip", track: 0 }]);
+    const clip = timelineElement({ id: "clip", track: 0, zIndex: 0 });
+    const commit = vi.fn<(entries: ZIndexEntry[]) => Promise<void>>().mockResolvedValue(undefined);
+    const writeProjectFile = vi.fn<(...args: unknown[]) => Promise<void>>(async () => {});
+    stubProjectFetch('<div id="clip" data-start="0" data-track-index="0"></div>');
+    const { move, unmount } = renderTimelineEditingHook({
+      timelineElements: [clip],
+      iframe,
+      onZIndexCommit: commit,
+      projectId: "p1",
+      writeProjectFile,
+      recordEdit: vi.fn(async () => {}),
+    });
+
+    await act(async () => {
+      // Vertical-only: same start, new track (already authored-space on this path).
+      await move(clip, { start: clip.start, track: 2 });
+    });
+
+    const doc = iframe.contentDocument;
+    if (!doc) throw new Error("Expected iframe document");
+    // Live DOM patched so a pre-reload re-discovery doesn't snap the lane back...
+    expect(doc.getElementById("clip")?.getAttribute("data-track-index")).toBe("2");
+    // ...and the file write carries the new data-track-index with start intact.
+    expect(writeProjectFile).toHaveBeenCalled();
+    expect(writeProjectFile.mock.calls[0]![1]).toContain('data-track-index="2"');
+    expect(writeProjectFile.mock.calls[0]![1]).toContain('data-start="0"');
+
+    unmount();
+  });
+
   it("orders the timing write after the z-index commit so a diagonal drag can't clobber the restack", async () => {
     const iframe = createPreviewIframe([
       { id: "clip", track: 0, style: "position: relative; z-index: 0" },
@@ -861,5 +896,152 @@ describe("useTimelineEditing timeline z-index reorder", () => {
 
     expect(groupWrite.mock.calls[0]![1]).toBe(singleWrite.mock.calls[0]![1]);
     group.unmount();
+  });
+});
+
+describe("useTimelineEditing duration rollback on failed persist", () => {
+  const ROLLBACK_SOURCE = [
+    `<div data-composition-id="main" data-duration="4">`,
+    `  <div id="clip" data-start="0" data-duration="2" data-track-index="0"></div>`,
+    `</div>`,
+  ].join("\n");
+
+  /** Iframe with a comp root so the optimistic sync (and its rollback) can patch data-duration. */
+  function createRootedIframe(): HTMLIFrameElement {
+    const iframe = document.createElement("iframe");
+    document.body.append(iframe);
+    const doc = iframe.contentDocument;
+    if (!doc) throw new Error("Expected iframe document");
+    doc.body.innerHTML = ROLLBACK_SOURCE;
+    return iframe;
+  }
+
+  function rootDurationAttr(iframe: HTMLIFrameElement): string | null | undefined {
+    return iframe.contentDocument
+      ?.querySelector("[data-composition-id]")
+      ?.getAttribute("data-duration");
+  }
+
+  function setupFailedPersist() {
+    const iframe = createRootedIframe();
+    const clip = timelineElement({ id: "clip", track: 0, zIndex: 0 });
+    const writeError = new Error("write failed");
+    const writeProjectFile = vi
+      .fn<(...args: unknown[]) => Promise<void>>()
+      .mockRejectedValue(writeError);
+    stubProjectFetch(ROLLBACK_SOURCE);
+    usePlayerStore.getState().setDuration(4);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const hook = renderTimelineEditingHook({
+      timelineElements: [clip],
+      iframe,
+      onZIndexCommit: vi.fn().mockResolvedValue(undefined),
+      projectId: "p1",
+      writeProjectFile,
+      recordEdit: vi.fn(async () => {}),
+      reloadPreview: vi.fn(),
+    });
+    return { iframe, clip, hook, writeError };
+  }
+
+  it("rolls back the store duration and live root when a move persist fails", async () => {
+    const { iframe, clip, hook, writeError } = setupFailedPersist();
+
+    let rejection: unknown;
+    await act(async () => {
+      // Move past the end: the optimistic sync grows the readout to 5s.
+      await hook.move(clip, { start: 3, track: clip.track }).catch((error) => {
+        rejection = error;
+      });
+      await flushAsyncWork();
+    });
+
+    expect(rejection).toBe(writeError);
+    expect(usePlayerStore.getState().duration).toBe(4);
+    expect(rootDurationAttr(iframe)).toBe("4");
+
+    hook.unmount();
+  });
+
+  it("rolls back the store duration and live root when a resize persist fails", async () => {
+    const { iframe, clip, hook, writeError } = setupFailedPersist();
+
+    let rejection: unknown;
+    await act(async () => {
+      await hook
+        .resize(clip, { start: 0, duration: 6, playbackStart: undefined })
+        .catch((error) => {
+          rejection = error;
+        });
+      await flushAsyncWork();
+    });
+
+    expect(rejection).toBe(writeError);
+    expect(usePlayerStore.getState().duration).toBe(4);
+    expect(rootDurationAttr(iframe)).toBe("4");
+
+    hook.unmount();
+  });
+
+  it("rolls back the store duration and live root when a group move persist fails", async () => {
+    const { iframe, clip, hook, writeError } = setupFailedPersist();
+
+    let rejection: unknown;
+    await act(async () => {
+      await hook.groupMove([{ element: clip, start: 3.5 }]).catch((error) => {
+        rejection = error;
+      });
+      await flushAsyncWork();
+    });
+
+    expect(rejection).toBe(writeError);
+    expect(usePlayerStore.getState().duration).toBe(4);
+    expect(rootDurationAttr(iframe)).toBe("4");
+
+    hook.unmount();
+  });
+
+  it("rolls back the store duration and live root when a group resize persist fails", async () => {
+    const { iframe, clip, hook, writeError } = setupFailedPersist();
+
+    let rejection: unknown;
+    await act(async () => {
+      await hook.groupResize([{ element: clip, start: 0, duration: 7 }]).catch((error) => {
+        rejection = error;
+      });
+      await flushAsyncWork();
+    });
+
+    expect(rejection).toBe(writeError);
+    expect(usePlayerStore.getState().duration).toBe(4);
+    expect(rootDurationAttr(iframe)).toBe("4");
+
+    hook.unmount();
+  });
+
+  it("keeps the grown duration when the persist succeeds", async () => {
+    const { iframe, clip, hook } = setupFailedPersist();
+    // Same harness, but with a write that succeeds this time.
+    hook.unmount();
+    const writeProjectFile = vi.fn<(...args: unknown[]) => Promise<void>>(async () => {});
+    const succeeding = renderTimelineEditingHook({
+      timelineElements: [clip],
+      iframe,
+      onZIndexCommit: vi.fn().mockResolvedValue(undefined),
+      projectId: "p1",
+      writeProjectFile,
+      recordEdit: vi.fn(async () => {}),
+      reloadPreview: vi.fn(),
+    });
+
+    await act(async () => {
+      await succeeding.move(clip, { start: 3, track: clip.track });
+      await flushAsyncWork();
+    });
+
+    expect(usePlayerStore.getState().duration).toBe(5);
+    expect(rootDurationAttr(iframe)).toBe("5");
+
+    succeeding.unmount();
   });
 });

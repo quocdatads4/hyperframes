@@ -1,5 +1,5 @@
 import { type TimelineElement, usePlayerStore } from "../player/store/playerStore";
-import { applyPatchByTarget, readAttributeByTarget } from "../utils/sourcePatcher";
+import { applyPatchByTarget, findTagByTarget, readAttributeByTarget } from "../utils/sourcePatcher";
 import {
   formatTimelineAttributeNumber,
   type TimelineStackingReorderIntent,
@@ -319,10 +319,17 @@ export async function persistTimelineBatchEdit(
     }
 
     const current = patchedByPath.get(targetPath) ?? original;
+    // Resolve the target FIRST: byte-identical output below is only a legit
+    // no-op when the member actually resolved in the source. A mistargeted
+    // member (stale id/selector) must fail loudly like the single-edit path,
+    // not be silently dropped as "already at target".
+    if (!findTagByTarget(current, patchTarget)) {
+      throw new Error(`Unable to patch timeline element ${change.element.id} in ${targetPath}`);
+    }
     const patched = change.buildPatches(current, patchTarget);
-    // A member whose attributes already hold the target values patches to the
-    // identical string — e.g. a track-insert renumber where one clip's lane is
-    // already correct. That is a legitimate no-op, not a targeting failure:
+    // The target resolved, so a member whose attributes already hold the target
+    // values patches to the identical string — e.g. a track-insert renumber
+    // where one clip's lane is already correct. That is a legitimate no-op:
     // skip it instead of aborting (and rolling back) the whole batch.
     if (patched === current) continue;
     patchedByPath.set(targetPath, patched);

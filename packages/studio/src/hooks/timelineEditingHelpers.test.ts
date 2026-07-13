@@ -184,6 +184,19 @@ describe("persistTimelineBatchEdit", () => {
 
     expect(writes).toHaveLength(0);
   });
+
+  it("throws on a mistargeted member instead of silently dropping it", async () => {
+    // A member whose target does not resolve in the source (stale id) patches
+    // to the identical string too — but that is a targeting FAILURE, not an
+    // already-at-target no-op, and must abort the batch like the single path.
+    stubReadFileContent(SOURCE);
+    const writes: Array<[string, string]> = [];
+
+    await expect(
+      persistTimelineBatchEdit(batchInput([moveMember("ghost", 3, 0, 2)], writes)),
+    ).rejects.toThrow("Unable to patch timeline element ghost in index.html");
+    expect(writes).toHaveLength(0);
+  });
 });
 
 describe("deleteSelectedKeyframes", () => {

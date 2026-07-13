@@ -46,6 +46,7 @@ export function AudioRow({
   const requestClipReveal = usePlayerStore((s) => s.requestClipReveal);
   const elements = usePlayerStore((s) => s.elements);
   const setPreviewAsset = useAssetPreviewStore((s) => s.setPreviewAsset);
+  const clearPreviewAsset = useAssetPreviewStore((s) => s.clearPreviewAsset);
 
   const handlePointerDown = useCallback((e: React.PointerEvent) => {
     pointerDownRef.current = { x: e.clientX, y: e.clientY };
@@ -60,6 +61,9 @@ export function AudioRow({
       if (used) {
         const clip = findClipForAsset(elements, asset);
         if (clip) {
+          // Dismiss any open preview overlay (from another asset) — the reveal
+          // must not leave a stale preview card floating over the canvas.
+          clearPreviewAsset();
           const clipKey = clip.key ?? clip.id;
           setSelectedElementId(clipKey);
           // Scroll the timeline so the selected clip is actually visible.
@@ -70,7 +74,16 @@ export function AudioRow({
       // Not added → preview overlay (audio player)
       setPreviewAsset(asset, projectId);
     },
-    [used, elements, asset, projectId, setSelectedElementId, requestClipReveal, setPreviewAsset],
+    [
+      used,
+      elements,
+      asset,
+      projectId,
+      setSelectedElementId,
+      requestClipReveal,
+      setPreviewAsset,
+      clearPreviewAsset,
+    ],
   );
 
   useEffect(() => {

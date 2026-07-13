@@ -42,6 +42,14 @@ function byStableId(a: TimelineElement, b: TimelineElement): number {
  * The editor enforces no per-track time overlap, so the spill only fires on legacy
  * files. It is DISPLAY-ONLY — a drag commit persists just the dragged clip, never
  * this re-lane — so it never rewrites the source.
+ *
+ * Spill sub-lanes ARE legal drop targets (Timeline's trackOrder lists every
+ * display lane). Because every occupant of a sub-lane shares the base lane's
+ * authored track by construction, dropping a clip onto one persists that shared
+ * authored track — a legitimate same-track join. On the next normalize the
+ * joined track re-packs (stable-id first-fit), so the clip may display on a
+ * DIFFERENT sub-lane than it was dropped on; the packing is deterministic, and
+ * the persisted source value is correct either way.
  */
 function packTrackLanes(
   clips: TimelineElement[],

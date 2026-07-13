@@ -70,6 +70,14 @@ export interface StackingPatch {
 const EPS = 1e-6;
 
 /**
+ * Canonical stacking-context key: null/undefined both mean the root context.
+ * The ONLY place the normalization lives — context partitioning, membership
+ * checks, and pairwise equality must all go through it.
+ */
+const contextKey = (el: { stackingContextId?: string | null }): string | null =>
+  el.stackingContextId ?? null;
+
+/**
  * Two clips overlap in time when their half-open [start, end) intervals intersect.
  *
  * NOTE the `- EPS`: this DELIBERATELY diverges from `timeRangesOverlap`'s exact
@@ -297,10 +305,8 @@ export function computeStackingPatches(
   // ancestor contexts' z decides paint order, so comparing (or patching) leaf
   // values across contexts is nonsense. Restrict the computation to the edited
   // clips' own context(s); cross-context lane relations are out of scope.
-  const editedContexts = new Set(
-    allResolved.filter((e) => editedSet.has(e.key)).map((e) => e.stackingContextId ?? null),
-  );
-  const resolved = allResolved.filter((e) => editedContexts.has(e.stackingContextId ?? null));
+  const editedContexts = new Set(allResolved.filter((e) => editedSet.has(e.key)).map(contextKey));
+  const resolved = allResolved.filter((e) => editedContexts.has(contextKey(e)));
 
   // Mutable z snapshot so edits + cascaded bumps see each other's applied z.
   const byKey = new Map<string, MutZ>(resolved.map((e) => [e.key, { ...e }]));
@@ -320,8 +326,7 @@ export function computeStackingPatches(
   // The full live set, so the transitive cascade can reach clips that overlap a
   // LIFTED neighbour without overlapping the edited clip itself (#2198).
   const all = [...byKey.values()];
-  const sameContext = (a: MutZ, b: MutZ) =>
-    (a.stackingContextId ?? null) === (b.stackingContextId ?? null);
+  const sameContext = (a: MutZ, b: MutZ) => contextKey(a) === contextKey(b);
   const overlappersOf = (clip: MutZ): MutZ[] =>
     all.filter(
       (o) => o.key !== clip.key && !o.isAudio && sameContext(clip, o) && overlapsInTime(clip, o),

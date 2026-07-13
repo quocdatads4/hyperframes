@@ -91,4 +91,43 @@ describe("computeRevealScroll", () => {
     expect(result.top).toBe(548 - 400 + REVEAL_SCROLL_PADDING_PX);
     expect(result.left).toBeNull();
   });
+
+  it("never scrolls on an axis whose visible window is degenerate", () => {
+    // Horizontal window collapses: 40px viewport minus the 32px gutter and
+    // 2x12px padding is negative; vertical is intact and still reveals.
+    const result = computeRevealScroll(
+      makeInput({
+        viewportWidth: 40,
+        clipLeft: 1500,
+        clipRight: 1600,
+        clipTop: 500,
+        clipBottom: 548,
+      }),
+    );
+    expect(result.left).toBeNull();
+    expect(result.top).toBe(548 - 400 + REVEAL_SCROLL_PADDING_PX);
+
+    // Exactly-zero window (viewport == sticky + 2x padding) is degenerate too.
+    const zero = computeRevealScroll(
+      makeInput({
+        viewportWidth: 32 + 2 * REVEAL_SCROLL_PADDING_PX,
+        clipLeft: 1500,
+        clipRight: 1600,
+      }),
+    );
+    expect(zero.left).toBeNull();
+
+    // Both axes degenerate: no scroll at all.
+    const both = computeRevealScroll(
+      makeInput({
+        viewportWidth: 10,
+        viewportHeight: 10,
+        clipLeft: 1500,
+        clipRight: 1600,
+        clipTop: 500,
+        clipBottom: 548,
+      }),
+    );
+    expect(both).toEqual({ left: null, top: null });
+  });
 });

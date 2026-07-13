@@ -232,11 +232,73 @@ describe("commitDraggedClipMove", () => {
       drag(elements[0], { previewStart: 20, previewTrack: 1, desiredTrack: 1 }),
       { elements, trackOrder: [0, 1] },
     );
-    // Store stays in display-lane space...
-    expect(updateElement).toHaveBeenCalledWith("a", { start: 20, track: 1 });
+    // Store stays in display-lane space, but authoredTrack is refreshed to the
+    // value just written to the file so a SECOND drag before any reload resolves
+    // authored tracks from current data, not the stale pre-edit value.
+    expect(updateElement).toHaveBeenCalledWith("a", { start: 20, track: 1, authoredTrack: 2 });
     // ...while the persist is translated to the target lane's authored track.
     const map = editMap(onMoveElements.mock.calls[0][0]);
     expect(map.a).toEqual({ start: 20, track: 2 });
+  });
+
+  it("resolves the authored track from occupants of the dragged clip's OWN source file", () => {
+    // Expanded sub-comp children live on synthetic display lanes next to host
+    // clips. Their authoredTrack is in THEIR file's coordinate space, so a lane
+    // occupied by a clip from a DIFFERENT file must never lend its authored
+    // value. Here lane 1 holds both a host-file clip (authored 12) and a
+    // same-file sibling (authored 7): the sibling answers.
+    const child3 = { ...el("c3", 0, 0, 3), authoredTrack: 3, sourceFile: "scene.html" };
+    const child7 = { ...el("c7", 1, 10, 3), authoredTrack: 7, sourceFile: "scene.html" };
+    const hostClip = { ...el("h", 1, 20, 3), authoredTrack: 12, sourceFile: "index.html" };
+    const elements = [child3, child7, hostClip];
+    const { onMoveElements } = runClipMove(
+      drag(child3, { previewStart: 0, previewTrack: 1, desiredTrack: 1 }),
+      { elements, trackOrder: [0, 1] },
+    );
+    const map = editMap(onMoveElements.mock.calls[0][0]);
+    expect(map.c3).toEqual({ start: 0, track: 7 });
+  });
+
+  it("never persists the display-lane integer when the target lane has no same-file occupant", () => {
+    // Reviewer scenario: an expanded child of a SPARSE file (authored tracks 3
+    // and 7 → display lanes 4 and 5) dragged onto display lane 6, which holds
+    // only another file's clip. Persisting 6 (the display integer) or 12 (the
+    // foreign authored value) would corrupt the sparse file; the fallback
+    // offsets from the NEAREST same-file lane instead: authored 7 at lane 5,
+    // one lane further down → 8.
+    const child3 = { ...el("c3", 4, 0, 3), authoredTrack: 3, sourceFile: "scene.html" };
+    const child7 = { ...el("c7", 5, 10, 3), authoredTrack: 7, sourceFile: "scene.html" };
+    const foreign = { ...el("f", 6, 20, 3), authoredTrack: 12, sourceFile: "index.html" };
+    const elements = [child3, child7, foreign];
+    const { onMoveElements } = runClipMove(
+      drag(child3, { previewStart: 0, previewTrack: 6, desiredTrack: 6 }),
+      { elements, trackOrder: [4, 5, 6] },
+    );
+    const map = editMap(onMoveElements.mock.calls[0][0]);
+    expect(map.c3.track).not.toBe(6); // not the display-lane integer
+    expect(map.c3.track).not.toBe(12); // not the foreign file's authored value
+    expect(map.c3).toEqual({ start: 0, track: 8 });
+  });
+
+  it("dropping onto an overlap spill sub-lane persists the base lane's shared authored track", () => {
+    // Authored track 2 holds two time-overlapping clips, which packTrackLanes
+    // spills onto display sub-lanes 1 and 2 (both authoredTrack 2). Dropping
+    // 'a' onto the spill sub-lane (2) is a legitimate same-track join: the
+    // persisted value is the shared authored track (2), even though the clip
+    // may re-pack onto a different sub-lane on the next normalize.
+    const elements = normalizeToZones([
+      { ...el("a", 0, 30, 3), authoredTrack: 1 },
+      { ...el("b1", 2, 0, 5), authoredTrack: 2 },
+      { ...el("b2", 2, 3, 5), authoredTrack: 2 }, // overlaps b1 → spills
+    ]);
+    expect(elements.map((e) => e.track)).toEqual([0, 1, 2]); // spill happened
+    const spillLane = elements.find((e) => e.id === "b2")!.track;
+    const { onMoveElements } = runClipMove(
+      drag(elements[0], { previewStart: 30, previewTrack: spillLane, desiredTrack: spillLane }),
+      { elements, trackOrder: [0, 1, 2] },
+    );
+    const map = editMap(onMoveElements.mock.calls[0][0]);
+    expect(map.a).toEqual({ start: 30, track: 2 });
   });
 
   it("multi-selection time-move shifts EVERY selected clip by the drag delta (atomic)", () => {
