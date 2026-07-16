@@ -35,6 +35,7 @@ export interface StoryboardFrameFocusProps {
   commentsSubmitState: CommentsSubmitState;
   commentsSubmitError: string | null;
   feedbackMessageCopied: boolean;
+  onFeedbackMessageCopied: () => void;
   onSaveFeedback: () => void;
   /** Project signature the board was loaded with (busts the poster cache). */
   posterVersion?: string;
@@ -67,11 +68,12 @@ export function StoryboardFrameFocus({
   commentsSubmitState,
   commentsSubmitError,
   feedbackMessageCopied,
+  onFeedbackMessageCopied,
   onSaveFeedback,
   posterVersion,
 }: StoryboardFrameFocusProps) {
   const { readProjectFile, writeProjectFile } = useFileManagerContext();
-  const { setViewMode } = useViewMode();
+  const { setViewMode, registerViewModeGuard } = useViewMode();
   const [draft, setDraft] = useState(frame.voiceover ?? "");
   const [savedVoiceover, setSavedVoiceover] = useState(frame.voiceover ?? "");
   const [busy, setBusy] = useState(false);
@@ -121,7 +123,12 @@ export function StoryboardFrameFocus({
   // dirty. An in-flight save does NOT count as safe: if it fails after unmount
   // the error lands on an unmounted component and the draft is silently lost,
   // so keep confirming until the save actually lands (dirty clears on success).
-  const confirmLeave = () => !dirty || window.confirm("Discard unsaved voiceover changes?");
+  const confirmLeave = useCallback(
+    () => !dirty || window.confirm("Discard unsaved voiceover changes?"),
+    [dirty],
+  );
+  useEffect(() => registerViewModeGuard(confirmLeave), [confirmLeave, registerViewModeGuard]);
+
   const handleBack = () => {
     if (confirmLeave()) onBack();
   };
@@ -144,8 +151,8 @@ export function StoryboardFrameFocus({
   });
 
   const openInPreview = () => {
+    if (!setViewMode("timeline")) return;
     if (frame.src) onSelectComposition(frame.src);
-    setViewMode("timeline");
   };
 
   return (
@@ -185,7 +192,7 @@ export function StoryboardFrameFocus({
               {commentDraftCount > 0
                 ? "Save this batch and copy the message for your agent."
                 : feedbackMessageCopied
-                  ? "Message copied — paste it in agent chat to continue."
+                  ? "Message copied — paste it in your terminal or IDE agent chat."
                   : "The agent has not been notified yet."}
             </div>
           </div>
@@ -201,7 +208,8 @@ export function StoryboardFrameFocus({
           ) : (
             <AgentChatMessageButton
               message={APPLY_STORYBOARD_FEEDBACK_MESSAGE}
-              label={feedbackMessageCopied ? "Copy again" : "Copy agent message"}
+              label={feedbackMessageCopied ? "Copy again" : "Copy prompt for agent"}
+              onCopied={onFeedbackMessageCopied}
             />
           )}
         </div>
@@ -235,7 +243,10 @@ export function StoryboardFrameFocus({
 
           <section>
             <div className="mb-1 flex items-center justify-between">
-              <h3 className="text-xs font-semibold uppercase tracking-wider text-neutral-400">
+              <h3
+                className="text-xs font-semibold uppercase tracking-wider text-neutral-400"
+                title="Storyboard voiceover is a guide; SCRIPT.md is the final TTS source."
+              >
                 🎙 Voiceover <span className="font-normal normal-case text-neutral-600">guide</span>
               </h3>
               <Button
@@ -259,7 +270,7 @@ export function StoryboardFrameFocus({
               {dirty
                 ? "Unsaved changes"
                 : scriptExists
-                  ? "Saved to STORYBOARD.md as a guide. SCRIPT.md owns final narration and TTS."
+                  ? "Saved. SCRIPT.md drives final TTS."
                   : "Saved to STORYBOARD.md. This voiceover guides narration for the frame."}
             </p>
             {error && <p className="mt-1 text-[11px] text-red-400">{error}</p>}
@@ -282,9 +293,12 @@ export function StoryboardFrameFocus({
             {pendingCommentCount > 0 ? (
               <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-md border border-sky-900/70 bg-sky-950/20 px-2.5 py-2">
                 <p className="text-[11px] text-sky-200">
-                  Feedback saved. Next: paste the agent message in chat.
+                  Paste the agent prompt in your terminal or IDE chat.
                 </p>
-                <AgentChatMessageButton message={APPLY_STORYBOARD_FEEDBACK_MESSAGE} />
+                <AgentChatMessageButton
+                  message={APPLY_STORYBOARD_FEEDBACK_MESSAGE}
+                  onCopied={onFeedbackMessageCopied}
+                />
               </div>
             ) : (
               <p className="mt-1 text-[11px] text-neutral-600">

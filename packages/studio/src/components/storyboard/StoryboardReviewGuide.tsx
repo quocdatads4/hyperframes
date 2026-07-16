@@ -21,7 +21,7 @@ const GUIDE_COPY: Record<StoryboardReviewStage, { eyebrow: string; title: string
     "plan-review": {
       eyebrow: "Ready for review",
       title: "Review the story plan",
-      body: "Check the sequence, scene direction, and voiceover before visual work begins. Leave frame comments, save them, then reply in agent chat to request changes or approve the plan.",
+      body: "Check the sequence, scene direction, and voiceover before visual work begins. Leave frame comments, save them, then reply in your terminal or IDE agent chat.",
     },
     "sketch-in-progress": {
       eyebrow: "Build in progress",
@@ -31,7 +31,7 @@ const GUIDE_COPY: Record<StoryboardReviewStage, { eyebrow: string; title: string
     "sketch-review": {
       eyebrow: "Ready for review",
       title: "Review the visual direction",
-      body: "Check composition, hierarchy, and copy. Save frame comments, then reply in agent chat to request changes or approve the sketches for animation.",
+      body: "Check composition, hierarchy, and copy. Save frame comments, then reply in your terminal or IDE agent chat.",
     },
     "animation-in-progress": {
       eyebrow: "Build in progress",
@@ -66,7 +66,7 @@ const REVIEW_ACTION_COPY: Record<
   },
   "final-review": {
     body: "Add comments where you want changes. If everything looks right, approve this pass in agent chat.",
-    approvalMessage: "Approve this final storyboard review.",
+    approvalMessage: "Approve this final storyboard review and continue to rendering.",
   },
 };
 
@@ -110,6 +110,7 @@ export interface StoryboardReviewGuideProps {
   frames: StoryboardFrameView[];
   draftCount: number;
   pendingCount: number;
+  onFeedbackMessageCopied: () => void;
 }
 
 /** Stage-aware instructions plus the explicit Studio → agent handoff. */
@@ -117,6 +118,7 @@ export function StoryboardReviewGuide({
   frames,
   draftCount,
   pendingCount,
+  onFeedbackMessageCopied,
 }: StoryboardReviewGuideProps) {
   const summary = deriveStoryboardReviewStage(frames);
   const copy = GUIDE_COPY[summary.stage];
@@ -155,7 +157,12 @@ export function StoryboardReviewGuide({
       {summary.frameCount > 0 && (
         <div className="mt-3 border-t border-neutral-800 pt-3">
           <ReviewSteps current={handoffStep} />
-          <NextAction stage={summary.stage} step={handoffStep} draftCount={draftCount} />
+          <NextAction
+            stage={summary.stage}
+            step={handoffStep}
+            draftCount={draftCount}
+            onFeedbackMessageCopied={onFeedbackMessageCopied}
+          />
         </div>
       )}
     </section>
@@ -217,27 +224,34 @@ function NextAction({
   stage,
   step,
   draftCount,
+  onFeedbackMessageCopied,
 }: {
   stage: StoryboardReviewStage;
   step: StoryboardHandoffStep;
   draftCount: number;
+  onFeedbackMessageCopied: () => void;
 }) {
-  if (step === 3) return <AgentHandoffAction />;
+  if (step === 3) {
+    return <AgentHandoffAction onFeedbackMessageCopied={onFeedbackMessageCopied} />;
+  }
   if (step === 2) return <SaveFeedbackAction draftCount={draftCount} />;
   return <ReviewFramesAction stage={stage} />;
 }
 
-function AgentHandoffAction() {
+function AgentHandoffAction({ onFeedbackMessageCopied }: { onFeedbackMessageCopied: () => void }) {
   return (
     <div className="mt-3 flex flex-col gap-3 rounded-md border border-sky-900/70 bg-sky-950/20 px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between">
       <div className="max-w-3xl">
-        <div className="text-xs font-semibold text-sky-200">Next: return to agent chat</div>
+        <div className="text-xs font-semibold text-sky-200">Next: return to your agent chat</div>
         <p className="mt-0.5 text-[11px] text-neutral-400">
-          Feedback is saved, but the agent has not been notified. Paste this message in chat: “
-          {APPLY_STORYBOARD_FEEDBACK_MESSAGE}”
+          Feedback is saved, but the agent has not been notified. Paste this prompt in your terminal
+          or IDE agent chat.
         </p>
       </div>
-      <AgentChatMessageButton message={APPLY_STORYBOARD_FEEDBACK_MESSAGE} />
+      <AgentChatMessageButton
+        message={APPLY_STORYBOARD_FEEDBACK_MESSAGE}
+        onCopied={onFeedbackMessageCopied}
+      />
     </div>
   );
 }

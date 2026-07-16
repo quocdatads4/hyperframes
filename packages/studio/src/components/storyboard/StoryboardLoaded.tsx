@@ -112,6 +112,7 @@ export function StoryboardLoaded({
         commentsSubmitState={comments.submitState}
         commentsSubmitError={comments.submitError}
         feedbackMessageCopied={feedbackMessageCopied}
+        onFeedbackMessageCopied={() => setFeedbackMessageCopied(true)}
         onSaveFeedback={() => void saveFeedbackAndCopyMessage()}
         posterVersion={data.signature}
       />
@@ -130,6 +131,7 @@ export function StoryboardLoaded({
             submitError={comments.submitError}
             messageCopied={feedbackMessageCopied}
             onSave={() => void saveFeedbackAndCopyMessage()}
+            onMessageCopied={() => setFeedbackMessageCopied(true)}
           />
         )}
       </div>
@@ -141,6 +143,7 @@ export function StoryboardLoaded({
               frames={data.frames}
               draftCount={comments.draftCount}
               pendingCount={comments.pending?.length ?? 0}
+              onFeedbackMessageCopied={() => setFeedbackMessageCopied(true)}
             />
             <StoryboardWarnings
               warnings={data.warnings}
@@ -177,6 +180,7 @@ function CommentsSubmitBar({
   submitError,
   messageCopied,
   onSave,
+  onMessageCopied,
 }: {
   draftCount: number;
   pendingCount: number;
@@ -184,6 +188,7 @@ function CommentsSubmitBar({
   submitError: string | null;
   messageCopied: boolean;
   onSave: () => void;
+  onMessageCopied: () => void;
 }) {
   return (
     <div className="ml-auto flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2 sm:flex-none">
@@ -191,12 +196,13 @@ function CommentsSubmitBar({
         <>
           <span className="text-xs text-sky-300">
             {messageCopied
-              ? "Feedback saved · Message copied — paste it in agent chat."
+              ? "Feedback saved · Message copied — paste it in your terminal or IDE agent chat."
               : "Feedback saved · Agent not notified."}
           </span>
           <AgentChatMessageButton
             message={APPLY_STORYBOARD_FEEDBACK_MESSAGE}
-            label={messageCopied ? "Copy again" : "Copy agent message"}
+            label={messageCopied ? "Copy again" : "Copy prompt for agent"}
+            onCopied={onMessageCopied}
           />
         </>
       )}

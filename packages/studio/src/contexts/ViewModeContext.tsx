@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -17,6 +18,7 @@ import {
  * user straight into the storyboard by navigating the tab to `?view=storyboard`.
  */
 export type StudioViewMode = "timeline" | "storyboard";
+export type ViewModeGuard = (nextMode: StudioViewMode) => boolean;
 
 const VIEW_QUERY_PARAM = "view";
 
@@ -40,7 +42,9 @@ function writeViewModeToUrl(mode: StudioViewMode): void {
 
 export interface ViewModeValue {
   viewMode: StudioViewMode;
-  setViewMode: (mode: StudioViewMode) => void;
+  /** Returns false when an active editor vetoes the transition. */
+  setViewMode: (mode: StudioViewMode) => boolean;
+  registerViewModeGuard: (guard: ViewModeGuard) => () => void;
 }
 
 /**
@@ -49,6 +53,7 @@ export interface ViewModeValue {
  */
 export function useViewModeState(): ViewModeValue {
   const [viewMode, setMode] = useState<StudioViewMode>(() => readViewModeFromUrl());
+  const guardsRef = useRef(new Set<ViewModeGuard>());
 
   // Reflect genuine browser back/forward between history entries with a different
   // `?view=`. Note: our own writes use `replaceState` (below), which does NOT fire
@@ -63,11 +68,25 @@ export function useViewModeState(): ViewModeValue {
   }, []);
 
   const setViewMode = useCallback((mode: StudioViewMode) => {
+    for (const guard of guardsRef.current) {
+      if (!guard(mode)) return false;
+    }
     setMode(mode);
     writeViewModeToUrl(mode);
+    return true;
   }, []);
 
-  return useMemo(() => ({ viewMode, setViewMode }), [viewMode, setViewMode]);
+  const registerViewModeGuard = useCallback((guard: ViewModeGuard) => {
+    guardsRef.current.add(guard);
+    return () => {
+      guardsRef.current.delete(guard);
+    };
+  }, []);
+
+  return useMemo(
+    () => ({ viewMode, setViewMode, registerViewModeGuard }),
+    [viewMode, setViewMode, registerViewModeGuard],
+  );
 }
 
 const ViewModeContext = createContext<ViewModeValue | null>(null);

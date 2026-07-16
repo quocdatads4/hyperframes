@@ -21,13 +21,9 @@ export function deriveStoryboardHandoffStep(
   draftCount: number,
   pendingCount: number,
 ): StoryboardHandoffStep {
-  if (pendingCount > 0) return 3;
   if (draftCount > 0) return 2;
+  if (pendingCount > 0) return 3;
   return 1;
-}
-
-export function isReviewReadyStage(stage: StoryboardReviewStage): boolean {
-  return stage === "plan-review" || stage === "sketch-review" || stage === "final-review";
 }
 
 /** Derive the board-level review moment from agent-owned frame statuses. */

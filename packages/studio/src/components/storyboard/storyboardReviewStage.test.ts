@@ -1,9 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  deriveStoryboardHandoffStep,
-  deriveStoryboardReviewStage,
-  isReviewReadyStage,
-} from "./storyboardReviewStage";
+import { deriveStoryboardHandoffStep, deriveStoryboardReviewStage } from "./storyboardReviewStage";
 
 describe("deriveStoryboardReviewStage", () => {
   it.each([
@@ -37,16 +33,8 @@ describe("storyboard review handoff", () => {
     [0, 0, 1],
     [2, 0, 2],
     [0, 3, 3],
-    [1, 3, 3],
+    [1, 3, 2],
   ] as const)("maps %i drafts and %i pending comments to step %i", (drafts, pending, step) => {
     expect(deriveStoryboardHandoffStep(drafts, pending)).toBe(step);
-  });
-
-  it("only offers approval when a review pass is complete", () => {
-    expect(isReviewReadyStage("plan-review")).toBe(true);
-    expect(isReviewReadyStage("sketch-review")).toBe(true);
-    expect(isReviewReadyStage("final-review")).toBe(true);
-    expect(isReviewReadyStage("sketch-in-progress")).toBe(false);
-    expect(isReviewReadyStage("animation-in-progress")).toBe(false);
   });
 });
