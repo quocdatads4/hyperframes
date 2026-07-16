@@ -1170,6 +1170,81 @@ describe("checkRenderResolutionPreflight", () => {
       await checkRenderResolutionPreflight("<html><body></body></html>", "landscape", noModes),
     ).toBeUndefined();
   });
+
+  // Aspect-agnostic aliases (`--resolution 1080p` / `hd` / `4k` / `uhd`) name a
+  // resolution tier without pinning an orientation. When the flag is
+  // aspect-agnostic the pre-flight must NOT block on an aspect-ratio mismatch —
+  // the compile stage adapts the preset to the composition's orientation
+  // downstream (see `outputResolutionAspectAgnostic` on RenderConfig).
+  // Field signal ts=1784176662 (darwin/arm64, CLI 0.7.59):
+  //   "--resolution 1080p rejects a 1080x1920 portrait comp"
+  describe("aspect-agnostic (--resolution 1080p / hd / 4k / uhd)", () => {
+    const agnostic = { ...noModes, aspectAgnostic: true } as const;
+
+    it("clears a landscape preset on a portrait composition (the field-signal scenario)", async () => {
+      // The bug: --resolution 1080p normalized to `landscape` (1920×1080),
+      // then errored on a 1080×1920 portrait comp with "Output resolution
+      // incompatible." With aspectAgnostic=true the pre-flight steps aside
+      // and the compile stage re-maps landscape → portrait.
+      expect(
+        await checkRenderResolutionPreflight(portraitHtml, "landscape", agnostic),
+      ).toBeUndefined();
+    });
+
+    it("clears a landscape-4k preset on a portrait composition (4K tier)", async () => {
+      // `--resolution 4k` → normalized `landscape-4k`. Portrait comp is fine
+      // when aspect-agnostic.
+      expect(
+        await checkRenderResolutionPreflight(portraitHtml, "landscape-4k", agnostic),
+      ).toBeUndefined();
+    });
+
+    it("clears a landscape preset on a square composition", async () => {
+      // aspect > 1 → landscape, aspect = 1 → square. Both self-heal.
+      expect(
+        await checkRenderResolutionPreflight(comp(1080, 1080), "landscape", agnostic),
+      ).toBeUndefined();
+    });
+
+    it("still flags alpha + aspect-agnostic (orientation isn't the issue)", async () => {
+      // alpha-incompatible is orthogonal to aspect: the alpha capture path
+      // can't apply deviceScaleFactor regardless of orientation. The
+      // aspect-agnostic downgrade must NOT swallow this.
+      const result = await checkRenderResolutionPreflight(portraitHtml, "landscape", {
+        aspectAgnostic: true,
+        alphaRequested: true,
+        hdrRequested: false,
+      });
+      expect(result?.kind).toBe("alpha-incompatible");
+    });
+
+    it("still flags HDR + aspect-agnostic", async () => {
+      const result = await checkRenderResolutionPreflight(landscapeHtml, "landscape", {
+        aspectAgnostic: true,
+        alphaRequested: false,
+        hdrRequested: true,
+      });
+      expect(result?.kind).toBe("hdr-incompatible");
+    });
+
+    it("still flags downsampling + aspect-agnostic (same-orientation, smaller preset)", async () => {
+      // 3840×2160 comp with `--resolution 1080p` → `landscape` (1920×1080).
+      // Same orientation, but tier smaller than comp — user asked for a
+      // downsample. That's a real incompatibility, not an orientation swap.
+      const result = await checkRenderResolutionPreflight(comp(3840, 2160), "landscape", agnostic);
+      expect(result?.kind).toBe("downsampling");
+    });
+
+    it("does NOT auto-clear when the flag was explicit (orientation-locked preset stays strict)", async () => {
+      // The negative case: `--resolution landscape` on a portrait comp — the
+      // user explicitly asked for landscape orientation, and the mismatch is
+      // a genuine mistake. Pre-flight must still block with the actionable
+      // "did you mean --resolution portrait?" suggestion.
+      const result = await checkRenderResolutionPreflight(portraitHtml, "landscape", noModes);
+      expect(result?.kind).toBe("aspect-mismatch");
+      expect(result?.message).toContain("--resolution portrait");
+    });
+  });
 });
 
 describe("render fps arg definition", () => {

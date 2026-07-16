@@ -90,6 +90,7 @@ import {
 } from "@hyperframes/engine";
 import {
   normalizeResolutionFlag,
+  isAspectAgnosticResolutionAlias,
   checkOutputResolutionCompatibility,
   parseFps,
   fpsToNumber,
@@ -481,6 +482,15 @@ export default defineCommand({
 
     // ── Validate resolution ────────────────────────────────────────────────
     let outputResolution: CanvasResolution | undefined;
+    // Aspect-agnostic aliases (`--resolution 1080p` / `hd` / `4k` / `uhd`) name
+    // a resolution *tier* without pinning an orientation. Historically they
+    // all normalize to a `landscape` preset, which rejects portrait/square
+    // compositions at `resolveDeviceScaleFactor` time. Track the raw-input
+    // shape so the compile stage can re-map the preset to the composition's
+    // orientation (see `outputResolutionAspectAgnostic` on RenderConfig).
+    // Explicit orientation-bearing aliases (`1080p-portrait`, `4k-square`, …)
+    // and canonical presets (`landscape`, `portrait`, …) stay strict.
+    let outputResolutionAspectAgnostic = false;
     if (args.resolution !== undefined) {
       outputResolution = normalizeResolutionFlag(args.resolution);
       if (!outputResolution) {
@@ -491,6 +501,7 @@ export default defineCommand({
         );
         process.exit(1);
       }
+      outputResolutionAspectAgnostic = isAspectAgnosticResolutionAlias(args.resolution);
       // Reject the --resolution + --hdr combination at the CLI layer so the
       // user sees the friendly errorBox before any work directories or
       // ffmpeg processes spin up. The orchestrator also enforces this via
@@ -860,6 +871,7 @@ export default defineCommand({
           {
             alphaRequested: format === "webm" || format === "mov" || format === "png-sequence",
             hdrRequested: args.hdr ?? false,
+            aspectAgnostic: outputResolutionAspectAgnostic,
           },
         );
       } catch {
@@ -906,6 +918,8 @@ export default defineCommand({
         browserPath,
         entryFile,
         outputResolution,
+        outputResolutionAspectAgnostic,
+        outputResolutionRaw: args.resolution,
         pageNavigationTimeoutMs,
         protocolTimeout,
         playerReadyTimeout,
@@ -973,6 +987,8 @@ export default defineCommand({
         variables,
         entryFile,
         outputResolution,
+        outputResolutionAspectAgnostic,
+        outputResolutionRaw: args.resolution,
         pageSideCompositing: args["page-side-compositing"] !== false,
         experimentalFastCapture: args["experimental-fast-capture"] === true,
         pageNavigationTimeoutMs,
@@ -1002,6 +1018,8 @@ export default defineCommand({
         variables,
         entryFile,
         outputResolution,
+        outputResolutionAspectAgnostic,
+        outputResolutionRaw: args.resolution,
         pageNavigationTimeoutMs,
         protocolTimeout,
         playerReadyTimeout,
@@ -1056,6 +1074,20 @@ interface RenderOptions {
   exitAfterComplete?: boolean;
   /** Output resolution preset; see `resolveDeviceScaleFactor` for constraints. */
   outputResolution?: CanvasResolution;
+  /**
+   * True when `outputResolution` came from an aspect-agnostic alias
+   * (`--resolution 1080p` / `hd` / `4k` / `uhd`). The compile stage adapts
+   * the preset to the composition's orientation instead of rejecting
+   * portrait/square comps as an aspect-ratio mismatch.
+   */
+  outputResolutionAspectAgnostic?: boolean;
+  /**
+   * Raw `--resolution` string as typed by the user. Preserved so Docker mode
+   * can forward the pre-normalized flag to the in-container CLI, which
+   * re-runs the aspect-agnostic detection on its own side — otherwise we'd
+   * lose the "1080p was ambiguous" signal at the process boundary.
+   */
+  outputResolutionRaw?: string;
   pageSideCompositing?: boolean;
   /** EXPERIMENTAL. drawElementImage frame capture (--experimental-fast-capture). */
   experimentalFastCapture?: boolean;
@@ -1165,11 +1197,19 @@ async function readCompositionDimensions(
  * Extracted (and exported) so the CLI wiring around `process.exit` stays a
  * thin adapter and the branch logic is unit-testable. See render-reliability
  * workstream P1-3.
+ *
+ * `aspectAgnostic` reflects whether `outputResolution` was normalized from an
+ * aspect-agnostic alias like `--resolution 1080p` / `hd` / `4k` / `uhd`.
+ * When true, an aspect-ratio mismatch is *not* an error at the CLI layer:
+ * the compile stage will re-map the preset to the composition's orientation
+ * (a portrait 1080×1920 composition with `--resolution 1080p` renders at
+ * 1080×1920, not 1920×1080). Alpha / HDR / downsampling / non-integer-scale
+ * checks still block, because those failures are not orientation-fixable.
  */
 export async function checkRenderResolutionPreflight(
   compositionHtml: string,
   outputResolution: CanvasResolution | undefined,
-  modes: { alphaRequested: boolean; hdrRequested: boolean },
+  modes: { alphaRequested: boolean; hdrRequested: boolean; aspectAgnostic?: boolean },
 ): Promise<{ message: string; kind: OutputResolutionIssueKind } | undefined> {
   if (!outputResolution) return undefined;
   const dims = await readCompositionDimensions(compositionHtml);
@@ -1185,6 +1225,11 @@ export async function checkRenderResolutionPreflight(
   });
   // Narrow to the incompatible case; `message`/`kind` are always set there.
   if (compat.ok || !compat.message || !compat.kind) return undefined;
+  // Aspect-agnostic aliases delegate orientation to the composition — a
+  // landscape-vs-portrait mismatch is expected and self-heals in the compile
+  // stage. Only *aspect-mismatch* is downgraded; other issue kinds still
+  // block (see the `aspectAgnostic` note above).
+  if (modes.aspectAgnostic && compat.kind === "aspect-mismatch") return undefined;
   return { message: compat.message, kind: compat.kind };
 }
 
@@ -1381,7 +1426,15 @@ async function renderDocker(
       quiet: options.quiet,
       variables: options.variables,
       entryFile: options.entryFile,
-      outputResolution: options.outputResolution,
+      // Forward the RAW `--resolution` flag (falling back to the canonical
+      // preset name when raw wasn't captured, e.g. programmatic callers).
+      // The in-container CLI re-runs `normalizeResolutionFlag` +
+      // `isAspectAgnosticResolutionAlias`, so aspect-agnostic aliases
+      // (`1080p`, `hd`, `4k`, `uhd`) retain their orientation-adaptive
+      // behavior inside Docker; passing the normalized `landscape` preset
+      // would silently lose that signal at the process boundary and
+      // reject portrait/square comps.
+      outputResolution: options.outputResolutionRaw ?? options.outputResolution,
       pageSideCompositing: options.pageSideCompositing,
       debug: options.debug,
       bestEffort: options.bestEffort,
@@ -1534,6 +1587,7 @@ export async function renderLocal(
     variables: options.variables,
     entryFile: options.entryFile,
     outputResolution: options.outputResolution,
+    outputResolutionAspectAgnostic: options.outputResolutionAspectAgnostic,
     debug: options.debug,
     strictness: options.bestEffort === false ? "strict" : "best-effort",
   });

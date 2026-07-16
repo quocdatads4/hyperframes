@@ -39,6 +39,30 @@ describe("@hyperframes/core public API exports", () => {
       expect(core.normalizeResolutionFlag(undefined)).toBeUndefined();
     });
 
+    it("exports isAspectAgnosticResolutionAlias for tier-only aliases", () => {
+      // Tier-only aliases → true (orientation follows the composition).
+      expect(core.isAspectAgnosticResolutionAlias("1080p")).toBe(true);
+      expect(core.isAspectAgnosticResolutionAlias("hd")).toBe(true);
+      expect(core.isAspectAgnosticResolutionAlias("4k")).toBe(true);
+      expect(core.isAspectAgnosticResolutionAlias("uhd")).toBe(true);
+      // Case-insensitive.
+      expect(core.isAspectAgnosticResolutionAlias("1080P")).toBe(true);
+      expect(core.isAspectAgnosticResolutionAlias("UHD")).toBe(true);
+      // Orientation-suffixed aliases → false (user picked an orientation).
+      expect(core.isAspectAgnosticResolutionAlias("1080p-portrait")).toBe(false);
+      expect(core.isAspectAgnosticResolutionAlias("portrait-1080p")).toBe(false);
+      expect(core.isAspectAgnosticResolutionAlias("4k-square")).toBe(false);
+      expect(core.isAspectAgnosticResolutionAlias("1080p-square")).toBe(false);
+      // Canonical presets → false.
+      expect(core.isAspectAgnosticResolutionAlias("landscape")).toBe(false);
+      expect(core.isAspectAgnosticResolutionAlias("portrait")).toBe(false);
+      expect(core.isAspectAgnosticResolutionAlias("landscape-4k")).toBe(false);
+      // Unknown / empty / undefined → false.
+      expect(core.isAspectAgnosticResolutionAlias("8k")).toBe(false);
+      expect(core.isAspectAgnosticResolutionAlias("")).toBe(false);
+      expect(core.isAspectAgnosticResolutionAlias(undefined)).toBe(false);
+    });
+
     it("exports TIMELINE_COLORS", () => {
       expect(core.TIMELINE_COLORS).toBeDefined();
       expect(core.TIMELINE_COLORS.video).toBeDefined();

@@ -37,6 +37,7 @@
 
 import { join } from "node:path";
 import type { EngineConfig } from "@hyperframes/engine";
+import { suggestMatchingPreset } from "@hyperframes/core";
 import type { CompiledComposition } from "../../htmlCompiler.js";
 import { compileForRender } from "../../htmlCompiler.js";
 import type { ProducerLogger } from "../../../logger.js";
@@ -273,10 +274,35 @@ export async function runCompileStage(input: CompileStageInput): Promise<Compile
     height: compiled.height,
   };
   const { width, height } = composition;
+  // Aspect-agnostic aliases (`--resolution 1080p` / `hd` / `4k` / `uhd`) all
+  // normalize to a landscape preset up-front (see `normalizeResolutionFlag`),
+  // which was historically fine because 16:9 was the only shipped orientation.
+  // Once portrait + square presets landed, that early normalization started
+  // rejecting portrait/square compositions with a cryptic "aspect ratio does
+  // not match" from `resolveDeviceScaleFactor` — a common enough hit that a
+  // field report (CLI 0.7.59) surfaced it. When the flag was aspect-agnostic,
+  // re-target the preset to the sibling that matches the composition's
+  // orientation while preserving the tier (HD vs 4K). Explicit
+  // orientation-bearing presets stay strict — a `--resolution portrait` on a
+  // landscape composition still errors, honoring the user's stated intent.
+  const requestedResolution = job.config.outputResolution;
+  let effectiveResolution = requestedResolution;
+  if (requestedResolution && job.config.outputResolutionAspectAgnostic) {
+    const flipped = suggestMatchingPreset(width, height, requestedResolution);
+    if (flipped && flipped !== requestedResolution) {
+      log.info("Adapted aspect-agnostic --resolution to composition orientation", {
+        compositionWidth: width,
+        compositionHeight: height,
+        requestedResolution,
+        effectiveResolution: flipped,
+      });
+      effectiveResolution = flipped;
+    }
+  }
   const deviceScaleFactor = resolveDeviceScaleFactor({
     compositionWidth: width,
     compositionHeight: height,
-    outputResolution: job.config.outputResolution,
+    outputResolution: effectiveResolution,
     hdrRequested: job.config.hdrMode === "force-hdr",
     alphaRequested: needsAlpha,
   });
@@ -286,7 +312,7 @@ export async function runCompileStage(input: CompileStageInput): Promise<Compile
     log.info("Supersampling composition via deviceScaleFactor", {
       compositionWidth: width,
       compositionHeight: height,
-      outputResolution: job.config.outputResolution,
+      outputResolution: effectiveResolution,
       outputWidth,
       outputHeight,
       deviceScaleFactor,
