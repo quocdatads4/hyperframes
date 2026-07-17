@@ -344,7 +344,6 @@ const BOOLEAN_ENGINE_CONFIG_FIELDS = [
 ] as const;
 
 const POSITIVE_NUMBER_ENGINE_CONFIG_FIELDS = [
-  "coresPerWorker",
   "browserTimeout",
   "protocolTimeout",
   "chunkSizeFrames",
@@ -394,6 +393,13 @@ function assertEngineConfigNumber(
   }
 }
 
+function assertPositiveEngineConfigNumber(config: Record<string, unknown>, field: string): void {
+  const value = config[field];
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new Error(`Engine config ${field} must be a finite number > 0`);
+  }
+}
+
 function assertEngineConfigEnum(
   config: Record<string, unknown>,
   field: string,
@@ -435,7 +441,7 @@ function validateEngineConfigParallelism(config: Record<string, unknown>): void 
   ) {
     throw new Error("Engine config concurrency must be a positive integer or auto");
   }
-  assertEngineConfigNumber(config, "coresPerWorker", 0);
+  assertPositiveEngineConfigNumber(config, "coresPerWorker");
   for (const field of ["minParallelFrames", "largeRenderThreshold"] as const) {
     assertEngineConfigNumber(config, field, 0, true);
   }

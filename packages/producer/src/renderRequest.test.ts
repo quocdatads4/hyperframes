@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { DEFAULT_CONFIG } from "@hyperframes/engine";
+import { DEFAULT_CONFIG, resolveConfig } from "@hyperframes/engine";
 import {
   createRenderRequest,
   distributedConfigFromRequest,
@@ -8,6 +8,7 @@ import {
   renderRequestFromDistributedConfig,
   serializeRenderRequest,
 } from "./renderRequest.js";
+import { InvalidConfigError } from "./services/distributed/renderConfigValidation.js";
 
 const originalForceScreenshot = process.env.PRODUCER_FORCE_SCREENSHOT;
 
@@ -200,6 +201,52 @@ describe("RenderRequest", () => {
           config: distributed,
         }),
       ).toThrow("Engine config");
+    }
+  });
+
+  it("accepts fractional coresPerWorker snapshots from the canonical resolver", () => {
+    const engineConfig = resolveConfig({ coresPerWorker: 0.5 });
+    const value = createRenderRequest({
+      projectDir: "/project",
+      outputPath: "/output/video.mp4",
+      engineConfig,
+      options: {
+        fps: { num: 30, den: 1 },
+        quality: "standard",
+        format: "mp4",
+        distributed: { width: 1920, height: 1080, cfr: true },
+      },
+    });
+
+    expect(value.options.engineConfig.coresPerWorker).toBe(0.5);
+    expect(parseRenderRequest(serializeRenderRequest(value))).toEqual(value);
+
+    const distributed = distributedConfigFromRequest(value);
+    (distributed as { engineConfig: unknown }).engineConfig = engineConfig;
+    expect(
+      renderRequestFromDistributedConfig({
+        projectDir: value.projectDir,
+        outputPath: value.outputPath,
+        config: distributed,
+      }).options.engineConfig.coresPerWorker,
+    ).toBe(0.5);
+  });
+
+  it("preserves the distributed InvalidConfigError contract for engine snapshots", () => {
+    const value = request();
+    const distributed = distributedConfigFromRequest(value);
+    (distributed as { engineConfig: unknown }).engineConfig = {};
+
+    try {
+      renderRequestFromDistributedConfig({
+        projectDir: value.projectDir,
+        outputPath: value.outputPath,
+        config: distributed,
+      });
+      throw new Error("expected distributed validation to fail");
+    } catch (error) {
+      expect(error).toBeInstanceOf(InvalidConfigError);
+      expect((error as InvalidConfigError).field).toBe("config.engineConfig");
     }
   });
 

@@ -208,7 +208,14 @@ export function validateDistributedRenderConfig(
     validateVariablesPayload(config.variables);
   }
   if (config.engineConfig !== undefined) {
-    validateEngineConfigSnapshot(config.engineConfig);
+    try {
+      validateEngineConfigSnapshot(config.engineConfig);
+    } catch (error) {
+      throw new InvalidConfigError(
+        "config.engineConfig",
+        error instanceof Error ? error.message : "must be a valid engine config snapshot",
+      );
+    }
   }
 
   return config;
