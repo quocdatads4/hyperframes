@@ -2707,6 +2707,14 @@ async function executeRenderPipeline(input: {
       durationSeconds: job.duration,
       isMemoryExhaustion: false,
     });
+    const inversionMemoryExhaustionFallback = resolveInversionRetryPlan({
+      deWorkerInversion,
+      preInversionWorkerCount: preRoutingWorkerCount,
+      cfg,
+      outputFormat,
+      durationSeconds: job.duration,
+      isMemoryExhaustion: true,
+    });
     const parallelRouterFallback = resolveParallelRouterRetryPlan({
       deParallelRouter,
       preRouterWorkerCount: preRoutingWorkerCount,
@@ -2715,27 +2723,50 @@ async function executeRenderPipeline(input: {
       durationSeconds: job.duration,
       isMemoryExhaustion: false,
     });
-    const captureRouting: CaptureRouting = inversionFallback
-      ? {
-          kind: "worker_inversion",
-          state: "active",
-          fallback: {
-            kind: inversionFallback.useStreamingEncode ? "sdr_streaming" : "sdr_disk",
-            workerCount: inversionFallback.workerCount,
-            forceParallelStream: false,
-          },
-        }
-      : parallelRouterFallback
+    const parallelRouterMemoryExhaustionFallback = resolveParallelRouterRetryPlan({
+      deParallelRouter,
+      preRouterWorkerCount: preRoutingWorkerCount,
+      cfg,
+      outputFormat,
+      durationSeconds: job.duration,
+      isMemoryExhaustion: true,
+    });
+    const captureRouting: CaptureRouting =
+      inversionFallback && inversionMemoryExhaustionFallback
         ? {
-            kind: "parallel_router",
+            kind: "worker_inversion",
             state: "active",
             fallback: {
-              kind: parallelRouterFallback.useStreamingEncode ? "sdr_streaming" : "sdr_disk",
-              workerCount: parallelRouterFallback.workerCount,
+              kind: inversionFallback.useStreamingEncode ? "sdr_streaming" : "sdr_disk",
+              workerCount: inversionFallback.workerCount,
+              forceParallelStream: false,
+            },
+            memoryExhaustionFallback: {
+              kind: inversionMemoryExhaustionFallback.useStreamingEncode
+                ? "sdr_streaming"
+                : "sdr_disk",
+              workerCount: inversionMemoryExhaustionFallback.workerCount,
               forceParallelStream: false,
             },
           }
-        : { kind: "default" };
+        : parallelRouterFallback && parallelRouterMemoryExhaustionFallback
+          ? {
+              kind: "parallel_router",
+              state: "active",
+              fallback: {
+                kind: parallelRouterFallback.useStreamingEncode ? "sdr_streaming" : "sdr_disk",
+                workerCount: parallelRouterFallback.workerCount,
+                forceParallelStream: false,
+              },
+              memoryExhaustionFallback: {
+                kind: parallelRouterMemoryExhaustionFallback.useStreamingEncode
+                  ? "sdr_streaming"
+                  : "sdr_disk",
+                workerCount: parallelRouterMemoryExhaustionFallback.workerCount,
+                forceParallelStream: false,
+              },
+            }
+          : { kind: "default" };
     let capturePlan: CapturePlan = createCapturePlan({
       workerCount,
       forceScreenshot: captureForceScreenshot,

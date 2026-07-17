@@ -74,6 +74,11 @@ describe("CapturePlan", () => {
       kind: "worker_inversion",
       state: "active",
       fallback: { kind: "sdr_disk", workerCount: 5, forceParallelStream: false },
+      memoryExhaustionFallback: {
+        kind: "sdr_streaming",
+        workerCount: 1,
+        forceParallelStream: false,
+      },
     });
     const next = replanAfterFailure(initial, { kind: "draw_element_verification" });
 
@@ -87,11 +92,16 @@ describe("CapturePlan", () => {
     expect(Object.isFrozen(next.routing)).toBe(true);
   });
 
-  it("reduces an OOM fallback to one worker without losing immutable routing state", () => {
+  it("retries an inversion OOM in single-worker screenshot streaming mode", () => {
     const initial = streaming({
-      kind: "parallel_router",
+      kind: "worker_inversion",
       state: "active",
       fallback: { kind: "sdr_disk", workerCount: 5, forceParallelStream: false },
+      memoryExhaustionFallback: {
+        kind: "sdr_streaming",
+        workerCount: 1,
+        forceParallelStream: false,
+      },
     });
     const next = replanAfterFailure(initial, {
       kind: "capture_failure",
@@ -99,7 +109,31 @@ describe("CapturePlan", () => {
     });
 
     expect(next).toMatchObject({
-      kind: "sdr_disk",
+      kind: "sdr_streaming",
+      workerCount: 1,
+      forceScreenshot: true,
+      routing: { kind: "worker_inversion", state: "reverted" },
+    });
+  });
+
+  it("retries a parallel-router OOM in single-worker screenshot streaming mode", () => {
+    const initial = streaming({
+      kind: "parallel_router",
+      state: "active",
+      fallback: { kind: "sdr_disk", workerCount: 5, forceParallelStream: false },
+      memoryExhaustionFallback: {
+        kind: "sdr_streaming",
+        workerCount: 1,
+        forceParallelStream: false,
+      },
+    });
+    const next = replanAfterFailure(initial, {
+      kind: "capture_failure",
+      memoryExhaustion: true,
+    });
+
+    expect(next).toMatchObject({
+      kind: "sdr_streaming",
       workerCount: 1,
       forceScreenshot: true,
       routing: { kind: "parallel_router", state: "reverted" },

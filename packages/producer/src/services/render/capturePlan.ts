@@ -21,6 +21,7 @@ export type CaptureRouting =
       kind: "worker_inversion" | "parallel_router";
       state: "active" | "reverted";
       fallback: CapturePlanTarget;
+      memoryExhaustionFallback: CapturePlanTarget;
     }>;
 
 interface CapturePlanBase {
@@ -83,7 +84,11 @@ function freezeTarget(target: CapturePlanTarget): CapturePlanTarget {
 
 function freezeRouting(routing: CaptureRouting | undefined): CaptureRouting {
   if (!routing || routing.kind === "default") return Object.freeze({ kind: "default" });
-  return Object.freeze({ ...routing, fallback: freezeTarget(routing.fallback) });
+  return Object.freeze({
+    ...routing,
+    fallback: freezeTarget(routing.fallback),
+    memoryExhaustionFallback: freezeTarget(routing.memoryExhaustionFallback),
+  });
 }
 
 export function createCapturePlan(input: CreateCapturePlanInput): CapturePlan {
@@ -132,15 +137,20 @@ export function replanAfterFailure(plan: CapturePlan, failure: CapturePlanFailur
     });
   }
 
+  const isMemoryExhaustion = failure.kind === "capture_failure" && failure.memoryExhaustion;
   const fallback =
     plan.routing.kind === "default"
-      ? { kind: plan.kind, workerCount: plan.workerCount, forceParallelStream: false }
-      : plan.routing.fallback;
-  const workerCount =
-    failure.kind === "capture_failure" && failure.memoryExhaustion ? 1 : fallback.workerCount;
+      ? {
+          kind: plan.kind,
+          workerCount: isMemoryExhaustion ? 1 : plan.workerCount,
+          forceParallelStream: false,
+        }
+      : isMemoryExhaustion
+        ? plan.routing.memoryExhaustionFallback
+        : plan.routing.fallback;
   return createCapturePlan({
     ...plan,
-    workerCount,
+    workerCount: fallback.workerCount,
     forceScreenshot: true,
     forceParallelStream: fallback.forceParallelStream,
     useStreamingEncode: fallback.kind === "sdr_streaming",
