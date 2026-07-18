@@ -90,13 +90,13 @@
       "source": "./src/ffBinaries.ts",
       "runtime": "./dist/ffBinaries.js",
       "types": "./dist/ffBinaries.d.ts",
-      "environments": ["browser", "bun", "node"]
+      "environments": ["bun", "node"]
     },
     "./asset-resolution": {
       "source": "./src/assetResolution.ts",
       "runtime": "./dist/assetResolution.js",
       "types": "./dist/assetResolution.d.ts",
-      "environments": ["browser", "bun", "node"]
+      "environments": ["bun", "node"]
     }
   }
 }
