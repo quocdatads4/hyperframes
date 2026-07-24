@@ -107,8 +107,10 @@ COPY packages/producer/ packages/producer/
 COPY packages/gcp-cloud-run/ packages/gcp-cloud-run/
 COPY packages/lint/ packages/lint/
 COPY packages/parsers/ packages/parsers/
+COPY packages/player/ packages/player/
 COPY packages/sdk/ packages/sdk/
 COPY packages/sdk-playground/ packages/sdk-playground/
+COPY packages/shader-transitions/ packages/shader-transitions/
 COPY packages/studio-server/ packages/studio-server/
 COPY packages/studio/ packages/studio/
 
@@ -121,6 +123,8 @@ RUN bun run --cwd packages/parsers build \
     && bun run --cwd packages/studio-server build \
     && bun run --cwd packages/core build \
     && bun run --cwd packages/core build:hyperframes-runtime:modular \
+    && bun run --cwd packages/player build \
+    && bun run --cwd packages/shader-transitions build \
     && bun run --cwd packages/sdk build \
     && bun run --cwd packages/sdk-playground build \
     && bun run --cwd packages/engine build \
