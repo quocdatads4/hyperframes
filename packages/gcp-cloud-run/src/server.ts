@@ -59,6 +59,7 @@ import {
   uploadFileToGcs,
 } from "./gcsTransport.js";
 import { createDatframesStudioProjectProviderFromEnv } from "./datframesStudioAdapter.js";
+import { createStudioThumbnailGeneratorFromEnv } from "./studioThumbnail.js";
 
 /**
  * Lazily-constructed Storage client. Cached at module scope so warm
@@ -643,6 +644,7 @@ export function createApp(deps?: HandlerDeps): Hono {
     title: "HyperFrames Studio Test Project",
   };
   const datframesProvider = deps ? null : createDatframesStudioProjectProviderFromEnv();
+  const thumbnailGenerator = deps ? null : createStudioThumbnailGeneratorFromEnv();
 
   const studioAdapter: StudioApiAdapter = deps?.studioAdapter ?? {
     listProjects: () => datframesProvider?.listProjects() ?? [testProject],
@@ -665,6 +667,15 @@ export function createApp(deps?: HandlerDeps): Hono {
       progress: 100,
       outputPath,
     }),
+    ...(thumbnailGenerator
+      ? {
+          generateThumbnail: (options) =>
+            thumbnailGenerator.generate({
+              ...options,
+              format: options.format ?? "jpeg",
+            }),
+        }
+      : {}),
   };
 
   const studioApi = createStudioApi(studioAdapter);
