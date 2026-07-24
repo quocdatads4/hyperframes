@@ -649,6 +649,13 @@ export function createApp(deps?: HandlerDeps): Hono {
     },
     lint: () => ({ findings: [] }),
     runtimeUrl: "/api/runtime.js",
+    rendersDir: () => join(process.cwd(), "dist/renders"),
+    startRender: ({ outputPath }) => ({
+      id: "dummy-job",
+      status: "complete",
+      progress: 100,
+      outputPath,
+    }),
   };
 
   const studioApi = createStudioApi(studioAdapter);
