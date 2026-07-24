@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { serve } from "@hono/node-server";
+import { serveStatic } from "@hono/node-server/serve-static";
 import { Storage } from "@google-cloud/storage";
 import { Hono } from "hono";
 import {
@@ -627,6 +628,18 @@ export function createApp(deps?: HandlerDeps): Hono {
       return c.json({ error: name ?? "RenderError", message }, status);
     }
   });
+
+  const studioDist = join(fileURLToPath(import.meta.url), "../../../studio/dist");
+  if (existsSync(studioDist)) {
+    app.use("/*", serveStatic({ root: "../studio/dist" }));
+    app.get("*", (c) => {
+      const indexPath = join(studioDist, "index.html");
+      if (existsSync(indexPath)) {
+        return c.html(readFileSync(indexPath, "utf-8"));
+      }
+      return c.text("Studio UI index.html not found", 404);
+    });
+  }
 
   return app;
 }

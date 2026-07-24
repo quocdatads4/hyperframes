@@ -110,6 +110,7 @@ COPY packages/parsers/ packages/parsers/
 COPY packages/sdk/ packages/sdk/
 COPY packages/sdk-playground/ packages/sdk-playground/
 COPY packages/studio-server/ packages/studio-server/
+COPY packages/studio/ packages/studio/
 
 # Build workspace dependencies before the producer bundle. The published
 # workspace packages are not prebuilt in a fresh clone, so producer's esbuild
@@ -125,6 +126,7 @@ RUN bun run --cwd packages/parsers build \
     && bun run --cwd packages/engine build \
     && (cd packages/producer && bunx tsx scripts/generate-font-data.ts) \
     && bun run --cwd packages/producer build \
+    && bun run --cwd packages/studio build \
     && bun run --cwd packages/gcp-cloud-run build
 
 # Cloud Run injects PORT (default 8080). The server reads it.
