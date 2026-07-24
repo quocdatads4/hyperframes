@@ -1,7 +1,13 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "paths": {},
+    "paths": {
+      "@hyperframes/core": ["../core/dist/index.d.ts"],
+      "@hyperframes/core/*": ["../core/dist/*"],
+      "@hyperframes/producer": ["../producer/dist/index.d.ts"],
+      "@hyperframes/producer/distributed": ["../producer/dist/distributed.d.ts"],
+      "@hyperframes/studio-server": ["../studio-server/dist/index.d.ts"]
+    },
     "noEmit": false,
     "outDir": "./dist",
     "rootDir": "./src",

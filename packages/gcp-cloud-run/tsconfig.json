@@ -10,8 +10,11 @@
     "noEmit": true,
     "baseUrl": ".",
     "paths": {
+      "@hyperframes/core": ["../core/src/index.ts"],
+      "@hyperframes/core/*": ["../core/src/*"],
       "@hyperframes/producer": ["../producer/src/index.ts"],
-      "@hyperframes/producer/distributed": ["../producer/src/distributed.ts"]
+      "@hyperframes/producer/distributed": ["../producer/src/distributed.ts"],
+      "@hyperframes/studio-server": ["../studio-server/src/index.ts"]
     }
   },
   "include": ["src/**/*"],
