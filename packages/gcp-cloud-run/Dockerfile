@@ -100,6 +100,7 @@ COPY packages/studio-server/package.json packages/studio-server/package.json
 RUN bun install --frozen-lockfile
 
 # Copy source for the packages the render path needs.
+COPY scripts/ scripts/
 COPY packages/core/ packages/core/
 COPY packages/engine/ packages/engine/
 COPY packages/producer/ packages/producer/
