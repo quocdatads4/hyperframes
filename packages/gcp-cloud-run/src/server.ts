@@ -27,8 +27,10 @@ import {
   type ResolvedProject,
   type StudioApiAdapter,
 } from "@hyperframes/studio-server";
+import { loadHyperframeRuntimeSource } from "@hyperframes/core";
 import { Storage } from "@google-cloud/storage";
 import { Hono } from "hono";
+import { compress } from "hono/compress";
 import {
   assemble,
   type AssembleResult,
@@ -615,7 +617,27 @@ const NON_RETRYABLE_ERROR_NAMES = new Set([
 export function createApp(deps?: HandlerDeps): Hono {
   const app = new Hono();
 
+  app.use("*", async (c, next) => {
+    await next();
+    c.header("Vary", "Accept-Encoding");
+  });
+  app.use("*", compress());
+  app.use("/assets/*", async (c, next) => {
+    await next();
+    if (c.res.ok) {
+      c.header("Cache-Control", "public, max-age=31536000, immutable");
+    }
+  });
+
   app.get("/healthz", (c) => c.json({ status: "ok" }));
+  app.get("/api/runtime.js", (c) => {
+    const runtimeSource = loadHyperframeRuntimeSource();
+    if (!runtimeSource) return c.text("HyperFrames runtime is unavailable.", 404);
+    return c.body(runtimeSource, 200, {
+      "Content-Type": "application/javascript; charset=utf-8",
+      "Cache-Control": "no-cache",
+    });
+  });
 
   // fallow-ignore-next-line complexity
   app.post("/", async (c) => {
@@ -708,6 +730,7 @@ export function createApp(deps?: HandlerDeps): Hono {
     app.get("*", (c) => {
       const indexPath = join(studioDist, "index.html");
       if (existsSync(indexPath)) {
+        c.header("Cache-Control", "no-cache");
         return c.html(readFileSync(indexPath, "utf-8"));
       }
       return c.text("Studio UI index.html not found", 404);

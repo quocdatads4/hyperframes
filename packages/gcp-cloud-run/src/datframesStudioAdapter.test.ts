@@ -28,6 +28,8 @@ describe("DatframesStudioProjectProvider", () => {
     const cacheRoot = await mkdtemp(join(tmpdir(), "hf-datframes-provider-"));
     temporaryRoots.push(cacheRoot);
     let archiveRequests = 0;
+    let bootstrapRequests = 0;
+    let now = 1_000;
     const fetchImpl: typeof fetch = async (input) => {
       const pathname = new URL(input.toString()).pathname;
       if (pathname.endsWith("/internal/hyperframes/projects")) {
@@ -45,6 +47,7 @@ describe("DatframesStudioProjectProvider", () => {
         ]);
       }
       if (pathname.endsWith("/bootstrap")) {
+        bootstrapRequests += 1;
         return Response.json({
           projectId: "project-1",
           title: "Data Project",
@@ -80,7 +83,9 @@ describe("DatframesStudioProjectProvider", () => {
       cacheRoot,
       maxArchiveBytes: 10_000,
       requestTimeoutMs: 5_000,
+      revalidateMs: 5_000,
       fetchImpl,
+      now: () => now,
     });
 
     expect(await provider.listProjects()).toHaveLength(1);
@@ -90,6 +95,12 @@ describe("DatframesStudioProjectProvider", () => {
     expect(first?.id).toBe("project-1");
     expect(second?.dir).toBe(first?.dir);
     expect(await readFile(join(first!.dir, "index.html"), "utf8")).toContain("from data");
+    expect(archiveRequests).toBe(1);
+    expect(bootstrapRequests).toBe(1);
+
+    now += 5_001;
+    await provider.resolveProject("project-1");
+    expect(bootstrapRequests).toBe(2);
     expect(archiveRequests).toBe(1);
   });
 
@@ -132,6 +143,7 @@ describe("DatframesStudioProjectProvider", () => {
       cacheRoot,
       maxArchiveBytes: 10_000,
       requestTimeoutMs: 5_000,
+      revalidateMs: 5_000,
       fetchImpl,
     });
 

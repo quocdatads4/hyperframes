@@ -329,4 +329,12 @@ describe("createApp HTTP mapping", () => {
     const res = await app.request("/healthz");
     expect(res.status).toBe(200);
   });
+
+  it("serves the interactive preview runtime", async () => {
+    const app = createApp(depsWith(new FakeGcs()));
+    const res = await app.request("/api/runtime.js");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/javascript");
+    expect(await res.text()).toContain("__player");
+  });
 });

@@ -49,7 +49,9 @@ export interface DatframesStudioProjectProviderConfig {
   cacheRoot: string;
   maxArchiveBytes: number;
   requestTimeoutMs: number;
+  revalidateMs: number;
   fetchImpl?: typeof globalThis.fetch;
+  now?: () => number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -193,16 +195,25 @@ async function fileExists(path: string): Promise<boolean> {
 
 export class DatframesStudioProjectProvider {
   private readonly fetchImpl: typeof globalThis.fetch;
+  private readonly now: () => number;
   private readonly inFlight = new Map<string, Promise<ResolvedProject | null>>();
+  private readonly resolvedProjects = new Map<
+    string,
+    { project: ResolvedProject; revalidateAt: number }
+  >();
   private readonly titles = new Map<string, string>();
 
   constructor(private readonly config: DatframesStudioProjectProviderConfig) {
     this.fetchImpl = config.fetchImpl ?? globalThis.fetch;
+    this.now = config.now ?? Date.now;
     if (!Number.isSafeInteger(config.maxArchiveBytes) || config.maxArchiveBytes < 1) {
       throw new Error("maxArchiveBytes must be a positive integer.");
     }
     if (!Number.isSafeInteger(config.requestTimeoutMs) || config.requestTimeoutMs < 1) {
       throw new Error("requestTimeoutMs must be a positive integer.");
+    }
+    if (!Number.isSafeInteger(config.revalidateMs) || config.revalidateMs < 1) {
+      throw new Error("revalidateMs must be a positive integer.");
     }
   }
 
@@ -235,11 +246,27 @@ export class DatframesStudioProjectProvider {
   }
 
   resolveProject(projectId: string): Promise<ResolvedProject | null> {
+    const cached = this.resolvedProjects.get(projectId);
+    if (cached && cached.revalidateAt > this.now()) {
+      return Promise.resolve(cached.project);
+    }
     const active = this.inFlight.get(projectId);
     if (active) return active;
-    const operation = this.resolveProjectUncached(projectId).finally(() => {
-      this.inFlight.delete(projectId);
-    });
+    const operation = this.resolveProjectUncached(projectId)
+      .then((project) => {
+        if (project) {
+          this.resolvedProjects.set(projectId, {
+            project,
+            revalidateAt: this.now() + this.config.revalidateMs,
+          });
+        } else {
+          this.resolvedProjects.delete(projectId);
+        }
+        return project;
+      })
+      .finally(() => {
+        this.inFlight.delete(projectId);
+      });
     this.inFlight.set(projectId, operation);
     return operation;
   }
@@ -377,6 +404,10 @@ export function createDatframesStudioProjectProviderFromEnv(): DatframesStudioPr
     requestTimeoutMs: positiveInteger(
       process.env.DATFRAMES_API_TIMEOUT_MS,
       "DATFRAMES_API_TIMEOUT_MS",
+    ),
+    revalidateMs: positiveInteger(
+      process.env.HYPERFRAMES_PROJECT_REVALIDATE_MS,
+      "HYPERFRAMES_PROJECT_REVALIDATE_MS",
     ),
   });
 }
