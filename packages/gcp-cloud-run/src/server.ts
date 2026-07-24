@@ -22,6 +22,7 @@ import { basename, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
+import { createStudioApi, type ResolvedProject, type StudioApiAdapter } from "@hyperframes/studio-server";
 import { Storage } from "@google-cloud/storage";
 import { Hono } from "hono";
 import {
@@ -627,6 +628,41 @@ export function createApp(deps?: HandlerDeps): Hono {
       // retry predicate keys off, plus `message` for human triage.
       return c.json({ error: name ?? "RenderError", message }, status);
     }
+  });
+
+  const defaultProject: ResolvedProject = {
+    id: "hyperframes-studio",
+    dir: process.cwd(),
+    title: "HyperFrames Studio",
+  };
+
+  const studioAdapter: StudioApiAdapter = {
+    listProjects: () => [defaultProject],
+    resolveProject: (id: string) => (id === defaultProject.id || id === "default" ? defaultProject : defaultProject),
+    async bundle(dir: string): Promise<string | null> {
+      try {
+        const { bundleToSingleHtml } = await import("@hyperframes/core/compiler");
+        return await bundleToSingleHtml(dir, { runtime: "placeholder" });
+      } catch {
+        return null;
+      }
+    },
+    lint: () => ({ findings: [] }),
+    runtimeUrl: "/api/runtime.js",
+  };
+
+  const studioApi = createStudioApi(studioAdapter);
+  app.all("/api/*", async (c) => {
+    const url = new URL(c.req.url);
+    url.pathname = url.pathname.slice(4); // Strip "/api" prefix
+    const forwardReq = new Request(url.toString(), {
+      method: c.req.method,
+      headers: c.req.raw.headers,
+      body: c.req.raw.body,
+      // @ts-expect-error -- Node streaming body
+      duplex: "half",
+    });
+    return studioApi.fetch(forwardReq);
   });
 
   const studioDist = join(fileURLToPath(import.meta.url), "../../../studio/dist");
