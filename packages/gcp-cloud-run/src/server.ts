@@ -22,7 +22,11 @@ import { basename, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
-import { createStudioApi, type ResolvedProject, type StudioApiAdapter } from "@hyperframes/studio-server";
+import {
+  createStudioApi,
+  type ResolvedProject,
+  type StudioApiAdapter,
+} from "@hyperframes/studio-server";
 import { Storage } from "@google-cloud/storage";
 import { Hono } from "hono";
 import {
@@ -54,6 +58,7 @@ import {
   untarDirectory,
   uploadFileToGcs,
 } from "./gcsTransport.js";
+import { createDatframesStudioProjectProviderFromEnv } from "./datframesStudioAdapter.js";
 
 /**
  * Lazily-constructed Storage client. Cached at module scope so warm
@@ -83,6 +88,8 @@ export interface HandlerDeps {
   tmpRoot?: string;
   /** Skip Chrome resolution (used by dispatch tests that mock renderChunk). */
   skipChromeResolution?: boolean;
+  /** Override Studio project discovery/materialization (used by HTTP tests and embedders). */
+  studioAdapter?: StudioApiAdapter;
 }
 
 /**
@@ -630,15 +637,17 @@ export function createApp(deps?: HandlerDeps): Hono {
     }
   });
 
-  const defaultProject: ResolvedProject = {
-    id: "hyperframes-studio",
+  const testProject: ResolvedProject = {
+    id: "hyperframes-studio-test",
     dir: process.cwd(),
-    title: "HyperFrames Studio",
+    title: "HyperFrames Studio Test Project",
   };
+  const datframesProvider = deps ? null : createDatframesStudioProjectProviderFromEnv();
 
-  const studioAdapter: StudioApiAdapter = {
-    listProjects: () => [defaultProject],
-    resolveProject: (id: string) => (id === defaultProject.id || id === "default" ? defaultProject : defaultProject),
+  const studioAdapter: StudioApiAdapter = deps?.studioAdapter ?? {
+    listProjects: () => datframesProvider?.listProjects() ?? [testProject],
+    resolveProject: (id: string) =>
+      datframesProvider?.resolveProject(id) ?? (id === testProject.id ? testProject : null),
     async bundle(dir: string): Promise<string | null> {
       try {
         const { bundleToSingleHtml } = await import("@hyperframes/core/compiler");
@@ -661,6 +670,16 @@ export function createApp(deps?: HandlerDeps): Hono {
   const studioApi = createStudioApi(studioAdapter);
   app.all("/api/*", async (c) => {
     const url = new URL(c.req.url);
+    if (!deps && isDataDrivenSourceMutation(c.req.method, url.pathname)) {
+      return c.json(
+        {
+          error: "DATA_DRIVEN_PROJECT_READ_ONLY",
+          message:
+            "Project source files are compiled artifacts. Update project data through the DATframes API.",
+        },
+        409,
+      );
+    }
     url.pathname = url.pathname.slice(4); // Strip "/api" prefix
     const forwardReq = new Request(url.toString(), {
       method: c.req.method,
@@ -685,6 +704,18 @@ export function createApp(deps?: HandlerDeps): Hono {
   }
 
   return app;
+}
+
+function isDataDrivenSourceMutation(method: string, pathname: string): boolean {
+  if (!["POST", "PUT", "PATCH", "DELETE"].includes(method.toUpperCase())) return false;
+  return [
+    "/files/",
+    "/file-mutations/",
+    "/gsap-mutation",
+    "/duplicate-file",
+    "/registry/install",
+    "/media/remove-background",
+  ].some((segment) => pathname.includes(segment));
 }
 
 /** Start the HTTP server. Cloud Run injects `PORT` (default 8080). */
