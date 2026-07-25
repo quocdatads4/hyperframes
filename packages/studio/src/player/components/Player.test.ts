@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   hasUnloadedAssets,
   resolvePlayerCompositionSize,
+  shouldHydrateAlreadyLoadedIframe,
   shouldShowCompositionLoadingOverlay,
 } from "./Player";
 
@@ -18,6 +19,27 @@ describe("player composition size", () => {
   it("falls back to the requested orientation before preview metadata loads", () => {
     expect(resolvePlayerCompositionSize(null, true)).toEqual({ width: 1080, height: 1920 });
     expect(resolvePlayerCompositionSize(null, false)).toEqual({ width: 1920, height: 1080 });
+  });
+});
+
+describe("already-loaded iframe hydration", () => {
+  it("hydrates a completed preview that loaded before the listener attached", () => {
+    expect(
+      shouldHydrateAlreadyLoadedIframe(
+        "complete",
+        "https://hyperframes.example/api/projects/demo/preview",
+      ),
+    ).toBe(true);
+  });
+
+  it("ignores loading and initial about:blank documents", () => {
+    expect(
+      shouldHydrateAlreadyLoadedIframe(
+        "loading",
+        "https://hyperframes.example/api/projects/demo/preview",
+      ),
+    ).toBe(false);
+    expect(shouldHydrateAlreadyLoadedIframe("complete", "about:blank")).toBe(false);
   });
 });
 

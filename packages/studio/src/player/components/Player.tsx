@@ -63,6 +63,13 @@ export function shouldShowCompositionLoadingOverlay(compositionLoading: boolean)
   return compositionLoading;
 }
 
+export function shouldHydrateAlreadyLoadedIframe(
+  readyState: DocumentReadyState | null,
+  href: string | null,
+): boolean {
+  return readyState === "complete" && href !== null && href !== "about:blank";
+}
+
 function enableInteractiveIframe(player: HyperframesPlayerElement): void {
   const root = player.shadowRoot;
   if (!root) return;
@@ -239,7 +246,18 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
         player.addEventListener("error", handleError);
 
         // Forward the iframe's native load event to the studio's onIframeLoad.
+        let handledDocument: Document | null = null;
         const handleLoad = () => {
+          let currentDocument: Document | null = null;
+          try {
+            currentDocument = iframe.contentDocument;
+          } catch {
+            // Cross-origin previews cannot be inspected, but still need the
+            // normal load callback below.
+          }
+          if (currentDocument && currentDocument === handledDocument) return;
+          handledDocument = currentDocument;
+
           loadCountRef.current++;
           setShaderTransitionLoading(false);
           setCompositionLoading(true);
@@ -289,6 +307,23 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
           }
         };
         iframe.addEventListener("load", handleLoad);
+        // The player starts navigating as soon as its `src` attribute is set.
+        // With a warm server/browser cache, that navigation can complete before
+        // this React wrapper attaches its iframe load listener. Hydrate the
+        // timeline immediately when that race has already happened.
+        try {
+          if (
+            shouldHydrateAlreadyLoadedIframe(
+              iframe.contentDocument?.readyState ?? null,
+              iframe.contentWindow?.location.href ?? null,
+            )
+          ) {
+            handleLoad();
+          }
+        } catch {
+          // The regular load event remains the fallback for cross-origin or
+          // transient iframe access failures.
+        }
 
         cleanup = () => {
           iframe.removeEventListener("load", handleLoad);
