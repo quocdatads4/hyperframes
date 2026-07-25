@@ -217,6 +217,28 @@ describe("registerPreviewRoutes", () => {
     expect(html).toContain('<meta name="preview-path" content="index.html">');
   });
 
+  it("materializes the runtime URL in bundled preview placeholders", async () => {
+    const projectDir = createProjectDir();
+    const app = new Hono();
+    registerPreviewRoutes(
+      app,
+      createAdapter(projectDir, {
+        bundle: async () =>
+          '<!doctype html><html><head><script data-hyperframes-preview-runtime="1" src=""></script></head><body>Preview</body></html>',
+        runtimeUrl: "/api/runtime.js",
+      }),
+    );
+
+    const response = await app.request("http://localhost/projects/demo/preview");
+    const html = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(html).toContain(
+      '<script data-hyperframes-preview-runtime="1" src="/api/runtime.js"></script>',
+    );
+    expect(html).not.toContain('data-hyperframes-preview-runtime="1" src=""');
+  });
+
   it("applies adapter preview transforms to sub-composition previews", async () => {
     const projectDir = createProjectDir();
     mkdirSync(join(projectDir, "compositions"), { recursive: true });

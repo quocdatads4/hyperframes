@@ -379,6 +379,17 @@ export function registerPreviewRoutes(api: Hono, adapter: PreviewApiAdapter): vo
         mainCompositionPath = diskMain.compositionPath;
       }
 
+      // bundleToSingleHtml(..., { runtime: "placeholder" }) deliberately emits
+      // an empty src for the host to materialize. Not every production adapter
+      // owns that replacement (Cloud Run delegates the raw cached bundle here),
+      // and leaving src="" makes the browser request the preview HTML itself as
+      // JavaScript. Resolve the placeholder at the shared route boundary so all
+      // adapters serve an executable runtime while retaining their own URL.
+      bundled = bundled.replace(
+        /(<script\b[^>]*\bdata-hyperframes-preview-runtime=(["'])1\2[^>]*\bsrc=)(["'])\3/i,
+        `$1$3${adapter.runtimeUrl}$3`,
+      );
+
       // Inject runtime if not already present (check URL pattern and bundler attribute)
       if (
         !bundled.includes("hyperframe.runtime") &&
