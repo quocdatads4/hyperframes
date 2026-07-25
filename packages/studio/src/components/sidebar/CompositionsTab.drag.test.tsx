@@ -14,6 +14,7 @@ Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 let root: Root | null = null;
 
 afterEach(() => {
+  vi.useRealTimers();
   if (root) act(() => root?.unmount());
   root = null;
   document.body.innerHTML = "";
@@ -40,6 +41,24 @@ function mount(onSelect = vi.fn(), onAddToTimeline = vi.fn()) {
 }
 
 describe("composition card drag", () => {
+  it("defers the live preview iframe until the card is hovered", () => {
+    vi.useFakeTimers();
+    const { host, card } = mount();
+    expect(host.querySelector("iframe")).toBeNull();
+
+    act(() => {
+      card.dispatchEvent(new PointerEvent("pointerover", { bubbles: true }));
+      vi.advanceTimersByTime(299);
+    });
+    expect(host.querySelector("iframe")).toBeNull();
+
+    act(() => vi.advanceTimersByTime(1));
+    expect(host.querySelector("iframe")).not.toBeNull();
+
+    act(() => card.dispatchEvent(new PointerEvent("pointerout", { bubbles: true })));
+    expect(host.querySelector("iframe")).toBeNull();
+  });
+
   it("keeps ordinary click navigation", () => {
     const { card, onSelect } = mount();
     act(() => card.click());

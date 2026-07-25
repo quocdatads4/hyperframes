@@ -481,6 +481,7 @@ export const NLEPreview = memo(function NLEPreview({
                 key={`backdrop-${projectId}`}
                 projectId={projectId}
                 onLoad={() => {}}
+                compositionSize={compositionSize}
                 portrait={portrait}
                 suppressLoadingOverlay
                 style={{ position: "absolute", inset: 0, zIndex: 0 }}
@@ -497,6 +498,7 @@ export const NLEPreview = memo(function NLEPreview({
                 applyInitialZoom();
               }}
               onCompositionLoadingChange={onCompositionLoadingChange}
+              compositionSize={compositionSize}
               portrait={portrait}
               suppressLoadingOverlay={suppressLoadingOverlay}
               style={

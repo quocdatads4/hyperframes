@@ -12,6 +12,10 @@ interface PlayerProps {
   directUrl?: string;
   onLoad: () => void;
   onCompositionLoadingChange?: (loading: boolean) => void;
+  compositionSize?: {
+    width: number;
+    height: number;
+  } | null;
   portrait?: boolean;
   style?: React.CSSProperties;
   suppressLoadingOverlay?: boolean;
@@ -38,6 +42,22 @@ function getShaderTransitionLoading(event: Event): boolean | null {
 }
 
 const COMPOSITION_LOADING_OVERLAY_DELAY_MS = 400;
+
+export function resolvePlayerCompositionSize(
+  compositionSize: PlayerProps["compositionSize"],
+  portrait: boolean | undefined,
+): { width: number; height: number } {
+  if (
+    compositionSize &&
+    Number.isFinite(compositionSize.width) &&
+    compositionSize.width > 0 &&
+    Number.isFinite(compositionSize.height) &&
+    compositionSize.height > 0
+  ) {
+    return compositionSize;
+  }
+  return portrait ? { width: 1080, height: 1920 } : { width: 1920, height: 1080 };
+}
 
 export function shouldShowCompositionLoadingOverlay(compositionLoading: boolean): boolean {
   return compositionLoading;
@@ -112,6 +132,7 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
       directUrl,
       onLoad,
       onCompositionLoadingChange,
+      compositionSize,
       portrait,
       style,
       suppressLoadingOverlay,
@@ -119,6 +140,7 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
     ref,
   ) => {
     const containerRef = useRef<HTMLDivElement>(null);
+    const playerRef = useRef<HyperframesPlayerElement | null>(null);
     const loadCountRef = useRef(0);
     const assetPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const assetFadeRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -164,13 +186,15 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
         player.setAttribute("shader-capture-scale", "1");
         player.setAttribute("shader-loading", "player");
         player.setAttribute("src", src);
-        player.setAttribute("width", String(portrait ? 1080 : 1920));
-        player.setAttribute("height", String(portrait ? 1920 : 1080));
+        const initialSize = resolvePlayerCompositionSize(compositionSize, portrait);
+        player.setAttribute("width", String(initialSize.width));
+        player.setAttribute("height", String(initialSize.height));
         player.style.width = "100%";
         player.style.height = "100%";
         player.style.display = "block";
         player.style.background = "transparent";
         container.appendChild(player);
+        playerRef.current = player;
 
         // Inject pasteboard shadow: let the shadow around the canvas bleed
         // into the surrounding pasteboard area (overflow: visible on the container)
@@ -274,6 +298,7 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
           player.removeEventListener("error", handleError);
           if (assetPollRef.current) clearInterval(assetPollRef.current);
           assetPollRef.current = null;
+          if (playerRef.current === player) playerRef.current = null;
           container.removeChild(player);
           // Clear the forwarded ref only if it still points to THIS iframe.
           // During crossfade refreshes the retiring Player unmounts after the
@@ -298,6 +323,18 @@ export const Player = forwardRef<HTMLIFrameElement, PlayerProps>(
         cleanup?.();
       };
     });
+
+    useEffect(() => {
+      const player = playerRef.current;
+      if (!player) return;
+      const next = resolvePlayerCompositionSize(compositionSize, portrait);
+      if (player.getAttribute("width") !== String(next.width)) {
+        player.setAttribute("width", String(next.width));
+      }
+      if (player.getAttribute("height") !== String(next.height)) {
+        player.setAttribute("height", String(next.height));
+      }
+    }, [compositionSize, portrait]);
 
     useEffect(() => {
       if (assetFadeRef.current) {

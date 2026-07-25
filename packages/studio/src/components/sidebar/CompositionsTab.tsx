@@ -216,36 +216,45 @@ function CompCard({
       }`}
     >
       <div className="w-20 h-[45px] rounded overflow-hidden bg-neutral-900 flex-shrink-0 relative">
-        <iframe
-          ref={iframeRef}
-          src={previewUrl}
-          sandbox="allow-scripts allow-same-origin"
-          loading="lazy"
-          className="absolute border-none pointer-events-none"
-          style={{
-            transformOrigin: "0 0",
-            width: stageSize.width,
-            height: stageSize.height,
-            left: thumbnailOffsetX,
-            top: thumbnailOffsetY,
-            transform: `scale(${previewScale})`,
-          }}
-          onLoad={(e) => {
-            try {
-              const iframe = e.currentTarget;
-              const root = iframe.contentDocument?.querySelector("[data-composition-id]");
-              const width = Number(root?.getAttribute("data-width")) || DEFAULT_PREVIEW_STAGE.width;
-              const height =
-                Number(root?.getAttribute("data-height")) || DEFAULT_PREVIEW_STAGE.height;
-              setStageSize({ width, height });
-              requestIframePlaybackSync(hovered);
-            } catch {
-              setStageSize(DEFAULT_PREVIEW_STAGE);
-            }
-          }}
-          title={`${name} preview`}
-          tabIndex={-1}
-        />
+        {hovered ? (
+          <iframe
+            ref={iframeRef}
+            src={previewUrl}
+            sandbox="allow-scripts allow-same-origin"
+            className="absolute border-none pointer-events-none"
+            style={{
+              transformOrigin: "0 0",
+              width: stageSize.width,
+              height: stageSize.height,
+              left: thumbnailOffsetX,
+              top: thumbnailOffsetY,
+              transform: `scale(${previewScale})`,
+            }}
+            onLoad={(e) => {
+              try {
+                const iframe = e.currentTarget;
+                const root = iframe.contentDocument?.querySelector("[data-composition-id]");
+                const width =
+                  Number(root?.getAttribute("data-width")) || DEFAULT_PREVIEW_STAGE.width;
+                const height =
+                  Number(root?.getAttribute("data-height")) || DEFAULT_PREVIEW_STAGE.height;
+                setStageSize({ width, height });
+                requestIframePlaybackSync(true);
+              } catch {
+                setStageSize(DEFAULT_PREVIEW_STAGE);
+              }
+            }}
+            title={`${name} preview`}
+            tabIndex={-1}
+          />
+        ) : (
+          <div
+            aria-hidden="true"
+            className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-neutral-900 to-neutral-950 text-[9px] font-medium text-neutral-600"
+          >
+            Preview
+          </div>
+        )}
       </div>
       <div
         className="min-w-0 flex-1"

@@ -63,6 +63,40 @@ import {
 import { createDatframesStudioProjectProviderFromEnv } from "./datframesStudioAdapter.js";
 import { createStudioThumbnailGeneratorFromEnv } from "./studioThumbnail.js";
 
+export function createStudioBundleCache(
+  bundle: (dir: string) => Promise<string | null>,
+  getRevision: (dir: string) => string | number = (dir) => {
+    const stats = statSync(dir);
+    return `${stats.dev}:${stats.ino}:${stats.mtimeMs}`;
+  },
+): (dir: string) => Promise<string | null> {
+  const cached = new Map<string, { revision: string | number; html: string | null }>();
+  const inFlight = new Map<
+    string,
+    { revision: string | number; promise: Promise<string | null> }
+  >();
+
+  return async (dir) => {
+    const revision = getRevision(dir);
+    const existing = cached.get(dir);
+    if (existing?.revision === revision) return existing.html;
+
+    const active = inFlight.get(dir);
+    if (active?.revision === revision) return active.promise;
+
+    const promise = bundle(dir)
+      .then((html) => {
+        cached.set(dir, { revision, html });
+        return html;
+      })
+      .finally(() => {
+        if (inFlight.get(dir)?.promise === promise) inFlight.delete(dir);
+      });
+    inFlight.set(dir, { revision, promise });
+    return promise;
+  };
+}
+
 /**
  * Lazily-constructed Storage client. Cached at module scope so warm
  * container instances reuse the underlying HTTP keep-alive pool across
@@ -667,19 +701,20 @@ export function createApp(deps?: HandlerDeps): Hono {
   };
   const datframesProvider = deps ? null : createDatframesStudioProjectProviderFromEnv();
   const thumbnailGenerator = deps ? null : createStudioThumbnailGeneratorFromEnv();
+  const bundleStudioProject = createStudioBundleCache(async (dir) => {
+    try {
+      const { bundleToSingleHtml } = await import("@hyperframes/core/compiler");
+      return await bundleToSingleHtml(dir, { runtime: "placeholder" });
+    } catch {
+      return null;
+    }
+  });
 
   const studioAdapter: StudioApiAdapter = deps?.studioAdapter ?? {
     listProjects: () => datframesProvider?.listProjects() ?? [testProject],
     resolveProject: (id: string) =>
       datframesProvider?.resolveProject(id) ?? (id === testProject.id ? testProject : null),
-    async bundle(dir: string): Promise<string | null> {
-      try {
-        const { bundleToSingleHtml } = await import("@hyperframes/core/compiler");
-        return await bundleToSingleHtml(dir, { runtime: "placeholder" });
-      } catch {
-        return null;
-      }
-    },
+    bundle: bundleStudioProject,
     lint: () => ({ findings: [] }),
     runtimeUrl: "/api/runtime.js",
     rendersDir: () => join(process.cwd(), "dist/renders"),

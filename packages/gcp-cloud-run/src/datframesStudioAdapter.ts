@@ -11,6 +11,7 @@ interface StudioProjectSummary {
   templateVersionId: string;
   dataChecksum: string;
   etag: string;
+  revision: string;
 }
 
 interface StudioProjectBootstrap extends StudioProjectSummary {
@@ -78,6 +79,7 @@ function parseSummary(value: unknown): StudioProjectSummary {
     templateVersionId: requiredString(value.templateVersionId, "templateVersionId"),
     dataChecksum: requiredString(value.dataChecksum, "dataChecksum"),
     etag: requiredString(value.etag, "etag"),
+    revision: requiredString(value.revision, "revision"),
   };
 }
 
@@ -202,6 +204,8 @@ export class DatframesStudioProjectProvider {
     { project: ResolvedProject; revalidateAt: number }
   >();
   private readonly titles = new Map<string, string>();
+  private projectList: { projects: ResolvedProject[]; revalidateAt: number } | undefined;
+  private projectListInFlight: Promise<ResolvedProject[]> | undefined;
 
   constructor(private readonly config: DatframesStudioProjectProviderConfig) {
     this.fetchImpl = config.fetchImpl ?? globalThis.fetch;
@@ -233,16 +237,33 @@ export class DatframesStudioProjectProvider {
   }
 
   async listProjects(): Promise<ResolvedProject[]> {
-    const value = await this.request("/internal/hyperframes/projects");
-    if (!Array.isArray(value)) throw new Error("DATframes projects response must be an array.");
-    return value.map(parseSummary).map((project) => {
-      this.titles.set(project.projectId, project.title);
-      return {
-        id: project.projectId,
-        dir: this.projectDirectory(project.projectId),
-        title: project.title,
-      };
-    });
+    if (this.projectList && this.projectList.revalidateAt > this.now()) {
+      return this.projectList.projects;
+    }
+    if (this.projectListInFlight) return this.projectListInFlight;
+
+    const operation = this.request("/internal/hyperframes/projects")
+      .then((value) => {
+        if (!Array.isArray(value)) throw new Error("DATframes projects response must be an array.");
+        const projects = value.map(parseSummary).map((project) => {
+          this.titles.set(project.projectId, project.title);
+          return {
+            id: project.projectId,
+            dir: this.projectDirectory(project.projectId),
+            title: project.title,
+          };
+        });
+        this.projectList = {
+          projects,
+          revalidateAt: this.now() + this.config.revalidateMs,
+        };
+        return projects;
+      })
+      .finally(() => {
+        this.projectListInFlight = undefined;
+      });
+    this.projectListInFlight = operation;
+    return operation;
   }
 
   resolveProject(projectId: string): Promise<ResolvedProject | null> {
@@ -317,6 +338,7 @@ export class DatframesStudioProjectProvider {
     if (
       cached?.projectId === projectId &&
       cached.etag === bootstrap.etag &&
+      cached.revision === bootstrap.revision &&
       (await fileExists(safeProjectFile(projectDir, cached.entryFile)))
     ) {
       return {
@@ -329,7 +351,11 @@ export class DatframesStudioProjectProvider {
     const archive = parseArchive(
       await this.request(`/internal/hyperframes/projects/${encodeURIComponent(projectId)}/archive`),
     );
-    if (archive.projectId !== projectId || archive.etag !== bootstrap.etag) {
+    if (
+      archive.projectId !== projectId ||
+      archive.etag !== bootstrap.etag ||
+      archive.revision !== bootstrap.revision
+    ) {
       throw new Error("DATframes bootstrap and archive revisions do not match.");
     }
     await this.materializeArchive(projectDir, archive);

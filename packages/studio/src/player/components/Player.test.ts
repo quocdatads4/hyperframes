@@ -1,7 +1,25 @@
 // @vitest-environment happy-dom
 
 import { describe, expect, it } from "vitest";
-import { hasUnloadedAssets, shouldShowCompositionLoadingOverlay } from "./Player";
+import {
+  hasUnloadedAssets,
+  resolvePlayerCompositionSize,
+  shouldShowCompositionLoadingOverlay,
+} from "./Player";
+
+describe("player composition size", () => {
+  it("uses the authored composition dimensions when available", () => {
+    expect(resolvePlayerCompositionSize({ width: 1080, height: 1920 }, false)).toEqual({
+      width: 1080,
+      height: 1920,
+    });
+  });
+
+  it("falls back to the requested orientation before preview metadata loads", () => {
+    expect(resolvePlayerCompositionSize(null, true)).toEqual({ width: 1080, height: 1920 });
+    expect(resolvePlayerCompositionSize(null, false)).toEqual({ width: 1920, height: 1080 });
+  });
+});
 
 describe("composition loading overlay", () => {
   it("shows while the composition is loading", () => {

@@ -21,7 +21,13 @@ import { join } from "node:path";
 import type { AssembleResult, ChunkResult, PlanResult } from "@hyperframes/producer/distributed";
 import { asStorage, FakeGcs } from "./__fixtures__/fakeGcs.js";
 import type { AssembleEvent, CloudRunEvent, PlanEvent, RenderChunkEvent } from "./events.js";
-import { createApp, dispatch, type HandlerDeps, unwrapEvent } from "./server.js";
+import {
+  createApp,
+  createStudioBundleCache,
+  dispatch,
+  type HandlerDeps,
+  unwrapEvent,
+} from "./server.js";
 import { tarDirectory } from "./gcsTransport.js";
 
 const tmpDirs: string[] = [];
@@ -35,6 +41,31 @@ afterEach(() => {
 });
 
 const PLAN_HASH = "abc123planhash";
+
+describe("createStudioBundleCache", () => {
+  it("reuses a bundle until the materialized project revision changes", async () => {
+    let revision = 1;
+    let calls = 0;
+    const bundle = createStudioBundleCache(
+      async () => {
+        calls += 1;
+        return `html-${calls}`;
+      },
+      () => revision,
+    );
+
+    expect(await Promise.all([bundle("/project"), bundle("/project")])).toEqual([
+      "html-1",
+      "html-1",
+    ]);
+    expect(await bundle("/project")).toBe("html-1");
+    expect(calls).toBe(1);
+
+    revision += 1;
+    expect(await bundle("/project")).toBe("html-2");
+    expect(calls).toBe(2);
+  });
+});
 
 /** Build a real project tarball, seed it into the fake, return its URI. */
 async function seedProjectTar(gcs: FakeGcs, uri: string): Promise<void> {
