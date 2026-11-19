@@ -6,20 +6,34 @@ import { sourceAliases } from "../../scripts/package-subpaths.mjs";
 const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf-8")) as {
   version: string;
 };
+const producerPkg = JSON.parse(
+  readFileSync(new URL("../producer/package.json", import.meta.url), "utf-8"),
+) as { version: string };
 
 export default defineConfig({
   entry: {
     cli: "src/cli.ts",
+    fontLocalizeCli: "src/fontLocalizeCli.ts",
     runtimeVersion: "src/runtimeVersion.ts",
+    hangReport: "src/hangReport.ts",
+    warmCheck: "src/warmCheck.ts",
+    warmCheckClient: "src/warmCheckClient.ts",
+    renderSetupWorker: "src/renderSetupWorker.ts",
+    backgroundChecksWorker: "src/backgroundChecksWorker.ts",
+    sherpaWorker: "src/whisper/sherpaWorker.ts",
     shaderTransitionWorker: "../producer/src/services/shaderTransitionWorker.ts",
+    subCompositionWorker: "../studio-server/src/helpers/subCompositionWorker.ts",
+    api: "src/api.ts",
   },
   format: ["esm"],
   outDir: "dist",
   target: "node22",
   platform: "node",
   bundle: true,
-  splitting: false,
+  splitting: true,
   sourcemap: false,
+  // Types for the `./api` export only; the other entries are programs, not libraries.
+  dts: { entry: { api: "src/api.ts" } },
   clean: true,
   banner: {
     js: `import { createRequire as __hf_createRequire } from "node:module";
@@ -31,6 +45,7 @@ var __dirname = __hf_dirname(__filename);`,
   },
   external: [
     "puppeteer-core",
+    "undici",
     "puppeteer",
     "@puppeteer/browsers",
     // Native module — its platform binary (@img/sharp-<os>-<arch>) must be
@@ -63,12 +78,14 @@ var __dirname = __hf_dirname(__filename);`,
     "@hyperframes/gcp-cloud-run/terraform",
   ],
   noExternal: [
+    "@hyperframes/share",
     "@hyperframes/core",
     "@hyperframes/parsers",
     "@hyperframes/studio-server",
     "@hyperframes/lint",
     "@hyperframes/producer",
     "@hyperframes/engine",
+    "@hyperframes/inspector",
     "@clack/prompts",
     "@clack/core",
     "picocolors",
@@ -79,13 +96,23 @@ var __dirname = __hf_dirname(__filename);`,
   ],
   define: {
     __CLI_VERSION__: JSON.stringify(pkg.version),
+    __PRODUCER_VERSION__: JSON.stringify(producerPkg.version),
   },
   esbuildOptions(options) {
     options.alias = {
       // Exact subpaths are generated from the same contracts as package
       // exports, avoiding esbuild's root-alias prefix substitution trap.
       ...sourceAliases(resolve(__dirname, "../producer"), [".", "./distributed"]),
-      ...sourceAliases(resolve(__dirname, "../engine"), [".", "./shader-transitions"]),
+      ...sourceAliases(resolve(__dirname, "../engine"), [
+        ".",
+        "./chrome-host-ceiling",
+        "./chrome-startup",
+        "./network-policy",
+        "./public-network",
+        "./shader-transitions",
+        "./system-memory",
+        "./wsl-host",
+      ]),
     };
     options.loader = { ...options.loader, ".browser.js": "text" };
   },

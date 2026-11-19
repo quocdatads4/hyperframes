@@ -5,9 +5,15 @@
  * Uses only Node.js built-ins (zlib) — no additional dependencies.
  */
 
-import { inflateSync } from "zlib";
+import { deflateSync, inflateSync } from "zlib";
+import { chunkCrc32 } from "./crc32.js";
 
 // ── PNG decoder ───────────────────────────────────────────────────────────────
+
+/** Ceiling for user-supplied rgb48le images and their resampled layout buffers. */
+export const MAX_RGB48LE_PIXELS = 8192 * 8192;
+/** Chrome caps screenshots at 16384 px per side, so `decodePng` never needs more. */
+const MAX_SCREENSHOT_PIXELS = 16384 * 16384;
 
 function paeth(a: number, b: number, c: number): number {
   const p = a + b - c;
@@ -17,6 +23,46 @@ function paeth(a: number, b: number, c: number): number {
   if (pa <= pb && pa <= pc) return a;
   if (pb <= pc) return b;
   return c;
+}
+
+/** Checks the IHDR size before any allocation and inflates exactly the bytes it declares. */
+function inflateScanlines(
+  idatChunks: Buffer[],
+  header: { width: number; height: number; bitDepth: number; colorType: number },
+  caller: string,
+  maxPixels: number,
+): { decompressed: Buffer; bpp: number; stride: number } {
+  const { width, height, bitDepth, colorType } = header;
+  if (bitDepth !== 8 && bitDepth !== 16) {
+    throw new Error(`${caller}: unsupported bit depth ${bitDepth} (expected 8 or 16)`);
+  }
+  if (width === 0 || height === 0 || width * height > maxPixels) {
+    throw new Error(
+      `${caller}: ${width}x${height} PNG is outside the supported size (max ${maxPixels} pixels)`,
+    );
+  }
+
+  // Bytes per pixel: channels x bytes-per-channel
+  const channels = colorType === 6 ? 4 : 3;
+  const bpp = channels * (bitDepth / 8);
+  const stride = width * bpp;
+  const expectedLength = height * (stride + 1);
+
+  let decompressed: Buffer;
+  try {
+    decompressed = inflateSync(Buffer.concat(idatChunks), { maxOutputLength: expectedLength });
+  } catch (err) {
+    throw new Error(
+      `${caller}: image data does not inflate to ${expectedLength} bytes for ${width}x${height}`,
+      { cause: err },
+    );
+  }
+  if (decompressed.length !== expectedLength) {
+    throw new Error(
+      `${caller}: image data inflates to ${decompressed.length} bytes, expected ${expectedLength}`,
+    );
+  }
+  return { decompressed, bpp, stride };
 }
 
 /**
@@ -31,6 +77,7 @@ function paeth(a: number, b: number, c: number): number {
 function decodePngRaw(
   buf: Buffer,
   caller: string,
+  maxPixels: number,
 ): { width: number; height: number; bitDepth: number; colorType: number; rawPixels: Buffer } {
   // Verify PNG signature
   if (
@@ -88,13 +135,12 @@ function decodePngRaw(
     );
   }
 
-  // Bytes per pixel: channels x bytes-per-channel
-  const channels = colorType === 6 ? 4 : 3;
-  const bpp = channels * (bitDepth / 8);
-  const stride = width * bpp;
-
-  const compressed = Buffer.concat(idatChunks);
-  const decompressed = inflateSync(compressed);
+  const { decompressed, bpp, stride } = inflateScanlines(
+    idatChunks,
+    { width, height, bitDepth, colorType },
+    caller,
+    maxPixels,
+  );
 
   // Reconstruct filtered rows into a flat pixel buffer (no filter bytes)
   const rawPixels = Buffer.allocUnsafe(height * stride);
@@ -157,7 +203,11 @@ function decodePngRaw(
  * Returns a Uint8Array of width*height*4 bytes in RGBA order.
  */
 export function decodePng(buf: Buffer): { width: number; height: number; data: Uint8Array } {
-  const { width, height, bitDepth, colorType, rawPixels } = decodePngRaw(buf, "decodePng");
+  const { width, height, bitDepth, colorType, rawPixels } = decodePngRaw(
+    buf,
+    "decodePng",
+    MAX_SCREENSHOT_PIXELS,
+  );
 
   if (bitDepth !== 8) {
     throw new Error(`decodePng: unsupported bit depth ${bitDepth} (expected 8)`);
@@ -181,6 +231,56 @@ export function decodePng(buf: Buffer): { width: number; height: number; data: U
   return { width, height, data: output };
 }
 
+// ── PNG encoder ──────────────────────────────────────────────────
+
+/**
+ * Intermediate frames are read once by the encoder and deleted, so encode speed matters
+ * and compression ratio does not. Measured on a 1920x1080 frame: level 1 takes 214 ms for
+ * 4.14 MiB against level 6's 293 ms for 3.98 MiB.
+ */
+const PNG_DEFLATE_LEVEL = 1;
+
+function pngChunk(type: string, body: Buffer): Buffer {
+  const header = Buffer.alloc(8);
+  header.writeUInt32BE(body.length, 0);
+  header.write(type, 4, "ascii");
+  const trailer = Buffer.alloc(4);
+  trailer.writeUInt32BE(chunkCrc32(type, body), 0);
+  return Buffer.concat([header, body, trailer]);
+}
+
+/**
+ * Encode 8-bit RGBA pixels as a PNG, the inverse of `decodePng`.
+ *
+ * Byte-identical for identical pixels: every scanline takes filter 0 and zlib runs at a
+ * fixed level, so a render that samples the same instant twice produces the same file.
+ */
+export function encodePng(width: number, height: number, rgba: Uint8Array): Buffer {
+  const expected = width * height * 4;
+  if (rgba.length !== expected) {
+    throw new Error(
+      `encodePng: expected ${expected} bytes for ${width}x${height}, got ${rgba.length}`,
+    );
+  }
+  const stride = width * 4;
+  const filtered = Buffer.alloc((stride + 1) * height);
+  for (let y = 0; y < height; y++) {
+    filtered[y * (stride + 1)] = 0;
+    filtered.set(rgba.subarray(y * stride, (y + 1) * stride), y * (stride + 1) + 1);
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 6; // colour type RGBA
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", deflateSync(filtered, { level: PNG_DEFLATE_LEVEL })),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
 // ── 16-bit PNG decoder ────────────────────────────────────────────────────────
 
 /**
@@ -193,7 +293,11 @@ export function decodePng(buf: Buffer): { width: number; height: number; data: U
  * Supports colorType 2 (RGB) and 6 (RGBA) at 16-bit depth, non-interlaced.
  */
 export function decodePngToRgb48le(buf: Buffer): { width: number; height: number; data: Buffer } {
-  const { width, height, bitDepth, colorType, rawPixels } = decodePngRaw(buf, "decodePngToRgb48le");
+  const { width, height, bitDepth, colorType, rawPixels } = decodePngRaw(
+    buf,
+    "decodePngToRgb48le",
+    MAX_RGB48LE_PIXELS,
+  );
 
   if (bitDepth !== 16) {
     throw new Error(`decodePngToRgb48le: unsupported bit depth ${bitDepth} (expected 16)`);
@@ -233,22 +337,20 @@ export function decodePngToRgb48le(buf: Buffer): { width: number; height: number
  * ## Convention
  *
  * "Linear" here means **scene light in [0, 1] relative to SDR reference white**
- * (not absolute nits). The HLG branch applies the OETF directly — no OOTF (no
- * gamma 1.2 scene→display conversion). This is the right choice for DOM
- * overlays that will be composited ON TOP of HLG video pixels (which are
- * already in HLG signal space); we need the overlay to sit in the same space
- * as what it’s blending onto. Applying the OOTF here would double-apply it
- * when the HDR video already carries scene-light semantics.
- *
- * For PQ, SDR white is placed at 203 nits per ITU-R BT.2408 ("SDR white"
- * reference level) and normalized against 10,000-nit peak. This lets SDR
- * content (text, UI) sit at the conventional SDR-white brightness within a
- * PQ frame rather than at peak brightness.
+ * (not absolute nits). Both branches put SDR white at BT.2408 reference white,
+ * below peak: HLG at 75% signal (the OETF takes peak-relative light, so it is
+ * scaled first; no OOTF), PQ at 203 nits of the 10,000-nit peak.
  *
  * Note: converts the transfer function but not the color primaries (bt709 →
  * bt2020). For neutral/near-neutral content (text, UI) the gamut difference
  * is negligible.
  */
+/** sRGB EOTF: an 8-bit signal value to linear light, 0 to 1 relative to SDR white. */
+export function srgbByteToLinear(value: number): number {
+  const v = value / 255;
+  return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+}
+
 function buildSrgbToSignalLut(transfer: "hlg" | "pq" | "srgb"): Uint16Array {
   const lut = new Uint16Array(256);
 
@@ -256,6 +358,7 @@ function buildSrgbToSignalLut(transfer: "hlg" | "pq" | "srgb"): Uint16Array {
   const hlgA = 0.17883277;
   const hlgB = 1 - 4 * hlgA;
   const hlgC = 0.5 - hlgA * Math.log(4 * hlgA);
+  const hlgSdrWhite = (Math.exp((0.75 - hlgC) / hlgA) + hlgB) / 12;
 
   // PQ (SMPTE 2084) OETF constants
   const pqM1 = 0.1593017578125;
@@ -272,14 +375,12 @@ function buildSrgbToSignalLut(transfer: "hlg" | "pq" | "srgb"): Uint16Array {
       continue;
     }
 
-    // sRGB EOTF: signal → linear (range 0–1, relative to SDR white)
-    const v = i / 255;
-    const linear = v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+    const linear = srgbByteToLinear(i);
 
     let signal: number;
     if (transfer === "hlg") {
-      signal =
-        linear <= 1 / 12 ? Math.sqrt(3 * linear) : hlgA * Math.log(12 * linear - hlgB) + hlgC;
+      const scene = linear * hlgSdrWhite;
+      signal = scene <= 1 / 12 ? Math.sqrt(3 * scene) : hlgA * Math.log(12 * scene - hlgB) + hlgC;
     } else {
       // PQ OETF: linear light (in SDR nits) → PQ signal
       const Lp = Math.max(0, (linear * sdrNits) / pqMaxNits);
@@ -669,8 +770,8 @@ export function blitRgb48leAffine(
 export type ObjectFit = "fill" | "cover" | "contain" | "none" | "scale-down";
 
 /**
- * Parse a single axis of a CSS `object-position` string into a fraction in
- * `[0, 1]` (proportion of the slack space along that axis).
+ * Parse a single axis of a CSS `object-position` string into a fraction of
+ * the slack space along that axis. Percentages may lie outside `[0, 1]`.
  *
  * Defaults to 0.5 (centered) for unrecognized inputs to match CSS, which
  * resolves invalid `object-position` values to the initial value (`50% 50%`).
@@ -682,7 +783,7 @@ function parseObjectPositionAxis(value: string, axis: "x" | "y"): number {
   if (lower === "center" || lower === "") return 0.5;
   if (lower.endsWith("%")) {
     const pct = parseFloat(lower) / 100;
-    return Number.isFinite(pct) ? Math.max(0, Math.min(1, pct)) : 0.5;
+    return Number.isFinite(pct) ? pct : 0.5;
   }
   // Pixel values (e.g. "10px") aren't fractional; without the slack-space
   // numerator we can't honor them precisely. Fall back to center — this is
@@ -693,7 +794,7 @@ function parseObjectPositionAxis(value: string, axis: "x" | "y"): number {
 
 /**
  * Parse a CSS `object-position` string like `"50% 50%"`, `"center top"`, or
- * `"25% 75%"` into normalized `[0, 1]` fractions for X and Y.
+ * `"25% 75%"` into fractions for X and Y, preserving percentages outside `[0, 1]`.
  *
  * The fractions express how the slack space (the portion of the layout box
  * not covered by the rendered content) should be distributed between the
@@ -791,6 +892,11 @@ export function resampleRgb48leObjectFit(
   }
   if (fit === "fill" && srcW === dstW && srcH === dstH) {
     return source;
+  }
+  if (dstW * dstH > MAX_RGB48LE_PIXELS) {
+    throw new Error(
+      `resampleRgb48leObjectFit: ${dstW}x${dstH} target exceeds the ${MAX_RGB48LE_PIXELS}-pixel limit`,
+    );
   }
 
   const pos = parseObjectPosition(objectPosition);
@@ -920,16 +1026,16 @@ export function normalizeObjectFit(value: string | undefined): ObjectFit {
 export function parseTransformMatrix(css: string): number[] | null {
   if (!css || css === "none") return null;
 
-  const match2d = css.match(
-    /^matrix\(\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,)]+)\s*\)$/,
-  );
+  // The captures already include whitespace; overlapping whitespace quantifiers
+  // cause excessive backtracking on malformed input. Number handles the spaces.
+  const match2d = css.match(/^matrix\(([^,]+),([^,]+),([^,]+),([^,]+),([^,]+),([^,)]+)\)$/);
   if (match2d) {
     const values = match2d.slice(1, 7).map(Number);
     if (!values.every(Number.isFinite)) return null;
     return values;
   }
 
-  const match3d = css.match(/^matrix3d\(\s*([^)]+)\)$/);
+  const match3d = css.match(/^matrix3d\(([^)]+)\)$/);
   if (match3d) {
     const raw = match3d[1];
     if (!raw) return null;

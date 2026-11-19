@@ -43,6 +43,7 @@ function FlatFillFields({
   styles,
   assets,
   onSetStyle,
+  onSetHtmlAttribute,
   onPreviewStyle,
   onImportAssets,
 }: {
@@ -50,19 +51,20 @@ function FlatFillFields({
   element: DomEditSelection;
   styles: Record<string, string>;
   assets: string[];
-  onSetStyle: (prop: string, value: string) => void | Promise<void>;
+  onSetStyle: (prop: string, value: string) => void | Promise<unknown>;
+  onSetHtmlAttribute: (attr: string, value: string | null) => void | Promise<void>;
   onPreviewStyle?: (prop: string, value: string) => void;
   onImportAssets?: (files: FileList) => Promise<string[]>;
 }) {
   const styleEditingDisabled = !element.capabilities.canEditStyles;
   const backgroundImage = styles["background-image"] ?? "none";
   const hasTextControls = isTextEditableSelection(element);
-  const fillMode =
-    backgroundImage && backgroundImage !== "none"
-      ? backgroundImage.includes("gradient")
-        ? "Gradient"
-        : "Image"
-      : "Solid";
+  let fillMode = "Solid";
+  if (element.tagName === "img") {
+    fillMode = "Image";
+  } else if (backgroundImage && backgroundImage !== "none") {
+    fillMode = backgroundImage.includes("gradient") ? "Gradient" : "Image";
+  }
   const [preferredFillMode, setPreferredFillMode] = useState(fillMode);
   const imageUrl = extractBackgroundImageUrl(backgroundImage);
 
@@ -124,7 +126,8 @@ function FlatFillFields({
       ) : (
         <ImageFillField
           projectId={projectId}
-          sourceFile={element.sourceFile}
+          element={element}
+          onSetHtmlAttribute={onSetHtmlAttribute}
           value={imageUrl}
           assets={assets}
           disabled={styleEditingDisabled}
@@ -156,7 +159,7 @@ function FlatStrokeRow({
 }: {
   styles: Record<string, string>;
   disabled: boolean;
-  onSetStyle: (prop: string, value: string) => void | Promise<void>;
+  onSetStyle: (prop: string, value: string) => void | Promise<unknown>;
 }) {
   const borderWidthValue =
     parsePxMetricValue(styles["border-width"] ?? "") ??
@@ -236,7 +239,7 @@ function FlatRadiusRow({
   styles: Record<string, string>;
   gsapBorderRadius?: { tl: number; tr: number; br: number; bl: number } | null;
   disabled: boolean;
-  onSetStyle: (prop: string, value: string) => void | Promise<void>;
+  onSetStyle: (prop: string, value: string) => void | Promise<unknown>;
 }) {
   const radiusValue = parseNumericValue(styles["border-radius"]) ?? 0;
   const radiusTL =
@@ -286,7 +289,7 @@ function FlatShadowBlendRows({
 }: {
   styles: Record<string, string>;
   disabled: boolean;
-  onSetStyle: (prop: string, value: string) => void | Promise<void>;
+  onSetStyle: (prop: string, value: string) => void | Promise<unknown>;
 }) {
   const boxShadowPreset = inferBoxShadowPreset(styles["box-shadow"]);
   const blendValue = styles["mix-blend-mode"] || "normal";
@@ -332,7 +335,7 @@ function FlatBlurSliders({
 }: {
   styles: Record<string, string>;
   disabled: boolean;
-  onSetStyle: (prop: string, value: string) => void | Promise<void>;
+  onSetStyle: (prop: string, value: string) => void | Promise<unknown>;
 }) {
   const filterBlurValue = getCssFilterFunctionPx(styles.filter, "blur");
   const backdropBlurValue = getCssFilterFunctionPx(styles["backdrop-filter"], "blur");
@@ -378,7 +381,7 @@ function FlatOverflowMaskRows({
 }: {
   styles: Record<string, string>;
   disabled: boolean;
-  onSetStyle: (prop: string, value: string) => void | Promise<void>;
+  onSetStyle: (prop: string, value: string) => void | Promise<unknown>;
 }) {
   const radiusValue = parseNumericValue(styles["border-radius"]) ?? 0;
   const clipPathValue = styles["clip-path"] || "none";
@@ -432,7 +435,7 @@ function FlatOpacitySlider({
 }: {
   styles: Record<string, string>;
   disabled: boolean;
-  onSetStyle: (prop: string, value: string) => void | Promise<void>;
+  onSetStyle: (prop: string, value: string) => void | Promise<unknown>;
 }) {
   const opacityValue = Math.round((parseNumericValue(styles.opacity) ?? 1) * 100);
 
@@ -456,6 +459,7 @@ export function FlatStyleSection({
   styles,
   assets,
   onSetStyle,
+  onSetHtmlAttribute,
   onPreviewStyle,
   onImportAssets,
   gsapBorderRadius,
@@ -464,7 +468,8 @@ export function FlatStyleSection({
   element: DomEditSelection;
   styles: Record<string, string>;
   assets: string[];
-  onSetStyle: (prop: string, value: string) => void | Promise<void>;
+  onSetStyle: (prop: string, value: string) => void | Promise<unknown>;
+  onSetHtmlAttribute: (attr: string, value: string | null) => void | Promise<void>;
   onPreviewStyle?: (prop: string, value: string) => void;
   onImportAssets?: (files: FileList) => Promise<string[]>;
   gsapBorderRadius?: { tl: number; tr: number; br: number; bl: number } | null;
@@ -478,6 +483,7 @@ export function FlatStyleSection({
         styles={styles}
         assets={assets}
         onSetStyle={onSetStyle}
+        onSetHtmlAttribute={onSetHtmlAttribute}
         onPreviewStyle={onPreviewStyle}
         onImportAssets={onImportAssets}
       />

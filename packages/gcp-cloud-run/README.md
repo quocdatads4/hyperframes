@@ -30,8 +30,8 @@ GCS bucket  ←→  Cloud Run service (plan / renderChunk / assemble)
                 Cloud Workflows  (Plan → parallel RenderChunk → Assemble)
 ```
 
-- **Plan** downloads the project tarball, runs `plan()`, uploads the planDir
-  tarball (+ audio) to GCS, and returns the chunk count.
+- **Plan** downloads the project tarball and publishes a Plan v2 manifest plus
+  content-addressed artifacts.
 - **RenderChunk** runs in a parallel `for` loop in the workflow, fanned out
   up to the plan's chunk count. Each invocation renders one chunk and uploads
   it.
@@ -43,6 +43,31 @@ The workflow accumulates each step's small result body and returns
 `{ Plan, Chunks, Assemble }` so `getRenderProgress` can read frame totals and
 per-step durations on success.
 
+### Plan transport
+
+Plan v2 is the only supported distributed plan transport.
+`renderToCloudRun` sends `PlanProtocol: "v2"` without requiring a protocol
+option:
+
+```ts
+await renderToCloudRun({
+  // ...project, bucket, workflow, service, and config...
+});
+```
+
+V2 uses separate manifest and content-addressed artifact locators throughout
+the workflow. Unknown protocols and integrity failures fail closed.
+
+#### Upgrade order
+
+Redeploy the Cloud Run image and Cloud Workflows definition from the same new
+package version before upgrading an application that calls
+`renderToCloudRun`. Pause new renders and drain active workflow executions
+during the infrastructure update. Older workflows may lack the Plan v2-only
+request and locator contract. If infrastructure cannot be redeployed first,
+keep the application on its previous package version until the workflow
+redeploy is complete.
+
 ## Chrome runtime
 
 Unlike the Lambda adapter — which fights a 250 MB ZIP ceiling and
@@ -50,7 +75,11 @@ decompresses `@sparticuz/chromium` into `/tmp` at runtime — Cloud Run runs a
 container image. The `Dockerfile` installs the same pinned
 `chrome-headless-shell` build and font set the production renderer uses, at a
 fixed path, and exports `HYPERFRAMES_CHROME_PATH`. CDP-level `BeginFrame`
-works because the command lives in the protocol, not the binary. There is no
+support is a binary/runtime capability, so the image build launches that
+exact executable and requires an enable + warm-up + PNG-returning
+`HeadlessExperimental.beginFrame` probe to pass. The end-to-end smoke also
+requires every chunk to report effective `CaptureMode: "beginframe"`, which
+catches runtime fallback separately from build-time packaging. There is no
 runtime decompression step and no packaging ceiling.
 
 ## Deploying
@@ -75,6 +104,12 @@ terraform -chdir=node_modules/@hyperframes/gcp-cloud-run/terraform apply \
 
 Terraform outputs `render_bucket_name`, `service_url`, `workflow_name`, and
 `region` — pass them straight into the SDK.
+
+### Page network restriction
+
+The service sets `PRODUCER_RESTRICT_PAGE_NETWORK=true`, so a rendered page reaches only its own project files and public internet addresses. Loopback, private, link-local and IPv6 addresses are refused for anything the page loads. An asset on a VPC-only host or behind private DNS is missing from the video. ffmpeg's https inputs may open only https, so an https source that redirects to http, or encrypted HLS, does not load.
+
+Keep it on when you render compositions you did not write. To turn it off, apply the module with `-var restrict_page_network=false`, or set `TF_VAR_restrict_page_network=false` before `hyperframes cloudrun deploy`.
 
 ## Using the SDK
 

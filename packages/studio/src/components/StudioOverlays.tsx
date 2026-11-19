@@ -1,15 +1,15 @@
-import type { ComponentProps } from "react";
+import { memo, type ComponentProps } from "react";
 import { LintModal } from "./LintModal";
 import { AskAgentModal } from "./AskAgentModal";
-import { StudioGlobalDragOverlay } from "./StudioGlobalDragOverlay";
 import { StudioToast } from "./StudioToast";
+import { StudioFeedbackCard } from "./feedback/StudioFeedbackCard";
 import { buildAgentContextPreview } from "./editor/domEditingAgentPrompt";
 import type { useDomEditSession } from "../hooks/useDomEditSession";
 import type { useToast } from "../hooks/useToast";
 
 type LintFindings = ComponentProps<typeof LintModal>["findings"];
 
-export interface StudioOverlaysProps {
+interface StudioOverlaysProps {
   projectId: string;
   projectDir?: string | null;
   lintModal: LintFindings | null;
@@ -18,18 +18,17 @@ export interface StudioOverlaysProps {
   clearConsoleErrors: () => void;
   domEditSession: ReturnType<typeof useDomEditSession>;
   activeCompPath: string | null;
-  dragOverlayActive: boolean;
   toasts: ReturnType<typeof useToast>["toasts"];
   dismissToast: (id: number) => void;
 }
 
 /**
  * Floating overlays for the studio shell: lint / console-error modals, the
- * ask-agent modal, the global drag overlay, and the toast. Extracted from
+ * ask-agent modal, and the toast. Extracted from
  * `App.tsx` to keep the shell within the studio's 600-line decomposition budget.
  */
 // fallow-ignore-next-line complexity
-export function StudioOverlays({
+export const StudioOverlays = memo(function StudioOverlays({
   projectId,
   projectDir,
   lintModal,
@@ -38,7 +37,6 @@ export function StudioOverlays({
   clearConsoleErrors,
   domEditSession,
   activeCompPath,
-  dragOverlayActive,
   toasts,
   dismissToast,
 }: StudioOverlaysProps) {
@@ -77,20 +75,22 @@ export function StudioOverlays({
           }}
         />
       )}
-      {dragOverlayActive && <StudioGlobalDragOverlay />}
-      {toasts.length > 0 && (
-        <div className="absolute bottom-6 right-6 z-[91] flex flex-col items-end gap-2">
+      {/* Toasts centre in the room the feedback card leaves, so the two never cover each other. */}
+      <div className="pointer-events-none absolute inset-x-6 bottom-6 z-91 flex items-end gap-2">
+        <div className="flex min-w-0 flex-1 flex-col items-center gap-2 *:pointer-events-auto">
           {toasts.map((toast) => (
             <StudioToast
               key={toast.id}
               message={toast.message}
               tone={toast.tone}
-              leaving={toast.leaving}
               onDismiss={() => dismissToast(toast.id)}
             />
           ))}
         </div>
-      )}
+        <div className="pointer-events-auto">
+          <StudioFeedbackCard />
+        </div>
+      </div>
     </>
   );
-}
+});

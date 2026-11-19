@@ -1,14 +1,27 @@
-import { memo, useState, useCallback, useRef } from "react";
+import { memo, useEffect, useState, useCallback, useRef } from "react";
+import { useLivePreviewIframe } from "../../player/store/previewIframeStore";
 import { useCaptionStore } from "../store";
-import { useMountEffect } from "../../hooks/useMountEffect";
-import { shouldHandleCaptionNudgeKey } from "../keyboard";
+import { usePlayerStore } from "../../player";
+import { resolveCaptionNudge, isEditableEventTarget } from "../keyboard";
+import { matchesKey } from "../../player/components/studioShortcuts";
+import { previewFrameOpaque } from "../../player/lib/previewChannel";
 import {
+  dragTransform,
+  moveSealedDrag,
+  pressSealedDrag,
+  readFrameWordBoxes,
+  restoreSealedDrag,
+  sealedNudger,
+  transformStyle,
+  type DragStart,
+  type SealedDrag,
   readWordBoxes,
   getWordEl,
   readGsapTransform,
   getOrCreateWrapper,
   writeTransform,
   computeTransformStyle,
+  registerCaptionIframe,
   type WordBox,
 } from "./CaptionOverlayUtils";
 
@@ -16,12 +29,16 @@ interface CaptionOverlayProps {
   iframeRef: React.RefObject<HTMLIFrameElement | null>;
 }
 
-const HANDLE = 8;
+const HANDLE = 8; // visual size of a handle dot
+const HANDLE_HIT = 24; // pointer target size (invisible padding around the dot)
 const ROTATION_OFFSET = 20; // px above the selection box
 
 /** Sync canvas state back to the Zustand store so the property panel reflects it. */
 function syncToStore(segmentId: string, el: HTMLElement, iframeWin: Window) {
-  const style = computeTransformStyle(el, iframeWin);
+  storeStyle(segmentId, computeTransformStyle(el, iframeWin));
+}
+
+function storeStyle(segmentId: string, style: Record<string, number>) {
   if (Object.keys(style).length > 0) {
     useCaptionStore.getState().updateSegmentStyle(segmentId, style);
   }
@@ -29,6 +46,7 @@ function syncToStore(segmentId: string, el: HTMLElement, iframeWin: Window) {
 
 export const CaptionOverlay = memo(function CaptionOverlay({ iframeRef }: CaptionOverlayProps) {
   const isEditMode = useCaptionStore((s) => s.isEditMode);
+  const livePreviewIframe = useLivePreviewIframe();
   const model = useCaptionStore((s) => s.model);
   const selectedSegmentIds = useCaptionStore((s) => s.selectedSegmentIds);
   const selectSegment = useCaptionStore((s) => s.selectSegment);
@@ -38,53 +56,61 @@ export const CaptionOverlay = memo(function CaptionOverlay({ iframeRef }: Captio
   const overlayRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef(model);
   modelRef.current = model;
+  // Set by the mount effect; lets Escape handling cancel an in-flight drag.
+  const cancelDragRef = useRef<(() => boolean) | null>(null);
 
   // Interaction mode — only one active at a time
-  const interactionRef = useRef<
-    | {
-        type: "move";
-        wordEl: HTMLElement;
-        segmentId: string;
-        startMX: number;
-        startMY: number;
-        origTX: number;
-        origTY: number;
-        origScale: number;
-        origRotation: number;
-      }
-    | {
-        type: "scale";
-        wordEl: HTMLElement;
-        segmentId: string;
-        startMX: number;
-        startDxFromCenter: number;
-        origTX: number;
-        origTY: number;
-        origScale: number;
-        origRotation: number;
-      }
-    | {
-        type: "rotate";
-        wordEl: HTMLElement;
-        segmentId: string;
-        startMX: number;
-        origTX: number;
-        origTY: number;
-        origRotation: number;
-        origScale: number;
-      }
-    | null
-  >(null);
+  const interactionRef = useRef<(DragStart & { wordEl: HTMLElement; segmentId: string }) | null>(
+    null,
+  );
+  const sealedDragRef = useRef<SealedDrag | null>(null);
+  const liveRef = useRef(false);
 
-  useMountEffect(() => {
+  // The observer and message filter bind to the live iframe element, which a promoted reload replaces.
+  // eslint-disable-next-line no-restricted-syntax
+  useEffect(() => {
     if (!isEditMode) return;
+    liveRef.current = true;
+
+    // Let undo/redo (useAppHotkeys) reapply restored models to this iframe.
+    const unregisterIframe = registerCaptionIframe(iframeRef);
+
     let prevBoxes: WordBox[] = [];
+    let rafId: number | null = null;
+    let disposed = false;
+    let reading = false;
+    let readAgain = false;
     const tick = () => {
+      rafId = null;
       const iframe = iframeRef.current;
       const m = modelRef.current;
       const overlay = overlayRef.current;
       if (!iframe || !m || !overlay) return;
-      const next = readWordBoxes(iframe, m, overlay);
+      if (previewFrameOpaque(iframe)) return readSealed(iframe, m, overlay);
+      show(readWordBoxes(iframe, m, overlay));
+    };
+    // One frame read in flight; triggers meanwhile collapse into one more read after it.
+    const readSealed = (
+      iframe: HTMLIFrameElement,
+      m: NonNullable<typeof model>,
+      overlay: HTMLElement,
+    ) => {
+      if (reading) {
+        readAgain = true;
+        return;
+      }
+      reading = true;
+      void readFrameWordBoxes(iframe, m, overlay).then((next) => {
+        reading = false;
+        if (disposed) return;
+        if (next) show(next);
+        if (readAgain) {
+          readAgain = false;
+          scheduleTick();
+        }
+      });
+    };
+    const show = (next: WordBox[]) => {
       if (
         next.length === prevBoxes.length &&
         next.every(
@@ -95,22 +121,108 @@ export const CaptionOverlay = memo(function CaptionOverlay({ iframeRef }: Captio
       prevBoxes = next;
       setWordBoxes(next);
     };
-    const id = setInterval(tick, 66);
+    // Coalesce bursts of triggers (player store updates, resize) into one
+    // layout read per frame — replaces the old unconditional 66ms polling.
+    const scheduleTick = () => {
+      if (rafId === null) rafId = requestAnimationFrame(tick);
+    };
+
+    // Event sources: player state changes (seek/scrub/select), preview
+    // messages, element resize, window resize.
+    const unsubPlayer = usePlayerStore.subscribe(scheduleTick);
+    const handleMessage = (e: MessageEvent) => {
+      if (!e.source || e.source !== iframeRef.current?.contentWindow) return;
+      const data = e.data;
+      if (data?.source === "hf-preview") scheduleTick();
+    };
+    window.addEventListener("message", handleMessage);
+    window.addEventListener("resize", scheduleTick);
+    const resizeObserver = new ResizeObserver(scheduleTick);
+    if (iframeRef.current) resizeObserver.observe(iframeRef.current);
+    if (overlayRef.current) resizeObserver.observe(overlayRef.current);
+
+    // During playback caption groups animate continuously — a light interval
+    // is the only reliable driver, but it runs ONLY while playing.
+    let playInterval: ReturnType<typeof setInterval> | null = null;
+    const syncPlaybackInterval = () => {
+      const playing = usePlayerStore.getState().isPlaying;
+      if (playing && playInterval === null) {
+        playInterval = setInterval(scheduleTick, 66);
+      } else if (!playing && playInterval !== null) {
+        clearInterval(playInterval);
+        playInterval = null;
+      }
+    };
+    const unsubPlayback = usePlayerStore.subscribe(syncPlaybackInterval);
+    syncPlaybackInterval();
     tick();
 
-    // Arrow key nudge for selected words
+    const getWin = (): Window | null => {
+      try {
+        return iframeRef.current?.contentWindow ?? null;
+      } catch {
+        return null;
+      }
+    };
+
+    const cancelActiveDrag = (): boolean => {
+      const sealed = sealedDragRef.current;
+      if (sealed) {
+        sealedDragRef.current = null;
+        restoreSealedDrag(sealed);
+        return true;
+      }
+      const i = interactionRef.current;
+      if (!i) return false;
+      const win = getWin();
+      if (win) {
+        // Restore the pre-drag transform instead of committing the partial one.
+        writeTransform(i.wordEl, win, i.origTX, i.origTY, i.origScale, i.origRotation);
+      }
+      interactionRef.current = null;
+      return true;
+    };
+    cancelDragRef.current = cancelActiveDrag;
+
     const handleKeyDown = (e: KeyboardEvent) => {
-      const { selectedSegmentIds: sel, model: m } = useCaptionStore.getState();
+      const store = useCaptionStore.getState();
+      const { selectedSegmentIds: sel, model: m } = store;
+
+      // Escape: cancel an in-flight drag first, else clear the selection.
+      if (matchesKey(e, "cancel")) {
+        if (cancelActiveDrag()) {
+          e.preventDefault();
+          scheduleTick();
+          return;
+        }
+        if (sel.size > 0) {
+          e.preventDefault();
+          store.clearSelection();
+        }
+        return;
+      }
+
+      // ⌘A / Ctrl+A selects every caption word (unless typing in a field).
+      if (matchesKey(e, "captionSelectAll") && !isEditableEventTarget(e.target)) {
+        e.preventDefault();
+        store.selectAll();
+        return;
+      }
+
       if (sel.size === 0 || !m) return;
-      const arrow = e.key;
-      if (!shouldHandleCaptionNudgeKey(e)) return;
+      // Pass the event target so arrows inside inputs keep their native
+      // behavior instead of nudging the canvas word.
+      const nudge = resolveCaptionNudge(e, e.target);
+      if (!nudge) return;
 
       e.preventDefault();
-      const step = e.shiftKey ? 10 : 1;
-      const dx = arrow === "ArrowLeft" ? -step : arrow === "ArrowRight" ? step : 0;
-      const dy = arrow === "ArrowUp" ? -step : arrow === "ArrowDown" ? step : 0;
+      const { dx, dy } = nudge;
 
       const iframe = iframeRef.current;
+      if (iframe && previewFrameOpaque(iframe)) {
+        void nudgeSealed(iframe, m, sel, dx, dy).then(scheduleTick);
+        return;
+      }
       const win = iframe?.contentWindow;
       if (!iframe || !win) return;
 
@@ -129,14 +241,31 @@ export const CaptionOverlay = memo(function CaptionOverlay({ iframeRef }: Captio
           break;
         }
       }
+      scheduleTick();
     };
+
+    const nudgeSealed = sealedNudger(
+      () => !disposed,
+      (segId, moved) => storeStyle(segId, transformStyle(moved)),
+    );
 
     window.addEventListener("keydown", handleKeyDown);
     return () => {
-      clearInterval(id);
+      disposed = true;
+      liveRef.current = false;
+      unregisterIframe();
+      unsubPlayer();
+      unsubPlayback();
+      if (playInterval !== null) clearInterval(playInterval);
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      resizeObserver.disconnect();
+      window.removeEventListener("message", handleMessage);
+      window.removeEventListener("resize", scheduleTick);
       window.removeEventListener("keydown", handleKeyDown);
+      cancelDragRef.current = null;
     };
-  });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [livePreviewIframe]);
 
   const getCssScale = useCallback(() => {
     const iframe = iframeRef.current;
@@ -146,6 +275,27 @@ export const CaptionOverlay = memo(function CaptionOverlay({ iframeRef }: Captio
     return rect.width / nativeW;
   }, [iframeRef]);
 
+  /** A press on a frame Studio cannot read: the drag starts from the word the frame reports. */
+  const startSealedDrag = useCallback(
+    (
+      type: DragStart["type"],
+      word: { group: number; word: number },
+      segmentId: string,
+      e: React.PointerEvent,
+    ) => {
+      const iframe = iframeRef.current;
+      if (!iframe) return;
+      const press = {
+        startMX: e.clientX,
+        startMY: e.clientY,
+        cssScale: getCssScale(),
+        left: iframe.getBoundingClientRect().left,
+      };
+      sealedDragRef.current = pressSealedDrag(iframe, type, word, segmentId, press);
+    },
+    [iframeRef, getCssScale],
+  );
+
   // --- Move ---
   const startMove = useCallback(
     (groupIndex: number, wordIndex: number, segmentId: string, e: React.PointerEvent) => {
@@ -153,6 +303,8 @@ export const CaptionOverlay = memo(function CaptionOverlay({ iframeRef }: Captio
       (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
       const iframe = iframeRef.current;
       if (!iframe) return;
+      if (previewFrameOpaque(iframe))
+        return startSealedDrag("move", { group: groupIndex, word: wordIndex }, segmentId, e);
       const wordEl = getWordEl(iframe, groupIndex, wordIndex);
       const win = iframe.contentWindow;
       if (!wordEl || !win) return;
@@ -169,7 +321,7 @@ export const CaptionOverlay = memo(function CaptionOverlay({ iframeRef }: Captio
         origRotation: state.rotation,
       };
     },
-    [iframeRef],
+    [iframeRef, startSealedDrag],
   );
 
   // --- Scale ---
@@ -180,6 +332,8 @@ export const CaptionOverlay = memo(function CaptionOverlay({ iframeRef }: Captio
       (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
       const iframe = iframeRef.current;
       if (!iframe) return;
+      if (previewFrameOpaque(iframe))
+        return startSealedDrag("scale", { group: groupIndex, word: wordIndex }, segmentId, e);
       const wordEl = getWordEl(iframe, groupIndex, wordIndex);
       const win = iframe.contentWindow;
       if (!wordEl || !win) return;
@@ -202,7 +356,7 @@ export const CaptionOverlay = memo(function CaptionOverlay({ iframeRef }: Captio
         origRotation: state.rotation,
       };
     },
-    [iframeRef, getCssScale],
+    [iframeRef, getCssScale, startSealedDrag],
   );
 
   // --- Rotate ---
@@ -213,6 +367,13 @@ export const CaptionOverlay = memo(function CaptionOverlay({ iframeRef }: Captio
       (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
       const iframe = iframeRef.current;
       if (!iframe) return;
+      if (previewFrameOpaque(iframe))
+        return startSealedDrag(
+          "rotate",
+          { group: box.groupIndex, word: box.wordIndex },
+          box.segmentId,
+          e,
+        );
       const wordEl = getWordEl(iframe, box.groupIndex, box.wordIndex);
       const win = iframe.contentWindow;
       if (!wordEl || !win) return;
@@ -228,7 +389,7 @@ export const CaptionOverlay = memo(function CaptionOverlay({ iframeRef }: Captio
         origScale: state.scale,
       };
     },
-    [iframeRef],
+    [iframeRef, startSealedDrag],
   );
 
   const getIframeWin = useCallback((): Window | null => {
@@ -242,34 +403,29 @@ export const CaptionOverlay = memo(function CaptionOverlay({ iframeRef }: Captio
   // --- Unified pointer move ---
   const handlePointerMove = useCallback(
     (e: React.PointerEvent) => {
+      const sealed = sealedDragRef.current;
+      if (sealed) return moveSealedDrag(sealed, e.clientX, e.clientY, getCssScale());
       const i = interactionRef.current;
       if (!i) return;
       const win = getIframeWin();
       if (!win) return;
 
-      if (i.type === "move") {
-        const cssScale = getCssScale();
-        const dx = (e.clientX - i.startMX) / cssScale;
-        const dy = (e.clientY - i.startMY) / cssScale;
-        writeTransform(i.wordEl, win, i.origTX + dx, i.origTY + dy, i.origScale, i.origRotation);
-      } else if (i.type === "scale") {
-        const cx = i.startMX - i.startDxFromCenter;
-        const startDist = Math.abs(i.startDxFromCenter);
-        const currentDist = Math.abs(e.clientX - cx);
-        const factor = startDist > 5 ? currentDist / startDist : 1;
-        const newScale = Math.max(0.1, i.origScale * factor);
-        writeTransform(i.wordEl, win, i.origTX, i.origTY, newScale, i.origRotation);
-      } else if (i.type === "rotate") {
-        const dx = e.clientX - i.startMX;
-        const delta = (dx / 200) * 90;
-        writeTransform(i.wordEl, win, i.origTX, i.origTY, i.origScale, i.origRotation + delta);
-      }
+      const t = dragTransform(i, e.clientX, e.clientY, getCssScale());
+      writeTransform(i.wordEl, win, t.x, t.y, t.scale, t.rotation);
     },
     [getCssScale, getIframeWin],
   );
 
   // --- Unified pointer up — sync back to store ---
   const handlePointerUp = useCallback(() => {
+    const sealed = sealedDragRef.current;
+    if (sealed) {
+      sealedDragRef.current = null;
+      void sealed.last.then(
+        (t) => t && liveRef.current && storeStyle(sealed.segmentId, transformStyle(t)),
+      );
+      return;
+    }
     const i = interactionRef.current;
     if (i) {
       const win = getIframeWin();
@@ -297,6 +453,13 @@ export const CaptionOverlay = memo(function CaptionOverlay({ iframeRef }: Captio
       onPointerUp={handlePointerUp}
       onLostPointerCapture={handlePointerUp}
     >
+      {wordBoxes.length === 0 && model && model.segments.size > 0 && (
+        <div className="absolute inset-x-0 top-3 flex justify-center pointer-events-none">
+          <span className="px-2.5 py-1 rounded-full bg-black/60 border border-neutral-700 text-2xs text-neutral-300">
+            No captions visible at this frame. Scrub to a caption, or select one in the track below
+          </span>
+        </div>
+      )}
       {wordBoxes.map((box) => {
         const isSelected = selectedSegmentIds.has(box.segmentId);
         return (
@@ -325,23 +488,33 @@ export const CaptionOverlay = memo(function CaptionOverlay({ iframeRef }: Captio
           >
             {isSelected && (
               <>
-                {/* Rotation handle — circle above the box */}
+                {/* Rotation handle — 24px hit area around an 8px dot */}
                 <div
                   style={{
                     position: "absolute",
                     left: "50%",
-                    top: -ROTATION_OFFSET - HANDLE,
-                    marginLeft: -HANDLE / 2,
-                    width: HANDLE,
-                    height: HANDLE,
-                    borderRadius: "50%",
-                    backgroundColor: "var(--hf-accent, #3CE6AC)",
-                    border: "1px solid rgba(0,0,0,0.5)",
+                    top: -ROTATION_OFFSET - HANDLE / 2 - HANDLE_HIT / 2,
+                    marginLeft: -HANDLE_HIT / 2,
+                    width: HANDLE_HIT,
+                    height: HANDLE_HIT,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
                     cursor: "grab",
                     touchAction: "none",
                   }}
                   onPointerDown={(e) => startRotate(box, e)}
-                />
+                >
+                  <div
+                    style={{
+                      width: HANDLE,
+                      height: HANDLE,
+                      borderRadius: "50%",
+                      backgroundColor: "var(--hf-accent, #3CE6AC)",
+                      border: "1px solid rgba(0,0,0,0.5)",
+                    }}
+                  />
+                </div>
                 {/* Line from box to rotation handle */}
                 <div
                   style={{
@@ -356,29 +529,52 @@ export const CaptionOverlay = memo(function CaptionOverlay({ iframeRef }: Captio
                     pointerEvents: "none",
                   }}
                 />
-                {/* Scale handles — four corners */}
+                {/* Scale handles — four corners, 24px hit areas around 8px dots */}
                 {[
-                  { right: -HANDLE / 2, bottom: -HANDLE / 2, cursor: "nwse-resize" },
-                  { left: -HANDLE / 2, top: -HANDLE / 2, cursor: "nwse-resize" },
-                  { right: -HANDLE / 2, top: -HANDLE / 2, cursor: "nesw-resize" },
-                  { left: -HANDLE / 2, bottom: -HANDLE / 2, cursor: "nesw-resize" },
-                ].map((pos, idx) => (
+                  {
+                    corner: { right: -HANDLE_HIT / 2, bottom: -HANDLE_HIT / 2 },
+                    cursor: "nwse-resize",
+                  },
+                  {
+                    corner: { left: -HANDLE_HIT / 2, top: -HANDLE_HIT / 2 },
+                    cursor: "nwse-resize",
+                  },
+                  {
+                    corner: { right: -HANDLE_HIT / 2, top: -HANDLE_HIT / 2 },
+                    cursor: "nesw-resize",
+                  },
+                  {
+                    corner: { left: -HANDLE_HIT / 2, bottom: -HANDLE_HIT / 2 },
+                    cursor: "nesw-resize",
+                  },
+                ].map(({ corner, cursor }, idx) => (
                   <div
                     key={idx}
                     style={{
                       position: "absolute",
-                      ...pos,
-                      width: HANDLE,
-                      height: HANDLE,
-                      backgroundColor: "var(--hf-accent, #3CE6AC)",
-                      border: "1px solid rgba(0,0,0,0.5)",
-                      borderRadius: 2,
+                      ...corner,
+                      width: HANDLE_HIT,
+                      height: HANDLE_HIT,
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      cursor,
                       touchAction: "none",
                     }}
                     onPointerDown={(e) =>
                       startScale(box.groupIndex, box.wordIndex, box.segmentId, e)
                     }
-                  />
+                  >
+                    <div
+                      style={{
+                        width: HANDLE,
+                        height: HANDLE,
+                        backgroundColor: "var(--hf-accent, #3CE6AC)",
+                        border: "1px solid rgba(0,0,0,0.5)",
+                        borderRadius: 2,
+                      }}
+                    />
+                  </div>
                 ))}
               </>
             )}

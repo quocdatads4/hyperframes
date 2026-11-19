@@ -9,11 +9,174 @@
  */
 
 import type { Page } from "puppeteer-core";
-import { existsSync, readdirSync, statSync, readFileSync } from "node:fs";
+import {
+  existsSync,
+  readdirSync,
+  statSync,
+  readFileSync,
+  openSync,
+  fstatSync,
+  closeSync,
+} from "node:fs";
 import { basename, join } from "node:path";
+import type { GoogleGenAIOptions } from "@google/genai";
 import type sharpType from "sharp";
 import type { CatalogedAsset } from "./assetCataloger.js";
 import type { DesignTokens } from "./types.js";
+import {
+  loadOptionalPackage,
+  loadSharp,
+  type OptionalPackageModules,
+} from "../utils/optionalPackages.js";
+import { noteProjectProviderKey, visionCredential } from "../utils/dotEnv.js";
+
+const DEFAULT_VISION_REQUEST_TIMEOUT_MS = 30_000;
+
+export interface VisionCaptionOutcome {
+  timedOutRequests: number;
+  failedRequests: number;
+  budgetExhausted: boolean;
+  /** Failure outside provider request handling (filesystem, module, or programming error). */
+  internalError?: boolean;
+}
+
+interface VisionCaptionOptions {
+  skipVision?: boolean;
+  remainingMs?: () => number;
+  onOutcome?: (outcome: VisionCaptionOutcome) => void;
+}
+
+export function resolveVisionPhaseCompletion(
+  outcome: VisionCaptionOutcome,
+  remainingMs: number,
+):
+  | { status: "completed" }
+  | {
+      status: "degraded";
+      reason: "budget-exhausted" | "request-timeout" | "provider-error" | "internal-error";
+    } {
+  if (outcome.budgetExhausted || remainingMs <= 0) {
+    return { status: "degraded", reason: "budget-exhausted" };
+  }
+  if (outcome.internalError) {
+    return { status: "degraded", reason: "internal-error" };
+  }
+  if (outcome.timedOutRequests > 0) {
+    return { status: "degraded", reason: "request-timeout" };
+  }
+  if (outcome.failedRequests > 0) {
+    return { status: "degraded", reason: "provider-error" };
+  }
+  return { status: "completed" };
+}
+
+class VisionRequestTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Vision request timed out after ${timeoutMs}ms`);
+    this.name = "VisionRequestTimeoutError";
+  }
+}
+
+const GOOGLE_TOKEN_URIS = new Set([
+  "https://oauth2.googleapis.com/token",
+  "https://accounts.google.com/o/oauth2/token",
+]);
+const CREDENTIAL_SOURCE_FIELDS = [
+  "credential_source",
+  "service_account_impersonation_url",
+  "source_credentials",
+  "executable",
+];
+
+// Only a plain service-account key is accepted. Other credential types (external_account,
+// impersonated_service_account) make Google's auth library read files or URLs named in the
+// JSON and send the result to the token endpoint the JSON names.
+function isServiceAccountKey(credentials: Record<string, unknown>): boolean {
+  if (!credentials || typeof credentials !== "object" || credentials.type !== "service_account")
+    return false;
+  const tokenUri = credentials.token_uri;
+  if (tokenUri !== undefined && !GOOGLE_TOKEN_URIS.has(String(tokenUri))) return false;
+  return !CREDENTIAL_SOURCE_FIELDS.some((field) => Object.hasOwn(credentials, field));
+}
+
+function vertexCredentials(raw: string): Record<string, unknown> | string {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return "HYPERFRAMES_VERTEX_SERVICE_ACCOUNT is not valid JSON; skipped vision captioning.";
+  }
+  return isServiceAccountKey(parsed)
+    ? parsed
+    : "HYPERFRAMES_VERTEX_SERVICE_ACCOUNT is not a service-account key; skipped vision captioning.";
+}
+
+type VertexAuthClient = NonNullable<
+  NonNullable<GoogleGenAIOptions["googleAuthOptions"]>["authClient"]
+>;
+
+// Visible ASCII only: a token is sent as a header value, so no whitespace or line breaks.
+const BEARER_TOKEN = /^[\x21-\x7e]+$/;
+
+// A caller that mints a short-lived token passes it instead of a key file. Google's auth library
+// asks a supplied client only for request headers, so the token is used as given and never refreshed.
+function vertexAccessTokenAuth(token: string): { authClient: VertexAuthClient } | string {
+  if (!BEARER_TOKEN.test(token)) {
+    return "HYPERFRAMES_VERTEX_ACCESS_TOKEN is not an access token; skipped vision captioning.";
+  }
+  const client = {
+    getRequestHeaders: async () => new Headers({ authorization: `Bearer ${token}` }),
+  };
+  return { authClient: client as unknown as VertexAuthClient };
+}
+
+// The SDK builds the request host from the location and the request path from the model id.
+// `:` stays legal inside a segment for endpoint paths in domain-scoped projects (`example.com:proj`).
+const VERTEX_LOCATION = /^[a-z][a-z0-9-]*$/;
+const GOOGLE_MODEL_ID = /^[A-Za-z0-9][\w.:@-]*(?:\/[A-Za-z0-9][\w.:@-]*)*$/;
+
+function googleClientSettingsProblem(
+  provider: "vertex" | "gemini",
+  model: string,
+  location: string,
+): string | undefined {
+  if (provider === "vertex" && !VERTEX_LOCATION.test(location)) {
+    return "HYPERFRAMES_VERTEX_LOCATION is not a Google Cloud region; skipped vision captioning.";
+  }
+  if (!GOOGLE_MODEL_ID.test(model)) {
+    const variable =
+      provider === "vertex" ? "HYPERFRAMES_VERTEX_MODEL" : "HYPERFRAMES_GEMINI_MODEL";
+    return `${variable} is not a model id; skipped vision captioning.`;
+  }
+  return undefined;
+}
+
+function resolveVisionRequestTimeoutMs(): number {
+  const configured = Number(process.env.HYPERFRAMES_VISION_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : DEFAULT_VISION_REQUEST_TIMEOUT_MS;
+}
+
+async function runBoundedVisionRequest<T>(
+  request: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new VisionRequestTimeoutError(timeoutMs));
+      controller.abort();
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([request(controller.signal), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 /**
  * Detect JS libraries via window globals, DOM fingerprints, script URLs,
@@ -165,27 +328,70 @@ export async function extractVisibleText(page: Page): Promise<string> {
  * Batches requests to stay under free-tier rate limits.
  * Returns a map of filename -> caption string.
  */
+// fallow-ignore-next-line complexity
 export async function captionImagesWithGemini(
   outputDir: string,
   progress: (stage: string, detail?: string) => void,
   warnings: string[],
+  options: VisionCaptionOptions = {},
 ): Promise<Record<string, string>> {
   const geminiCaptions: Record<string, string> = {};
+  let timedOutCount = 0;
+  let failedRequestCount = 0;
+  let budgetExhausted = false;
+  let internalError = false;
+  const reportOutcome = (): void => {
+    const outcome: VisionCaptionOutcome = {
+      timedOutRequests: timedOutCount,
+      failedRequests: failedRequestCount,
+      budgetExhausted,
+    };
+    if (internalError) outcome.internalError = true;
+    options.onOutcome?.(outcome);
+  };
+  if (options.skipVision) {
+    reportOutcome();
+    return geminiCaptions;
+  }
   const openRouterKey = process.env.OPENROUTER_API_KEY;
   const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
-  if (!openRouterKey && !geminiKey) return geminiCaptions;
+  // Vertex authenticates with a project plus a service account or a short-lived access token,
+  // instead of an API key. Server deployments have those; they often do not have a working
+  // Gemini API key, and a rejected key is indistinguishable from an unset one in the output —
+  // every request simply returns nothing and the capture reports "0 images captioned".
+  const vertexProject = process.env.HYPERFRAMES_VERTEX_PROJECT_ID;
+  const vertexAccessToken = process.env.HYPERFRAMES_VERTEX_ACCESS_TOKEN;
+  const vertexServiceAccount = process.env.HYPERFRAMES_VERTEX_SERVICE_ACCOUNT;
+  const useVertex = Boolean(vertexProject && (vertexAccessToken || vertexServiceAccount));
+  if (!openRouterKey && !useVertex && !geminiKey) {
+    reportOutcome();
+    return geminiCaptions;
+  }
 
-  // OpenRouter takes priority when both keys are set — it's the explicit opt-in
-  // for users without Google access. Both providers satisfy the same
-  // single-image → one-line-caption contract (`captionOne`), so the batching and
-  // SVG-rasterization loops below stay provider-agnostic.
-  const useOpenRouter = Boolean(openRouterKey);
-  const providerName = useOpenRouter ? "OpenRouter" : "Gemini";
-  // Default mirrors the Gemini path's tier (3.x flash-lite). Override per
-  // provider via HYPERFRAMES_OPENROUTER_MODEL / HYPERFRAMES_GEMINI_MODEL.
-  const model = useOpenRouter
-    ? process.env.HYPERFRAMES_OPENROUTER_MODEL || "google/gemini-3.1-flash-lite"
-    : process.env.HYPERFRAMES_GEMINI_MODEL || "gemini-3.1-flash-lite-preview";
+  // OpenRouter takes priority — it's the explicit opt-in for users without Google access.
+  // Vertex outranks the bare API key because it is the credential a deployment actually
+  // holds. All three satisfy the same single-image → one-line-caption contract
+  // (`captionOne`), so the batching and SVG-rasterization loops stay provider-agnostic.
+  const provider: "openrouter" | "vertex" | "gemini" = openRouterKey
+    ? "openrouter"
+    : useVertex
+      ? "vertex"
+      : "gemini";
+  const providerName = { openrouter: "OpenRouter", vertex: "Vertex AI", gemini: "Gemini" }[
+    provider
+  ];
+  // Override per provider via HYPERFRAMES_OPENROUTER_MODEL / HYPERFRAMES_VERTEX_MODEL /
+  // HYPERFRAMES_GEMINI_MODEL. Vertex publishes a different model set than the Gemini API —
+  // the API's flash-lite preview id is not resolvable there — so it carries its own default.
+  const model = {
+    openrouter: process.env.HYPERFRAMES_OPENROUTER_MODEL || "google/gemini-3.1-flash-lite",
+    vertex: process.env.HYPERFRAMES_VERTEX_MODEL || "gemini-2.5-flash",
+    gemini: process.env.HYPERFRAMES_GEMINI_MODEL || "gemini-3.1-flash-lite-preview",
+  }[provider];
+  const requestTimeoutMs = resolveVisionRequestTimeoutMs();
+  for (const name of visionCredential() ?? []) {
+    await noteProjectProviderKey(name, `images go to that key's ${providerName} account`);
+  }
 
   progress("design", `Captioning images with ${providerName} vision...`);
   try {
@@ -196,53 +402,124 @@ export async function captionImagesWithGemini(
       base64: string;
       prompt: string;
       maxTokens: number;
+      timeoutMs: number;
     }) => Promise<string>;
 
     let captionOne: CaptionOne;
-    if (openRouterKey) {
-      captionOne = async ({ mimeType, base64, prompt, maxTokens }) => {
-        const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${openRouterKey}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            model,
-            messages: [
-              {
-                role: "user",
-                content: [
-                  { type: "text", text: prompt },
-                  { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64}` } },
-                ],
-              },
-            ],
-            max_tokens: maxTokens,
-          }),
-        });
-        if (!res.ok) {
-          const detail = await res.text().catch(() => "");
-          throw new Error(`OpenRouter ${res.status} ${res.statusText}: ${detail.slice(0, 200)}`);
-        }
-        const data = (await res.json()) as {
-          choices?: Array<{ message?: { content?: string } }>;
-        };
-        return data.choices?.[0]?.message?.content?.trim() || "";
+    if (provider === "openrouter") {
+      captionOne = async ({ mimeType, base64, prompt, maxTokens, timeoutMs }) => {
+        return runBoundedVisionRequest(async (signal) => {
+          const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${openRouterKey}`,
+              "Content-Type": "application/json",
+            },
+            signal,
+            body: JSON.stringify({
+              model,
+              messages: [
+                {
+                  role: "user",
+                  content: [
+                    { type: "text", text: prompt },
+                    {
+                      type: "image_url",
+                      image_url: { url: `data:${mimeType};base64,${base64}` },
+                    },
+                  ],
+                },
+              ],
+              max_tokens: maxTokens,
+            }),
+          });
+          if (!res.ok) {
+            await res.text();
+            throw new Error(`OpenRouter request failed with HTTP ${res.status}`);
+          }
+          const data = (await res.json()) as {
+            choices?: Array<{ message?: { content?: string } }>;
+          };
+          return data.choices?.[0]?.message?.content?.trim() || "";
+        }, timeoutMs);
       };
     } else {
-      // Unreachable when geminiKey is unset (guarded above); re-narrow for TS.
-      if (!geminiKey) return geminiCaptions;
-      const { GoogleGenAI } = await import("@google/genai");
-      const ai = new GoogleGenAI({ apiKey: geminiKey });
-      captionOne = async ({ mimeType, base64, prompt, maxTokens }) => {
-        const response = await ai.models.generateContent({
-          model,
-          contents: [
-            { role: "user", parts: [{ inlineData: { mimeType, data: base64 } }, { text: prompt }] },
-          ],
-          config: { maxOutputTokens: maxTokens },
+      const vertexLocation = process.env.HYPERFRAMES_VERTEX_LOCATION || "us-central1";
+      const settingsProblem = googleClientSettingsProblem(provider, model, vertexLocation);
+      if (settingsProblem) {
+        warnings.push(settingsProblem);
+        internalError = true;
+        reportOutcome();
+        return geminiCaptions;
+      }
+      let GoogleGenAI: OptionalPackageModules["@google/genai"]["GoogleGenAI"];
+      try {
+        ({ GoogleGenAI } = await loadOptionalPackage("@google/genai", "vision captioning"));
+      } catch (err) {
+        warnings.push(`Skipped vision captioning: ${(err as Error).message}`);
+        internalError = true;
+        reportOutcome();
+        return geminiCaptions;
+      }
+      let ai: InstanceType<typeof GoogleGenAI>;
+      if (provider === "vertex") {
+        // Re-narrow for TS; `useVertex` already guaranteed a project and one credential.
+        if (!vertexProject) return geminiCaptions;
+        // The token wins when both are set: it is the narrower credential.
+        let googleAuthOptions: { authClient: VertexAuthClient } | { credentials: object };
+        if (vertexAccessToken) {
+          const auth = vertexAccessTokenAuth(vertexAccessToken);
+          if (typeof auth === "string") {
+            warnings.push(auth);
+            internalError = true;
+            reportOutcome();
+            return geminiCaptions;
+          }
+          googleAuthOptions = auth;
+        } else {
+          if (!vertexServiceAccount) return geminiCaptions;
+          const credentials = vertexCredentials(vertexServiceAccount);
+          if (typeof credentials === "string") {
+            warnings.push(credentials);
+            internalError = true;
+            reportOutcome();
+            return geminiCaptions;
+          }
+          googleAuthOptions = { credentials };
+        }
+        ai = new GoogleGenAI({
+          vertexai: true,
+          project: vertexProject,
+          location: vertexLocation,
+          googleAuthOptions,
         });
+      } else {
+        // Unreachable when geminiKey is unset (guarded above); re-narrow for TS.
+        if (!geminiKey) return geminiCaptions;
+        ai = new GoogleGenAI({ apiKey: geminiKey });
+      }
+      captionOne = async ({ mimeType, base64, prompt, maxTokens, timeoutMs }) => {
+        const response = await runBoundedVisionRequest(
+          (signal) =>
+            ai.models.generateContent({
+              model,
+              contents: [
+                {
+                  role: "user",
+                  parts: [{ inlineData: { mimeType, data: base64 } }, { text: prompt }],
+                },
+              ],
+              config: {
+                maxOutputTokens: maxTokens,
+                // Thinking tokens are drawn from maxOutputTokens, so the model can spend the
+                // whole budget and return a successful request with no caption text.
+                thinkingConfig: { thinkingBudget: 0 },
+                abortSignal: signal,
+                httpOptions: { timeout: timeoutMs },
+              },
+            }),
+          timeoutMs,
+        );
         return response.text?.trim() || "";
       };
     }
@@ -253,17 +530,48 @@ export async function captionImagesWithGemini(
 
     // Caption in parallel batches. Gemini free tier is ~5 RPM (slow but $0),
     // paid/OpenRouter ~2000 RPM. We batch 20 with a 2s inter-batch pause and rely
-    // on Promise.allSettled so a rate-limited image degrades to "" rather than
-    // failing the batch.
+    // on Promise.allSettled so one rate-limited image does not fail its siblings;
+    // rejected requests are aggregated into a sanitized warning below.
     const BATCH_SIZE = 20;
+    const collectCaptionResults = (
+      results: PromiseSettledResult<{ file: string; caption: string }>[],
+    ): { timeouts: number; failures: number } => {
+      let timeouts = 0;
+      let failures = 0;
+      for (const result of results) {
+        if (result.status === "fulfilled" && result.value.caption) {
+          geminiCaptions[result.value.file] = result.value.caption;
+        } else if (
+          result.status === "rejected" &&
+          result.reason instanceof VisionRequestTimeoutError
+        ) {
+          timeouts++;
+        } else if (result.status === "rejected") {
+          failures++;
+        }
+      }
+      return { timeouts, failures };
+    };
     for (let i = 0; i < imageFiles.length; i += BATCH_SIZE) {
+      const remainingMs = options.remainingMs?.() ?? Number.POSITIVE_INFINITY;
+      if (remainingMs <= 0) {
+        budgetExhausted = true;
+        break;
+      }
+      const timeoutMs = Math.max(1, Math.min(requestTimeoutMs, remainingMs));
       const batch = imageFiles.slice(i, i + BATCH_SIZE);
       const results = await Promise.allSettled(
         batch.map(async (file: string) => {
           const filePath = join(outputDir, "assets", file);
-          const stat = statSync(filePath);
-          if (stat.size > 4_000_000) return { file, caption: "" }; // skip images > 4 MB (provider inline limit)
-          const buffer = readFileSync(filePath);
+          const fd = openSync(filePath, "r", 0o600);
+          let buffer: Buffer;
+          try {
+            const stat = fstatSync(fd);
+            if (stat.size > 4_000_000) return { file, caption: "" }; // skip images > 4 MB (provider inline limit)
+            buffer = readFileSync(fd);
+          } finally {
+            closeSync(fd);
+          }
           const base64 = buffer.toString("base64");
           const ext = file.split(".").pop()?.toLowerCase() || "png";
           const mimeType = ext === "jpg" ? "image/jpeg" : `image/${ext}`;
@@ -273,15 +581,14 @@ export async function captionImagesWithGemini(
             prompt:
               "Describe this website image in ONE short sentence for a video storyboard. Focus on: what it shows, dominant colors, whether background is light or dark. Be factual, not creative.",
             maxTokens: 500,
+            timeoutMs,
           });
           return { file, caption };
         }),
       );
-      for (const result of results) {
-        if (result.status === "fulfilled" && result.value.caption) {
-          geminiCaptions[result.value.file] = result.value.caption;
-        }
-      }
+      const counts = collectCaptionResults(results);
+      timedOutCount += counts.timeouts;
+      failedRequestCount += counts.failures;
       // Pace requests between batches (paid tier: 2000+ RPM, free tier: rate-limited)
       if (i + BATCH_SIZE < imageFiles.length) {
         await new Promise((r) => setTimeout(r, 2000)); // 2s pause between batches — paid tier handles 2000 RPM, free tier retries via Promise.allSettled
@@ -316,24 +623,47 @@ export async function captionImagesWithGemini(
       // than crashing the whole capture command on import.
       let sharp: typeof sharpType;
       try {
-        sharp = (await import("sharp")).default as typeof sharpType;
+        sharp = await loadSharp("SVG captions");
       } catch (err) {
         warnings.push(
           `Skipped ${svgFiles.length} SVG caption(s): sharp could not load (${(err as Error).message}). ` +
             `Reinstall with optional dependencies enabled (e.g. \`npm i sharp\`) to caption SVG assets.`,
         );
+        reportOutcome();
         return geminiCaptions;
       }
+      // libvips' worker pool sizes itself to the host's core count, and several concurrent SVG
+      // renders then multiply that — the combination corrupted the heap in production (see the
+      // serialized rasterize loop below). `sharp.concurrency` is process-global and outlives this
+      // function, so remember the host's value and bound the pool only around the renders that
+      // need it: captioning must not leave every later sharp caller in this process — none of
+      // which asked for captioning — pinned to a single thread for the rest of its life.
+      const hostConcurrency = sharp.concurrency();
       progress("design", `Rasterizing + captioning ${svgFiles.length} SVGs via vision API...`);
       const SVG_BATCH = 20;
       const SVG_RENDER_SIZE = 256; // px — enough resolution for Gemini to read wordmarks, small enough to keep payload sub-MB
       let svgsSkipped = 0;
       for (let i = 0; i < svgFiles.length; i += SVG_BATCH) {
+        const remainingMs = options.remainingMs?.() ?? Number.POSITIVE_INFINITY;
+        if (remainingMs <= 0) {
+          budgetExhausted = true;
+          break;
+        }
+        const timeoutMs = Math.max(1, Math.min(requestTimeoutMs, remainingMs));
         const batch = svgFiles.slice(i, i + SVG_BATCH);
-        const results = await Promise.allSettled(
-          batch.map(async ({ relPath }) => {
+        // Rasterize the batch one file at a time, then caption it in parallel.
+        //
+        // Rasterizing the whole batch concurrently drove up to SVG_BATCH simultaneous librsvg
+        // renders through libvips, and that corrupts the heap: production captures aborted
+        // with `free(): unaligned chunk detected in tcache 2` (SIGABRT) during this phase and
+        // lost the entire capture. A native abort cannot be caught by the try/catch below, so
+        // the concurrency has to go rather than be handled. Rasterizing is local and cheap;
+        // the vision request is the slow leg and stays parallel, so throughput barely moves.
+        const rasterized: { relPath: string; pngBase64: string | null }[] = [];
+        sharp.concurrency(1);
+        try {
+          for (const { relPath } of batch) {
             const filePath = join(assetsDir, relPath);
-            let pngBase64: string;
             try {
               // Flatten against a contrasting background — white-on-white SVGs render invisible to Vision.
               const svgSource = readFileSync(filePath, "utf-8");
@@ -358,12 +688,21 @@ export async function captionImagesWithGemini(
                 .flatten({ background: bg })
                 .png()
                 .toBuffer();
-              pngBase64 = pngBuffer.toString("base64");
+              rasterized.push({ relPath, pngBase64: pngBuffer.toString("base64") });
             } catch {
               // exotic SVG features may break sharp; skip caption rather than block
               svgsSkipped++;
-              return { file: relPath, caption: "" };
+              rasterized.push({ relPath, pngBase64: null });
             }
+          }
+        } finally {
+          // Hand the pool back even if a rasterize threw: the vision requests below are network
+          // work that gains nothing from a pinned pool, and the process outlives this capture.
+          sharp.concurrency(hostConcurrency);
+        }
+        const results = await Promise.allSettled(
+          rasterized.map(async ({ relPath, pngBase64 }) => {
+            if (pngBase64 === null) return { file: relPath, caption: "" };
             const caption = await captionOne({
               mimeType: "image/png",
               base64: pngBase64,
@@ -373,15 +712,14 @@ export async function captionImagesWithGemini(
                 "If you see a wordmark, READ THE LETTERS LITERALLY — do not guess a brand from context. " +
                 "Be factual.",
               maxTokens: 300,
+              timeoutMs,
             });
             return { file: relPath, caption };
           }),
         );
-        for (const result of results) {
-          if (result.status === "fulfilled" && result.value.caption) {
-            geminiCaptions[result.value.file] = result.value.caption;
-          }
-        }
+        const counts = collectCaptionResults(results);
+        timedOutCount += counts.timeouts;
+        failedRequestCount += counts.failures;
         if (i + SVG_BATCH < svgFiles.length) {
           await new Promise((r) => setTimeout(r, 2000));
         }
@@ -398,10 +736,22 @@ export async function captionImagesWithGemini(
         );
       }
     }
-  } catch (err) {
-    warnings.push(`${providerName} captioning failed: ${err}`);
+    if (timedOutCount > 0) {
+      warnings.push(
+        `${providerName} vision timed out for ${timedOutCount} asset(s); captions omitted.`,
+      );
+    }
+    if (failedRequestCount > 0) {
+      warnings.push(
+        `${providerName} vision failed for ${failedRequestCount} asset(s); captions omitted.`,
+      );
+    }
+  } catch {
+    internalError = true;
+    warnings.push(`${providerName} captioning failed internally; captions omitted.`);
   }
 
+  reportOutcome();
   return geminiCaptions;
 }
 

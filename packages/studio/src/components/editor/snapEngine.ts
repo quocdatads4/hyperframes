@@ -3,6 +3,24 @@
 // All position values are in overlay-space (screen) pixels.
 
 export const SNAP_THRESHOLD_PX = 6;
+/**
+ * Pointer travel a MOVE must reach before snapping is allowed to touch it.
+ *
+ * An element resting within the threshold of a guide is already "snappable", so
+ * a snap computed on the very first frame displaces it by up to the threshold
+ * while the pointer has moved nothing — pick a selection up and the whole thing
+ * teleports before you have dragged at all. Snapping is meant to pull toward a
+ * guide as the user drags, so it does not participate until the drag is real.
+ * The value matches the distance a drag must cover to count as a drag rather
+ * than a click, so nothing below it moves anything.
+ */
+const SNAP_ENGAGE_TRAVEL_PX = 4;
+
+/** Whether a move of this size has travelled far enough for snapping to apply. */
+export function snapEngagedForTravel(dx: number, dy: number): boolean {
+  return Math.hypot(dx, dy) >= SNAP_ENGAGE_TRAVEL_PX;
+}
+
 const EQUIDISTANCE_TOLERANCE_PX = 1;
 
 // ---------------------------------------------------------------------------
@@ -359,8 +377,11 @@ export function resolveSnapAdjustment(input: {
   gridEdges?: { x: SnapEdge[]; y: SnapEdge[] };
   threshold: number;
   disabled: boolean;
+  /** Set when the gesture has not travelled far enough for snapping yet. */
+  disabledForTravel?: boolean;
+  lockedAxis?: "x" | "y";
 }): SnapResult {
-  if (input.disabled || input.threshold <= 0) {
+  if (input.disabled || input.disabledForTravel || input.threshold <= 0) {
     return DISABLED_RESULT(input.proposedDx, input.proposedDy);
   }
 
@@ -387,8 +408,8 @@ export function resolveSnapAdjustment(input: {
     input.threshold,
   );
 
-  const bestX = pickBest(xCandidates);
-  const bestY = pickBest(yCandidates);
+  const bestX = input.lockedAxis === "x" ? null : pickBest(xCandidates);
+  const bestY = input.lockedAxis === "y" ? null : pickBest(yCandidates);
   const adjustedDx = input.proposedDx + (bestX?.adjustment ?? 0);
   const adjustedDy = input.proposedDy + (bestY?.adjustment ?? 0);
 

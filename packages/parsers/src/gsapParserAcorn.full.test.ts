@@ -84,6 +84,24 @@ const REAL_WORLD_SCRIPT = `(function () {
 // ── parseGsapScript ───────────────────────────────────────────────────────────
 
 describe("parseGsapScript", () => {
+  it("excludes per-step `duration` from %-keyed keyframe properties (segment timing is not a lane)", () => {
+    // A %-keyed object keyframe carrying a stray per-step `duration` — the shape
+    // a buggy array->object conversion produces. `duration` is GSAP segment
+    // timing, not an animatable property; it must not surface as a keyframe lane
+    // or round-trip as a property (which corrupts the tween on the next edit).
+    const script = `
+      const tl = gsap.timeline({ paused: true });
+      tl.to("#card", { keyframes: { "0%": { x: 0, duration: 0 }, "50%": { x: 100, duration: 6, ease: "power2.out" }, "100%": { x: 200, duration: 6 } } }, 0);
+    `;
+    const anim = parseGsapScript(script).animations[0]!;
+    const kfs = expectKeyframesFormat(anim, "percentage", 3);
+    for (const kf of kfs) {
+      expect(kf.properties).not.toHaveProperty("duration"); // the fix
+      expect(kf.properties).toHaveProperty("x"); // real animatable prop preserved
+    }
+    expect(kfs[1]!.ease).toBe("power2.out"); // per-keyframe ease still parsed
+  });
+
   it("parses a basic timeline with .to()", () => {
     const script = `
       const tl = gsap.timeline({ paused: true });
@@ -339,6 +357,28 @@ describe("parseGsapScript", () => {
 });
 
 // ── resolvedStart ─────────────────────────────────────────────────────────────
+
+describe("timeline defaults", () => {
+  it("never gives a keyframed tween the timeline's default ease, as GSAP does not", () => {
+    const script = `
+      const tl = gsap.timeline({ defaults: { ease: "power2.out" } });
+      tl.to("#a", { keyframes: { "0%": { x: 0 }, "100%": { x: 100 } }, duration: 2 });
+      tl.to("#b", { x: 100, duration: 2 });
+    `;
+    const [keyed, flat] = parseGsapScriptAcorn(script).animations;
+    expect(keyed!.ease).toBeUndefined();
+    expect(flat!.ease).toBe("power2.out");
+  });
+
+  it("keeps a keyframes ease the file names by variable, so a rewrite can write it back", () => {
+    const script = `
+      const tl = gsap.timeline();
+      tl.to("#a", { keyframes: { "0%": { x: 0 }, "100%": { x: 100 }, ease: E, easeEach: F }, duration: 2 });
+    `;
+    const [anim] = parseGsapScriptAcorn(script).animations;
+    expect(anim!.keyframes).toMatchObject({ ease: "__raw:E", easeEach: "__raw:F" });
+  });
+});
 
 describe("resolvedStart — timeline position resolution", () => {
   it("resolves chained from() tweens with relative positions (sdk-test pattern)", () => {
@@ -864,9 +904,21 @@ describe("native GSAP keyframes parsing", () => {
     const anim = parseSingleAnimation(script);
     const kfs = expectKeyframesFormat(anim, "object-array", 3);
 
-    expectKeyframe(kfs[0], 22, { x: 0, opacity: 1 });
-    expectKeyframe(kfs[1], 65, { x: 100 }, "power2.out");
+    expectKeyframe(kfs[0], 21.7, { x: 0, opacity: 1 });
+    expectKeyframe(kfs[1], 65.2, { x: 100 }, "power2.out");
     expectKeyframe(kfs[2], 100, { x: 200 });
+  });
+
+  it("leaves array keyframes it can read only in part to the runtime", () => {
+    for (const step of ["mid", "{ ...mid, y: 20 }", "{ x: 120, runBackwards: true }"]) {
+      const anim = parseSingleAnimation(`
+        const mid = { x: 120 };
+        const tl = gsap.timeline({ paused: true });
+        tl.to("#hero", { keyframes: [{ x: 60 }, ${step}, { x: 180 }], duration: 3 }, 0);
+      `);
+      expect(anim.keyframes).toBeUndefined();
+      expect(anim.hasUnresolvedKeyframes).toBe(true);
+    }
   });
 
   it("parses simple array keyframes format", () => {
@@ -893,9 +945,8 @@ describe("native GSAP keyframes parsing", () => {
     const script = `
       const tl = gsap.timeline({ paused: true });
       tl.to("#hero", {
-        keyframes: { "0%": { x: 0 }, "50%": { x: 100, ease: "back.out(1.7)" }, "100%": { x: 200 } },
+        keyframes: { "0%": { x: 0 }, "50%": { x: 100, ease: "back.out(1.7)" }, "100%": { x: 200 }, easeEach: "power2.out" },
         ease: "none",
-        easeEach: "power2.out",
         duration: 5
       }, 0);
     `;

@@ -1,12 +1,25 @@
-import { failCommand, requestCliExit } from "../utils/commandResult.js";
-import { defineCommand } from "citty";
+import type { ReferenceBackgroundResult } from "@hyperframes/producer";
+import { captureArtifactRevision } from "../utils/artifactCapture.js";
+import { recordRenderSuccess, registerRenderOutput } from "@hyperframes/studio-server/history";
+import { resolveGsapVendorDir } from "../server/gsapVendor.js";
+import { failCommand, requestCliExit, scheduleCliExit } from "../utils/commandResult.js";
+import { defineCommand } from "../utils/defineCommand.js";
 import type { Example } from "./_examples.js";
-import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, rmSync } from "node:fs";
-import { createRenderPlan, resolveBrowserGpuForCli, type RenderFormat } from "./render/plan.js";
+import { mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync, rmSync } from "node:fs";
+import {
+  createRenderPlan,
+  resolveBrowserGpuForCli,
+  type RenderFormat,
+  type RenderRange,
+} from "./render/plan.js";
+import { seedProjectAuthoringSkill } from "../utils/projectConfig.js";
+import { deliveryFlagArgs } from "../utils/deliveryFlags.js";
+import type { CatalogUsage } from "../utils/catalogUsage.js";
 import { presentRenderPlan } from "./render/present.js";
-import { executeRenderPlan, renderLintContinuationHint } from "./render/execute.js";
+import { acquireRenderSlot } from "./render/renderSlot.js";
+import { executeRenderPlan, renderLintContinuationHint, runRenderLint } from "./render/execute.js";
 // Test-only seams retained at the command boundary for render behavior tests.
-export { resolveBrowserGpuForCli, renderLintContinuationHint };
+export { resolveBrowserGpuForCli, renderLintContinuationHint, runRenderLint };
 
 export const examples: Example[] = [
   ["Render to MP4", "hyperframes render --output output.mp4"],
@@ -25,10 +38,18 @@ export const examples: Example[] = [
     "Render PNG sequence (RGBA frames for AE/Nuke/Fusion)",
     "hyperframes render --format png-sequence --output frames/",
   ],
+  [
+    "Render HLS VOD (master playlist + MPEG-TS segments in a directory)",
+    "hyperframes render --format hls --output stream/",
+  ],
   ["High quality at 60fps", "hyperframes render --fps 60 --quality high --output hd.mp4"],
   ["Deterministic render via Docker", "hyperframes render --docker --output deterministic.mp4"],
   ["Parallel rendering with 6 workers", "hyperframes render --workers 6 --output fast.mp4"],
   ["Opt out of browser GPU render", "hyperframes render --no-browser-gpu --output cpu.mp4"],
+  [
+    "Show full lint findings instead of the summary line",
+    "hyperframes render --lint-verbose --output out.mp4",
+  ],
   [
     "Relocate frame cache off C: (Windows) or another small partition",
     "hyperframes render --frames-cache-dir D:/hf-cache --output out.mp4",
@@ -51,45 +72,101 @@ import { freemem, tmpdir } from "node:os";
 import { resolve, dirname, join, basename } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { loadProducer } from "../utils/producer.js";
+import { outsideAssetsAllowed } from "../utils/receivedRender.js";
 import { c } from "../ui/colors.js";
-import { formatBytes, formatRenderSummaryDetail, errorBox } from "../ui/format.js";
+import { desktopHint } from "../utils/desktopApp.js";
+import {
+  formatBytes,
+  formatRenderSummaryDetail,
+  formatRenderPipelineDetail,
+  formatScreenshotFallbackHint,
+  resolvePrintedCaptureMode,
+  errorBox,
+} from "../ui/format.js";
 import { warnIfWebmAlphaDropped } from "../utils/webmAlphaCheck.js";
-import { renderProgress } from "../ui/progress.js";
+import { renderFailureDiagnostic } from "../ui/renderDiagnostic.js";
+import { sourceFailureHint } from "./render/sourceFailureHint.js";
+import { missingPathKind } from "../telemetry/missingPathKind.js";
+import { renderProgress, renderMachineProgress } from "../ui/progress.js";
 import {
   trackRenderComplete,
   trackRenderError,
   trackRenderObservation,
+  type RenderOutputShapeTelemetryPayload,
+  type RenderEnvironmentTelemetryPayload,
 } from "../telemetry/events.js";
 import { maybePromptRenderFeedback } from "../telemetry/feedback.js";
+import { renderMotionBlurTelemetryPayload } from "../telemetry/renderMotionBlur.js";
 import {
   readConfigFresh,
+  releaseDeParallelRouterLatch,
+  type DeRouterBreaker,
+  type DeRouterRevert,
   recordRecentRender,
   writeConfig,
+  writeConfigWithResult,
   type HyperframesConfig,
 } from "../telemetry/config.js";
-import { shouldTrack } from "../telemetry/client.js";
 import { renderJobObservabilityTelemetryPayload } from "../telemetry/renderObservability.js";
+import {
+  startRenderCpuSampler,
+  type RenderCpuSampler,
+  type RenderCpuTelemetryPayload,
+} from "../telemetry/renderCpu.js";
 import { bytesToMb } from "../telemetry/system.js";
 import { VERSION } from "../version.js";
+import {
+  afterCleanRender,
+  afterRevert,
+  forVersion,
+  isRouterOff,
+} from "./render/deRouterBreaker.js";
 import { isDevMode } from "../utils/env.js";
-import { buildDockerRunArgs, resolveDockerPlatform } from "../utils/dockerRunArgs.js";
+import {
+  buildDockerRunArgs,
+  resolveDockerPlatform,
+  type DockerRenderOptions,
+} from "../utils/dockerRunArgs.js";
+import { createStderrTail, DockerRenderExitError } from "../utils/dockerStderrTail.js";
+import type { BrowserInstallFacts } from "../browser/installFacts.js";
 import { normalizeErrorMessage } from "../utils/errorMessage.js";
+import {
+  DOCKER_BUILD_TIMEOUT_MINUTES,
+  describeDockerBuildFailure,
+} from "../utils/dockerBuildFailure.js";
 import { runEnvironmentChecks } from "../browser/preflight.js";
-import { detectH264EncoderMode } from "../browser/ffmpeg.js";
+import {
+  detectH264EncoderModeForRender,
+  FFMPEG_PATH_ENV,
+  getFFmpegInstallHint,
+  H264EncoderUnavailableError,
+  type H264EncoderMode,
+} from "../browser/ffmpeg.js";
 import { chromeLaunchRemediation } from "../browser/linuxDeps.js";
 import { macosOldChromeCrashRemediation } from "../browser/macosOldChromeCrash.js";
-import { killOrphanedProcesses } from "../utils/orphanCleanup.js";
+import { windowsChromeCrashRemediation } from "../browser/windowsCrash.js";
+import { killOrphanedProcessesForRender } from "../utils/orphanCleanup.js";
+import { createRenderCancellationScope } from "../utils/renderCancellation.js";
+import { audioLoweredWarning } from "../utils/audioLoweredWarning.js";
 import {
   markRenderSucceeded,
   runPostRenderStep,
   runPostRenderStepAsync,
 } from "../utils/render-success-state.js";
-import type { ProducerLogger, RenderJob } from "@hyperframes/producer";
-import { EXTRACT_CACHE_DIR_DISABLED_ALIASES, type VideoFrameFormat } from "@hyperframes/engine";
+import type { ProducerLogger, RenderJob, RenderPerfSummary } from "@hyperframes/producer";
+import { recordFailure } from "../utils/jsonError.js";
+import {
+  EXTRACT_CACHE_DIR_DISABLED_ALIASES,
+  sandboxDeniedRemediation,
+  type PageMotionBlurSummary,
+  type ProresProfile,
+  type VideoFrameFormat,
+} from "@hyperframes/engine";
 import {
   checkOutputResolutionCompatibility,
   suggestMatchingPreset,
   fpsToNumber,
+  terminalText,
   type CanvasResolution,
   type OutputResolutionIssueKind,
   type Fps,
@@ -98,7 +175,7 @@ import {
 export default defineCommand({
   meta: {
     name: "render",
-    description: "Render a composition to MP4, WebM, MOV, GIF, or a PNG sequence",
+    description: "Render a composition to MP4, WebM, MOV, GIF, HLS, or a PNG sequence",
   },
   args: {
     dir: {
@@ -117,7 +194,7 @@ export default defineCommand({
     output: {
       type: "string",
       alias: "o",
-      description: "Output path (default: renders/<name>.mp4)",
+      description: "Output path (default: renders/<project>_<YYYY-MM-DD>_<HH-MM-SS>.<ext>)",
     },
     fps: {
       type: "string",
@@ -135,34 +212,48 @@ export default defineCommand({
     quality: {
       type: "string",
       alias: "q",
-      description: "Quality: draft, standard, high",
-      default: "standard",
+      description:
+        "Quality: draft, looks, delivery, or standard/high. looks is the default (CRF 16). delivery is high. MOV uses ProRes 4444 with alpha unless --prores-profile picks a 422 profile.",
+      default: "looks",
     },
     skill: {
       type: "string",
       description:
-        "Authoring workflow skill that initiated this render (e.g. product-launch-video). " +
-        "Recorded on anonymous render telemetry for per-skill usage breakdowns; ignored unless it is a slug.",
+        "Authoring skill that initiated this render (e.g. hyperframes). " +
+        "Recorded on render telemetry for per-skill usage breakdowns; ignored unless it is a slug.",
     },
     format: {
       type: "string",
       description:
-        "Output format: mp4, webm, mov, gif, png-sequence " +
+        "Output format: mp4, webm, mov, gif, png-sequence, hls " +
         "(MOV/WebM render with transparency; png-sequence writes RGBA frames " +
-        "to a directory for AE/Nuke/Fusion ingest; gif is best at 15fps for PRs/docs)",
+        "to a directory for AE/Nuke/Fusion ingest; gif is best at 15fps for PRs/docs; " +
+        "hls writes a VOD playlist directory — H.264/AAC, SDR only, no GPU encoding)",
       default: "mp4",
     },
     "gif-loop": {
       type: "string",
       description: "GIF loop count, 0 = infinite. Range: 0-65535. Only used with --format gif.",
     },
+    "hls-segment-seconds": {
+      type: "string",
+      description:
+        "HLS target segment length in whole seconds (default: 4). Range: 1-60. " +
+        "Also fixes the encoder GOP at segment x fps frames so every segment " +
+        "starts on a keyframe. Only used with --format hls.",
+    },
     "video-frame-format": {
       type: "string",
       description:
-        "Source video frame extraction format: auto, jpg, png (default: auto). " +
+        "Source video frame extraction format: auto, jpg, png. " +
         "Use png for UI recordings, screen captures, and color-sensitive source videos; " +
         "alpha-capable sources always extract as PNG.",
       default: "auto",
+    },
+    "page-motion-blur": {
+      type: "string",
+      description:
+        "Set off to disable authored page motion blur. Omit to keep the composition's setting.",
     },
     workers: {
       type: "string",
@@ -188,16 +279,37 @@ export default defineCommand({
     },
     crf: {
       type: "string",
-      description: "Override encoder CRF. Mutually exclusive with --video-bitrate.",
+      description:
+        "Override MP4/WebM encoder CRF. Mutually exclusive with --video-bitrate; unsupported for MOV.",
+    },
+    start: {
+      type: "string",
+      description:
+        "Render from this second of the film (MP4). The clip starts at 0 and carries the audio of the span.",
+    },
+    end: {
+      type: "string",
+      description:
+        "Render up to this second of the film (default: the end). Needs MP4, a whole frame rate of 24, 25, 30 or 60, and SDR.",
     },
     "video-bitrate": {
       type: "string",
-      description: "Target video bitrate such as 10M. Mutually exclusive with --crf.",
+      description:
+        "Target MP4/WebM video bitrate such as 10M. Mutually exclusive with --crf; unsupported for MOV.",
     },
+    ...deliveryFlagArgs,
     "vp9-cpu-used": {
       type: "string",
       description:
         "libvpx-vp9 -cpu-used value for WebM encodes (-8 to 8). Higher is faster with a larger quality/size tradeoff. Env: PRODUCER_VP9_CPU_USED.",
+    },
+    "chroma-subsampling": {
+      type: "string",
+      description:
+        "MP4 chroma: 420 (default) or 444. 444 keeps full-resolution colour for thin coloured " +
+        "text and UI (yuv444p, lossless PNG capture, slower). Software encoder and SDR MP4 only; " +
+        "many players cannot decode 4:4:4.",
+      default: "420",
     },
     gpu: { type: "boolean", description: "Use GPU encoding", default: false },
     "browser-gpu": {
@@ -208,6 +320,11 @@ export default defineCommand({
     quiet: {
       type: "boolean",
       description: "Suppress verbose output",
+      default: false,
+    },
+    "lint-verbose": {
+      type: "boolean",
+      description: "Show full lint findings instead of the summary line",
       default: false,
     },
     debug: {
@@ -222,10 +339,34 @@ export default defineCommand({
         "Allow output with structured capture-readiness warnings (default). Use --no-best-effort to fail on missing or unready media.",
       default: true,
     },
+    wait: {
+      type: "boolean",
+      description:
+        "Wait while another render of this user account runs, then start (default): renders side by " +
+        "side starve each other. Use --no-wait to fail at once instead. Env: HYPERFRAMES_RENDER_LOCK=off " +
+        "lets renders run side by side; HYPERFRAMES_RENDER_LOCK_DIR set to one folder in every account " +
+        "shares the slot across user accounts.",
+      default: true,
+    },
     strict: {
       type: "boolean",
       description: "Fail render on lint errors",
       default: false,
+    },
+    "include-outside-files": {
+      type: "boolean",
+      description:
+        "Also run .js and .mjs scripts the project references from outside its folder. Without it they are left out " +
+        "with a warning; images, video, audio, fonts and CSS outside the folder are always included.",
+      default: false,
+    },
+    "refuse-outside-files": {
+      type: "boolean",
+      description:
+        "Leave out every file the project references from outside its folder. A --docker render passes it " +
+        "into the container when the received-files rule refuses those files on the host.",
+      default: false,
+      hidden: true,
     },
     "strict-all": {
       type: "boolean",
@@ -239,7 +380,7 @@ export default defineCommand({
     variables: {
       type: "string",
       description:
-        'JSON object of variable values, merged over the composition\'s data-composition-variables defaults. Example: --variables \'{"title":"Hello"}\'. Read inside the composition via window.__hyperframes.getVariables().',
+        'JSON object of variable values, merged over the composition\'s data-composition-variables defaults. Example: --variables \'{"title":"Hello"}\'. Also a JSON file path, or - for stdin. Read inside the composition via window.__hyperframes.getVariables().',
     },
     "variables-file": {
       type: "string",
@@ -269,21 +410,24 @@ export default defineCommand({
     },
     json: {
       type: "boolean",
-      description: "With --batch, emit exactly one final JSON result document.",
+      description:
+        "With --batch, emit exactly one final JSON result document. Without --batch, print no progress, and on failure print the JSON error envelope.",
       default: false,
     },
     resolution: {
       type: "string",
       description:
-        "Output resolution preset: landscape (1920x1080), portrait (1080x1920), landscape-4k (3840x2160), portrait-4k (2160x3840), square (1080x1080), square-4k (2160x2160). Aliases: 1080p, 4k, uhd, 1080p-square, square-1080p, 4k-square. The composition is unchanged — Chrome renders at higher DPR (deviceScaleFactor) so the captured screenshot lands at the requested dimensions. Aspect ratio must match the composition; the scale must be an integer multiple. Not yet supported with --hdr.",
+        "Output resolution preset: landscape (1920x1080), portrait (1080x1920), landscape-4k (3840x2160), portrait-4k (2160x3840), square (1080x1080), square-4k (2160x2160), landscape-1440p (2560x1440), portrait-1440p (1440x2560), square-1440p (1440x1440). Aliases: 1080p, 4k, uhd, 1440p, qhd, 1080p-square, square-1080p, 4k-square, 1440p-portrait, 1440p-square. The composition is unchanged — Chrome renders at higher DPR (deviceScaleFactor) so the captured screenshot lands at the requested dimensions. Aspect ratio must match the composition; upscaling requires an integer multiple. Not yet supported with --hdr.",
     },
     "page-side-compositing": {
       type: "boolean",
       description:
         "Run shader transitions on a page-side WebGL canvas inside Chrome " +
         "instead of the Node-side layered blend. ~6× faster for SDR " +
-        "shader-transition renders. HDR/alpha/video content auto-disables. " +
-        "Use --no-page-side-compositing to force the layered path.",
+        "shader-transition renders. Used for mp4, hls and gif output without " +
+        "HDR content; for mp4 and hls it usually turns off under --experimental-fast-capture. " +
+        "webm and mov output take the layered path. --no-page-side-compositing forces " +
+        "the layered path for mp4 and hls; gif always uses the page-side canvas.",
       default: true,
     },
     "browser-timeout": {
@@ -312,6 +456,22 @@ export default defineCommand({
         "Timeout in ms for the composition player to become ready. " +
         "Increase for complex compositions on slow hardware. Default: 45000 (45 s). " +
         "Env: PRODUCER_PLAYER_READY_TIMEOUT_MS.",
+    },
+    resume: {
+      type: "boolean",
+      description:
+        "Segmented capture only (HF_SEGMENTED_CAPTURE=true): reuse segments a " +
+        "previous run of the same composition and settings already finished, " +
+        "recorded in the local HyperFrames cache. Each reused " +
+        "segment is re-validated before it is skipped.",
+      default: false,
+    },
+    "keep-segments": {
+      type: "boolean",
+      description:
+        "Segmented capture only: keep locally cached segments after a " +
+        "successful render instead of deleting it.",
+      default: false,
     },
     "low-memory-mode": {
       type: "boolean",
@@ -351,16 +511,39 @@ export default defineCommand({
   // Keep the transport adapter thin: each phase has one ownership boundary.
   async run({ args }) {
     const plan = createRenderPlan(args);
-    await presentRenderPlan(plan);
-    await executeRenderPlan(plan, {
-      renderDocker,
-      renderLocal,
-      checkResolution: checkRenderResolutionPreflight,
-    });
+    const cancellation = plan.useDocker ? undefined : createRenderCancellationScope();
+    try {
+      // Teach the project its owning skill from an explicit --skill so every
+      // later flag-less render (re-render, `npm run render`, batch) inherits it.
+      seedProjectAuthoringSkill(plan.project.dir, args.skill);
+      await presentRenderPlan(plan);
+      await executeRenderPlan(
+        plan,
+        {
+          renderDocker,
+          renderLocal,
+          checkResolution: checkRenderResolutionPreflight,
+          acquireRenderSlot,
+        },
+        cancellation,
+      );
+    } catch (error) {
+      if (cancellation?.signal.aborted) {
+        const reason = cancellation.signal.reason;
+        const message = reason instanceof Error ? reason.message : String(reason);
+        process.stderr.write(`Render cancelled: ${message}\n`);
+        recordFailure(`Render cancelled: ${message}`);
+        requestCliExit(1);
+      }
+      throw error;
+    } finally {
+      cancellation?.dispose();
+    }
   },
 });
 
-export interface SingleRenderResult {
+export interface SingleRenderResult extends Partial<ReferenceBackgroundResult> {
+  motionBlur?: PageMotionBlurSummary;
   durationMs?: number;
   renderTimeMs: number;
   outcome?: "completed" | "completed_with_warnings";
@@ -372,8 +555,28 @@ export interface RenderOptions {
   quality: "draft" | "standard" | "high";
   /** Authoring workflow skill that drove this render (telemetry attribution). */
   authoringSkill?: string;
+  /** Which step resolved authoringSkill: an explicit --skill flag, or the project's own config. */
+  authoringSkillSource?: "flag" | "project-config";
+  /** Raw --skill value when it failed normalizeSkillSlug (an unrecognized skill name was passed). */
+  authoringSkillInvalid?: string;
+  /** Names of HF_-/HYPERFRAMES_-prefixed env vars present at plan time (never values), capped at 20. */
+  hfEnvOverrides?: readonly string[];
+  /**
+   * Catalog items installed in this project and those the rendered composition
+   * reaches. Resolved once in the render plan; absent on programmatic callers
+   * that build options by hand, which simply omit the catalog properties.
+   */
+  catalogUsage?: CatalogUsage;
   format: RenderFormat;
   gifLoop?: number;
+  /** True when `createRenderPlan` clamped a requested `--fps` above 30 to 30 for `--format gif`. */
+  gifFpsCapped?: boolean;
+  /** Major FFmpeg/Chrome version from local preflight (telemetry only); absent on Docker renders. */
+  ffmpegVersionMajor?: number;
+  browserVersionMajor?: number;
+  browserInstall?: BrowserInstallFacts;
+  /** HLS target segment length in seconds; ignored unless `format` is `"hls"`. */
+  hlsSegmentSeconds?: number;
   workers?: number;
   gpu: boolean;
   /**
@@ -386,14 +589,34 @@ export interface RenderOptions {
   crf?: number;
   vp9CpuUsed?: number;
   videoBitrate?: string;
+  keyframeIntervalSeconds?: number;
+  range?: RenderRange;
+  proresProfile?: ProresProfile;
+  maxBitrate?: string;
+  bufferSize?: string;
   videoFrameFormat?: VideoFrameFormat;
+  /** "444" opts an SDR MP4 render into full-resolution chroma. Absent means 4:2:0. */
+  chromaSubsampling?: "420" | "444";
+  pageMotionBlur?: "off";
   quiet: boolean;
   debug?: boolean;
+  /** Segmented capture: reuse a prior run's validated segments. */
+  resumeSegments?: boolean;
+  /** Segmented capture: keep the segment directory after success. */
+  keepSegments?: boolean;
   bestEffort?: boolean;
+  /** --include-outside-files: run scripts the project references from outside its folder. */
+  includeOutsideScripts?: boolean;
+  /**
+   * True brings in no file from outside the project folder (--refuse-outside-files). False means
+   * the caller already applied the received-files rule and it allows them. Absent, the render applies it.
+   */
+  refuseOutsideFiles?: boolean;
   browserPath?: string;
   variables?: Record<string, unknown>;
   entryFile?: string;
   exitAfterComplete?: boolean;
+  embedded?: boolean;
   /** Output resolution preset; see `resolveDeviceScaleFactor` for constraints. */
   outputResolution?: CanvasResolution;
   /** Whether the resolution names a tier without fixing an orientation. */
@@ -418,22 +641,29 @@ export interface RenderOptions {
   throwOnError?: boolean;
   /** Skip the interactive feedback prompt after a successful render. */
   skipFeedback?: boolean;
+  /** False for a batch row: one line about the desktop app per batch is noise, not a pointer. */
+  desktopHint?: boolean;
   /**
-   * OPT IN to the DE parallel-router CLI trial
-   * (`maybeEnableDeParallelRouterTrial`) for this render. Default OFF —
+   * OPT IN to managing the DE parallel-router circuit breaker
+   * (`applyDeParallelRouterCircuitBreaker`) for this render. Default OFF —
    * only the top-level CLI render command's own call sites should ever set
-   * this (review): the trial mechanism shares one process-wide env var and
-   * two module-level flags across every `renderLocal` call in the process,
+   * this (review): the mechanism shares one process-wide env var and two
+   * module-level flags across every `renderLocal` call in the process,
    * which is safe for SEQUENTIAL calls (single render, single-concurrency
    * batch rows) but not for genuinely concurrent ones — racing invocations
    * could tear down or misattribute each other's outcome. Programmatic
    * consumers importing `renderLocal` (a future studio-server path, test
-   * harnesses, distributed runners) therefore get NO trial unless they
-   * explicitly opt in AND guarantee sequential invocation. The CLI sets
-   * this for single renders and for `--batch` at concurrency 1; it leaves
-   * it unset for `--batch-concurrency N>=2`.
+   * harnesses, distributed runners) therefore do not manage the breaker
+   * unless they explicitly opt in AND guarantee sequential invocation. The
+   * CLI sets this for single renders and for `--batch` at concurrency 1; it
+   * leaves it unset for `--batch-concurrency N>=2`.
+   *
+   * NOTE the asymmetry: the ROUTER itself is default-on for every consumer
+   * (the producer decides that). This flag only governs whether we
+   * additionally enforce the per-install breaker, because that is the part
+   * with process-wide state.
    */
-  enableDeParallelRouterTrial?: boolean;
+  manageDeParallelRouterBreaker?: boolean;
 }
 
 /**
@@ -508,6 +738,7 @@ export async function checkRenderResolutionPreflight(
 }
 
 const DOCKER_IMAGE_PREFIX = "hyperframes-renderer";
+const BEGIN_FRAME_FIRST_FRAME_DEADLINE_MS = 20_000;
 
 function dockerImageTag(version: string): string {
   return `${DOCKER_IMAGE_PREFIX}:${version}`;
@@ -558,9 +789,12 @@ function ensureDockerImage(version: string, platform: string, quiet: boolean): s
 
   const dockerfilePath = resolveDockerfilePath();
 
-  // Copy Dockerfile to a temp build context so docker build has a clean context
-  const tmpDir = join(tmpdir(), `hyperframes-docker-${Date.now()}`);
-  mkdirSync(tmpDir, { recursive: true });
+  // Copy Dockerfile to a temp build context so docker build has a clean context.
+  // mkdtempSync (not a `Date.now()`-derived name) so the path is unpredictable
+  // and created 0o700 by the kernel — a guessable temp dir in a world-writable
+  // tmpdir is pre-creatable by another local user, who could then swap in their
+  // own Dockerfile or symlink the path (CodeQL js/insecure-temporary-file).
+  const tmpDir = mkdtempSync(join(tmpdir(), "hyperframes-docker-"));
   writeFileSync(join(tmpDir, "Dockerfile"), readFileSync(dockerfilePath));
 
   // Platform is now derived from the host arch (see resolveDockerPlatform).
@@ -588,11 +822,11 @@ function ensureDockerImage(version: string, platform: string, quiet: boolean): s
         tag,
         tmpDir,
       ],
-      { stdio: quiet ? "pipe" : "inherit", timeout: 600_000 },
+      { stdio: quiet ? "pipe" : "inherit", timeout: DOCKER_BUILD_TIMEOUT_MINUTES * 60_000 },
     );
   } catch (error: unknown) {
     const message = normalizeErrorMessage(error);
-    throw new Error(`Failed to build Docker image: ${message}`);
+    throw new Error(`Failed to build Docker image: ${message}`, { cause: error });
   } finally {
     rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -642,15 +876,73 @@ function resolveDockerHostPlatform(options: RenderOptions): string {
   return platform;
 }
 
-// Inherited minor finding (CRAP 37.1, cyclomatic 11). This PR only added
-// `pageNavigationTimeoutMs` to the options forwarded to `buildDockerRunArgs`.
+async function registerRenderOutputOrWarn(projectDir: string, outputPath: string): Promise<void> {
+  await registerRenderOutput(projectDir, outputPath).catch((error: unknown) =>
+    console.warn(`Render output was not registered: ${normalizeErrorMessage(error)}`),
+  );
+}
+
+function outsideAssetsAllowedOrWarn(projectDir: string, entryFile: string | undefined): boolean {
+  return outsideAssetsAllowed(projectDir, entryFile, (line) => console.warn(c.warn(`  ${line}`)));
+}
+
+/**
+ * The render options passed into the container. The received-files rule is
+ * decided here on the host, because the container mounts only the project and
+ * cannot see a record in a folder above it. A container CLI without
+ * --refuse-outside-files rejects it as an unknown flag and does not render.
+ */
+export function dockerRenderOptions(
+  projectDir: string,
+  options: RenderOptions,
+): DockerRenderOptions {
+  return {
+    fps: options.fps,
+    quality: options.quality,
+    format: options.format,
+    gifLoop: options.gifLoop,
+    hlsSegmentSeconds: options.hlsSegmentSeconds,
+    workers: options.workers,
+    gpu: options.gpu,
+    browserGpu: options.browserGpuMode === "hardware",
+    hdrMode: options.hdrMode,
+    crf: options.crf,
+    vp9CpuUsed: options.vp9CpuUsed,
+    videoBitrate: options.videoBitrate,
+    keyframeIntervalSeconds: options.keyframeIntervalSeconds,
+    range: options.range,
+    proresProfile: options.proresProfile,
+    maxBitrate: options.maxBitrate,
+    bufferSize: options.bufferSize,
+    videoFrameFormat: options.videoFrameFormat,
+    chromaSubsampling: options.chromaSubsampling,
+    pageMotionBlur: options.pageMotionBlur,
+    quiet: options.quiet,
+    variables: options.variables,
+    entryFile: options.entryFile,
+    outputResolution: options.outputResolutionRaw ?? options.outputResolution,
+    pageSideCompositing: options.pageSideCompositing,
+    debug: options.debug,
+    bestEffort: options.bestEffort,
+    experimentalFastCapture: options.experimentalFastCapture,
+    pageNavigationTimeoutMs: options.pageNavigationTimeoutMs,
+    protocolTimeoutMs: options.protocolTimeout,
+    playerReadyTimeoutMs: options.playerReadyTimeout,
+    refuseOutsideFiles:
+      options.refuseOutsideFiles ?? !outsideAssetsAllowedOrWarn(projectDir, options.entryFile),
+  };
+}
+
 // fallow-ignore-next-line complexity
-async function renderDocker(
+export async function renderDocker(
   projectDir: string,
   outputPath: string,
   options: RenderOptions,
 ): Promise<SingleRenderResult> {
+  await registerRenderOutputOrWarn(projectDir, outputPath);
+  const capture = await captureArtifactRevision(projectDir).catch(() => undefined);
   const startTime = Date.now();
+  const cpu = startRenderCpuSampler();
 
   // Dev mode (tsx/ts-node) uses "latest" since the local version isn't on npm
   const dockerVersion = isDevMode() ? "latest" : VERSION;
@@ -664,15 +956,9 @@ async function renderDocker(
   try {
     imageTag = ensureDockerImage(dockerVersion, platform, options.quiet);
   } catch (error: unknown) {
-    const message = normalizeErrorMessage(error);
-    const isDockerMissing = /connect|not found|ENOENT/i.test(message);
-    errorBox(
-      isDockerMissing ? "Docker not available" : "Docker image build failed",
-      message,
-      isDockerMissing
-        ? "Install Docker: https://docs.docker.com/get-docker/"
-        : "Check Docker is running: docker info",
-    );
+    cpu.stop();
+    const failure = describeDockerBuildFailure(error);
+    errorBox(failure.title, failure.message, failure.hint);
     failCommand();
   }
 
@@ -684,31 +970,8 @@ async function renderDocker(
     outputDir: resolve(outputDir),
     outputFilename,
     platform,
-    options: {
-      fps: options.fps,
-      quality: options.quality,
-      format: options.format,
-      gifLoop: options.gifLoop,
-      workers: options.workers,
-      gpu: options.gpu,
-      browserGpu: options.browserGpuMode === "hardware",
-      hdrMode: options.hdrMode,
-      crf: options.crf,
-      vp9CpuUsed: options.vp9CpuUsed,
-      videoBitrate: options.videoBitrate,
-      videoFrameFormat: options.videoFrameFormat,
-      quiet: options.quiet,
-      variables: options.variables,
-      entryFile: options.entryFile,
-      outputResolution: options.outputResolutionRaw ?? options.outputResolution,
-      pageSideCompositing: options.pageSideCompositing,
-      debug: options.debug,
-      bestEffort: options.bestEffort,
-      experimentalFastCapture: options.experimentalFastCapture,
-      pageNavigationTimeoutMs: options.pageNavigationTimeoutMs,
-      protocolTimeoutMs: options.protocolTimeout,
-      playerReadyTimeoutMs: options.playerReadyTimeout,
-    },
+    hostStdoutIsTty: process.stdout.isTTY === true,
+    options: dockerRenderOptions(projectDir, options),
   });
 
   if (!options.quiet) {
@@ -718,27 +981,36 @@ async function renderDocker(
 
   try {
     await new Promise<void>((resolvePromise, reject) => {
+      const stderrTail = createStderrTail();
+      // stderr is piped so the failure can name its cause; it is still echoed live.
       const child = spawn("docker", dockerArgs, {
-        // When quiet, still show stderr so container errors surface
-        stdio: options.quiet ? ["pipe", "pipe", "inherit"] : "inherit",
+        stdio: options.quiet ? ["pipe", "ignore", "pipe"] : ["inherit", "inherit", "pipe"],
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        process.stderr.write(chunk);
+        stderrTail.push(chunk.toString());
       });
       child.on("close", (code) => {
         if (code === 0) resolvePromise();
-        else reject(new Error(`Docker render exited with code ${code}`));
+        else reject(new DockerRenderExitError(code, stderrTail.tail()));
       });
       child.on("error", (err) => reject(err));
     });
   } catch (error: unknown) {
-    handleRenderError(error, options, startTime, true, "Check Docker is running: docker info");
+    handleRenderError(error, options, startTime, cpu, true, "Check Docker is running: docker info");
   }
 
   const elapsed = Date.now() - startTime;
+  const cpuUsage = cpu.stop();
 
   // Docker child exited 0 → the containerized producer already validated
   // AND committed the artifact. Mirror renderLocal's post-success guarantee
   // so any late throw here (telemetry flush, feedback prompt) cannot flip
   // the exit code.
-  markRenderSucceeded();
+  if (!options.embedded) markRenderSucceeded();
+  await runPostRenderStepAsync("recordRenderSuccess", () =>
+    recordRenderSuccess(projectDir, outputPath, "completed", capture).then(() => {}),
+  );
 
   // Track metrics (no job object available from Docker — use a minimal stub)
   runPostRenderStep("trackRenderComplete", () =>
@@ -750,7 +1022,14 @@ async function renderDocker(
       docker: true,
       gpu: options.gpu,
       authoringSkill: options.authoringSkill,
+      authoringSkillSource: options.authoringSkillSource,
+      authoringSkillInvalid: options.authoringSkillInvalid,
+      hfEnvOverrides: options.hfEnvOverrides,
+      catalogUsage: options.catalogUsage,
+      ...renderOutputShapeTelemetryPayload(options),
+      ...renderEnvironmentTelemetryPayload(options),
       ...getMemorySnapshot(),
+      ...cpuUsage,
     }),
   );
 
@@ -758,22 +1037,55 @@ async function renderDocker(
   // threaded back here; the summary shows render time only (never a wrong video
   // length). Probe the output with ffprobe if a duration figure is wanted here.
   runPostRenderStep("printRenderComplete", () =>
-    printRenderComplete(outputPath, elapsed, options.quiet),
+    printRenderComplete({
+      outputPath,
+      projectDir,
+      desktopHint: wantsDesktopHint(options),
+      elapsedMs: elapsed,
+      quiet: options.quiet,
+      format: options.format,
+    }),
   );
   runPostRenderStep("warnIfWebmAlphaDropped", () =>
     warnIfWebmAlphaDropped(outputPath, options.format, options.quiet),
   );
-  if (options.exitAfterComplete) scheduleRenderProcessExit();
+  if (options.exitAfterComplete && !options.embedded) scheduleCliExit();
   return { renderTimeMs: elapsed };
 }
 
-// fallow-ignore-next-line complexity
 export async function renderLocal(
   projectDir: string,
   outputPath: string,
   options: RenderOptions,
+  commandCancellation?: ReturnType<typeof createRenderCancellationScope>,
 ): Promise<SingleRenderResult> {
-  const recoveredOrphanTrees = killOrphanedProcesses();
+  const cancellation = commandCancellation ?? createRenderCancellationScope();
+  try {
+    return await executeLocalRender(projectDir, outputPath, options, cancellation);
+  } finally {
+    if (!commandCancellation) cancellation.dispose();
+  }
+}
+
+// fallow-ignore-next-line complexity
+async function executeLocalRender(
+  projectDir: string,
+  outputPath: string,
+  options: RenderOptions,
+  cancellation: ReturnType<typeof createRenderCancellationScope>,
+): Promise<SingleRenderResult> {
+  await registerRenderOutputOrWarn(projectDir, outputPath);
+  const capture = await captureArtifactRevision(projectDir).catch(() => undefined);
+  cancellation.checkAncestors();
+  cancellation.signal.throwIfAborted();
+  let recoveredOrphanTrees = 0;
+  try {
+    recoveredOrphanTrees = await killOrphanedProcessesForRender(cancellation.signal);
+  } catch {
+    if (cancellation.signal.aborted) cancellation.signal.throwIfAborted();
+  }
+  cancellation.checkAncestors();
+  cancellation.signal.throwIfAborted();
   if (recoveredOrphanTrees > 0 && !options.quiet) {
     console.warn(
       c.warn(
@@ -789,13 +1101,22 @@ export async function renderLocal(
     includeBrowser: true,
     includeDisk: true,
     includeWindowsUnc: true,
+    signal: cancellation.signal,
   });
+  options = {
+    ...options,
+    ffmpegVersionMajor: preflight.ffmpegVersionMajor,
+    browserVersionMajor: preflight.browserVersionMajor,
+    browserInstall: preflight.browserInstall,
+  };
+  cancellation.checkAncestors();
+  cancellation.signal.throwIfAborted();
   const failedChecks = preflight.outcomes.filter((outcome) => !outcome.ok);
   if (failedChecks.length > 0) {
     for (const check of failedChecks) {
       errorBox(check.title ?? `${check.name} check failed`, check.detail, check.hint);
     }
-    failCommand();
+    failCommand(1, undefined, failedChecks.at(-1)?.code);
   }
   if (!options.quiet) {
     for (const outcome of preflight.outcomes) {
@@ -812,11 +1133,36 @@ export async function renderLocal(
     process.env.PRODUCER_HEADLESS_SHELL_PATH = preflight.browser.executablePath;
   }
 
-  if (!options.gpu && options.format === "mp4" && preflight.ffmpegPath) {
-    let encoderMode: ReturnType<typeof detectH264EncoderMode> = "software";
+  // HLS shares the H.264 encode path but cannot take the GPU fallback below:
+  // its fixed-length segments need the software encoder's forced-keyframe lock.
+  const isHls = options.format === "hls";
+  if ((options.format === "mp4" || isHls) && preflight.ffmpegPath) {
+    const gpuRequested = options.gpu && !isHls;
+    let encoderMode: H264EncoderMode = gpuRequested ? "gpu" : "software";
     try {
-      encoderMode = detectH264EncoderMode(preflight.ffmpegPath, false);
+      encoderMode = await detectH264EncoderModeForRender(
+        preflight.ffmpegPath,
+        gpuRequested,
+        cancellation.signal,
+      );
     } catch (error) {
+      if (cancellation.signal.aborted) cancellation.signal.throwIfAborted();
+      // HDR MP4 uses HEVC; auto mode cannot resolve the codec until sources are
+      // inspected. Forced SDR, HLS, or no libx265 either: nothing here can encode.
+      if (
+        error instanceof H264EncoderUnavailableError &&
+        (options.hdrMode === "force-sdr" || isHls || !error.hevcEncoderAvailable)
+      ) {
+        errorBox(
+          `${isHls ? "HLS" : "MP4"} H.264 encoder unavailable`,
+          error.message,
+          `Install an FFmpeg build with libx264 support (${getFFmpegInstallHint()}), or point ${FFMPEG_PATH_ENV} at one` +
+            (isHls
+              ? "."
+              : ", or render WebM instead: hyperframes render --format webm --output output.webm"),
+        );
+        failCommand();
+      }
       // Capability probing is advisory. Let the real encode surface the
       // authoritative FFmpeg error instead of failing here with a bare stack.
       if (!options.quiet) {
@@ -824,27 +1170,63 @@ export async function renderLocal(
         console.warn(c.warn(`  Unable to probe H.264 encoder capabilities: ${detail}`));
       }
     }
-    if (encoderMode === "gpu") {
+    if (encoderMode === "gpu" && isHls) {
+      errorBox(
+        "HLS H.264 encoder unavailable",
+        "FFmpeg does not include libx264, and HLS cannot fall back to VideoToolbox: fixed-length segments require the software encoder's forced-keyframe lock.",
+        `Install an FFmpeg build with libx264 support (${getFFmpegInstallHint()}).`,
+      );
+      failCommand();
+    }
+    if (encoderMode === "gpu" && !gpuRequested) {
       console.warn(
-        c.warn("  FFmpeg does not include libx264; falling back to VideoToolbox H.264 encoding."),
+        c.warn("  FFmpeg does not include libx264; falling back to GPU H.264 encoding."),
       );
       options = { ...options, gpu: true };
     }
+    if (encoderMode === "software" && gpuRequested && !options.quiet) {
+      console.warn(c.warn("  No GPU encoder works on this machine; encoding with libx264."));
+    }
   }
 
+  cancellation.checkAncestors();
+  cancellation.signal.throwIfAborted();
+  const gsapVendorDir = resolveGsapVendorDir();
+  if (gsapVendorDir && !process.env.HYPERFRAMES_GSAP_VENDOR_DIR) {
+    process.env.HYPERFRAMES_GSAP_VENDOR_DIR = gsapVendorDir;
+  }
   const producer = await loadProducer();
-  const deParallelRouterTrialArmed = maybeEnableDeParallelRouterTrial(
-    options.quiet,
-    options.enableDeParallelRouterTrial === true,
-  );
+  const allowOutsideProjectAssets =
+    options.refuseOutsideFiles === undefined
+      ? outsideAssetsAllowedOrWarn(projectDir, options.entryFile)
+      : !options.refuseOutsideFiles;
+  const includeOutsideScripts = options.includeOutsideScripts === true;
+  const deParallelRouterActive =
+    options.manageDeParallelRouterBreaker === true
+      ? applyDeParallelRouterCircuitBreaker(options.quiet)
+      : // Not managing the breaker: the router still runs (producer default),
+        // we just don't enforce or record the per-install trip.
+        false;
 
   const startTime = Date.now();
+  const cpu = startRenderCpuSampler();
   const logger = createRenderTelemetryLogger(
-    producer.createConsoleLogger?.(options.debug ? "debug" : "info") ?? createNoopProducerLogger(),
+    producer.createConsoleLogger?.(options.debug ? "debug" : options.quiet ? "warn" : "info") ??
+      createNoopProducerLogger(),
   );
 
   const engineConfig = producer.resolveConfig({
     browserGpuMode: options.browserGpuMode ?? "software",
+    // Local auto opts out of the software-GPU screenshot clamp, and a BeginFrame that draws no first frame
+    // retries by screenshot. Docker and --no-browser-gpu request software; --resolution supersamples via screenshot.
+    ...(options.browserGpuMode === "auto" &&
+    options.outputResolution == null &&
+    process.env.PRODUCER_FORCE_SCREENSHOT !== "true"
+      ? {
+          forceScreenshot: false,
+          beginFrameFirstFrameDeadlineMs: BEGIN_FRAME_FIRST_FRAME_DEADLINE_MS,
+        }
+      : {}),
     ...(options.pageNavigationTimeoutMs != null
       ? { pageNavigationTimeout: options.pageNavigationTimeoutMs }
       : {}),
@@ -861,38 +1243,84 @@ export async function renderLocal(
       quality: options.quality,
       format: options.format,
       gifLoop: options.gifLoop,
+      hlsSegmentSeconds: options.hlsSegmentSeconds,
       workers: options.workers,
       useGpu: options.gpu,
       hdrMode: options.hdrMode,
       crf: options.crf,
       videoBitrate: options.videoBitrate,
+      keyframeIntervalSeconds: options.keyframeIntervalSeconds,
+      proresProfile: options.proresProfile,
+      maxBitrate: options.maxBitrate,
+      bufferSize: options.bufferSize,
       videoFrameFormat: options.videoFrameFormat,
+      chromaSubsampling: options.chromaSubsampling,
+      pageMotionBlur: options.pageMotionBlur,
       variables: options.variables,
       entryFile: options.entryFile,
       outputResolution: options.outputResolution,
       outputResolutionAspectAgnostic: options.outputResolutionAspectAgnostic,
       debug: options.debug,
+      resumeSegments: options.resumeSegments,
+      keepSegments: options.keepSegments,
       strictness: options.bestEffort === false ? "strict" : "best-effort",
+      // plan() takes the film's own size; these only satisfy the request shape.
+      distributed: options.range ? { width: 1920, height: 1080 } : undefined,
     },
   });
-  const job = producer.createRenderJob(producer.renderConfigFromRequest(request, { logger }));
+  if (options.range) {
+    return renderRange({
+      producer,
+      request,
+      range: options.range,
+      projectDir,
+      outputPath,
+      options,
+      logger,
+      startTime,
+      cpu,
+      signal: cancellation.signal,
+      allowOutsideProjectAssets,
+      includeOutsideScripts,
+    });
+  }
+  const job = producer.createRenderJob(
+    producer.renderConfigFromRequest(request, {
+      logger,
+      allowOutsideProjectAssets,
+      includeOutsideScripts,
+    }),
+  );
 
   const onProgress = options.quiet
     ? undefined
-    : (progressJob: { progress: number }, message: string) => {
+    : (progressJob: Pick<RenderJob, "progress" | "stageProgress">, message: string) => {
         renderProgress(progressJob.progress, message);
+        renderMachineProgress(progressJob.progress, progressJob.stageProgress);
       };
 
   try {
-    await producer.executeRenderJob(job, projectDir, outputPath, onProgress);
+    cancellation.checkAncestors();
+    await producer.executeRenderJob(
+      job,
+      projectDir,
+      outputPath,
+      onProgress,
+      cancellation.signal,
+      cancellation.checkAncestors,
+    );
   } catch (error: unknown) {
-    maybeConsumeDeParallelRouterTrial(deParallelRouterTrialArmed, job, options.quiet);
+    maybeConsumeDeParallelRouterTrial(deParallelRouterActive, job, options.quiet);
+    // The render container sets `ENV CONTAINER=true`; suggesting `--docker`
+    // from inside it is a misdirection (heygen-com/hyperframes#3370).
+    const inContainer = process.env.CONTAINER === "true";
     handleRenderError(
       error,
       options,
       startTime,
+      cpu,
       false,
-      "Try --docker for containerized rendering",
+      inContainer ? "" : "Try --docker for containerized rendering",
       job.failedStage,
       job,
     );
@@ -903,24 +1331,40 @@ export async function renderLocal(
   // point on, ANY thrown teardown error must not be allowed to override
   // the exit code. Field signal ts=1784169760 / ts=1784171150 / ts=1784172467
   // (win32/x64, CLI 0.7.58): valid MP4 on disk, exited 1 with no error print.
-  markRenderSucceeded();
+  if (!options.embedded) markRenderSucceeded();
+  await runPostRenderStepAsync("recordRenderSuccess", () =>
+    recordRenderSuccess(
+      projectDir,
+      outputPath,
+      job.outcome === "completed_with_warnings" ? "completed_with_warnings" : "completed",
+      capture,
+    ).then(() => {}),
+  );
 
-  maybeConsumeDeParallelRouterTrial(deParallelRouterTrialArmed, job, options.quiet);
+  maybeConsumeDeParallelRouterTrial(deParallelRouterActive, job, options.quiet, true);
   const elapsed = Date.now() - startTime;
+  const cpuUsage = cpu.stop();
   if (job.outcome === "completed_with_warnings") {
     for (const warning of job.warnings) {
       console.warn(c.warn(`  [${warning.code}] ${warning.message}`));
     }
   }
-  runPostRenderStep("trackRenderMetrics", () => trackRenderMetrics(job, elapsed, options, false));
+  const audioLowered = audioLoweredWarning(job.audioLoweredDb);
+  if (audioLowered) console.warn(c.warn(`  [${audioLowered.code}] ${audioLowered.message}`));
+  runPostRenderStep("trackRenderMetrics", () =>
+    trackRenderMetrics(job, elapsed, options, false, cpuUsage),
+  );
   runPostRenderStep("printRenderComplete", () =>
-    printRenderComplete(
+    printRenderComplete({
       outputPath,
-      elapsed,
-      options.quiet,
-      job.perfSummary?.compositionDurationSeconds,
-      job.perfSummary?.totalFrames,
-    ),
+      projectDir,
+      desktopHint: wantsDesktopHint(options),
+      elapsedMs: elapsed,
+      quiet: options.quiet,
+      format: options.format,
+      perf: job.perfSummary,
+      requestedGpuMode: options.browserGpuMode,
+    }),
   );
   runPostRenderStep("warnIfWebmAlphaDropped", () =>
     warnIfWebmAlphaDropped(outputPath, options.format, options.quiet),
@@ -933,44 +1377,111 @@ export async function renderLocal(
       }),
     );
   }
-  if (options.exitAfterComplete) scheduleRenderProcessExit();
+  if (options.exitAfterComplete && !options.embedded) scheduleCliExit();
   const durationMs = job.perfSummary
     ? Math.round(job.perfSummary.compositionDurationSeconds * 1000)
     : undefined;
   const outcome =
     job.outcome === "completed_with_warnings" ? "completed_with_warnings" : "completed";
   return {
+    ...producer.referenceBackgroundResult(job[producer.REFERENCE_BACKGROUND_FIELD]),
+    motionBlur: job.perfSummary?.motionBlur,
     renderTimeMs: elapsed,
     durationMs,
     outcome,
-    warnings: job.warnings.map((warning) => ({ code: warning.code, message: warning.message })),
+    warnings: [
+      ...job.warnings.map((warning) => ({ code: warning.code, message: warning.message })),
+      ...(audioLowered ? [audioLowered] : []),
+    ],
   };
 }
 
-type UnrefableTimer = {
-  unref: () => void;
-};
-
-function isUnrefableTimer(
-  timer: ReturnType<typeof setTimeout>,
-): timer is ReturnType<typeof setTimeout> & UnrefableTimer {
-  return (
-    typeof timer === "object" &&
-    timer !== null &&
-    "unref" in timer &&
-    typeof timer.unref === "function"
-  );
-}
-
-function scheduleRenderProcessExit(): void {
-  const timer = setTimeout(() => requestCliExit(0), 100);
-  if (isUnrefableTimer(timer)) timer.unref();
+async function renderRange(input: {
+  producer: Awaited<ReturnType<typeof loadProducer>>;
+  request: ReturnType<Awaited<ReturnType<typeof loadProducer>>["createRenderRequest"]>;
+  range: RenderRange;
+  projectDir: string;
+  outputPath: string;
+  options: RenderOptions;
+  logger: ProducerLogger;
+  startTime: number;
+  cpu: RenderCpuSampler;
+  signal: AbortSignal;
+  allowOutsideProjectAssets: boolean;
+  includeOutsideScripts: boolean;
+}): Promise<SingleRenderResult> {
+  const { producer, options } = input;
+  let framesEncoded = 0;
+  let reference = producer.referenceBackgroundResult(undefined);
+  try {
+    const config = producer.distributedConfigFromRequest(input.request, {
+      logger: input.logger,
+      abortSignal: input.signal,
+    });
+    const spanResult = await producer.renderSpan(
+      input.projectDir,
+      config,
+      input.range,
+      input.outputPath,
+      {
+        allowOutsideProjectAssets: input.allowOutsideProjectAssets,
+        includeOutsideScripts: input.includeOutsideScripts,
+      },
+    );
+    framesEncoded = spanResult.framesEncoded;
+    reference = producer.referenceBackgroundResult(spanResult[producer.REFERENCE_BACKGROUND_FIELD]);
+  } catch (error: unknown) {
+    handleRenderError(error, options, input.startTime, input.cpu, false, "");
+  }
+  if (!options.embedded) markRenderSucceeded();
+  const elapsed = Date.now() - input.startTime;
+  input.cpu.stop();
+  printRenderComplete({
+    outputPath: input.outputPath,
+    projectDir: input.projectDir,
+    desktopHint: wantsDesktopHint(options),
+    elapsedMs: elapsed,
+    quiet: options.quiet,
+    format: options.format,
+  });
+  if (options.exitAfterComplete && !options.embedded) scheduleCliExit();
+  return {
+    renderTimeMs: elapsed,
+    ...reference,
+    durationMs: Math.round((framesEncoded / fpsToNumber(options.fps)) * 1000),
+    outcome: "completed",
+    warnings: [],
+  };
 }
 
 function getMemorySnapshot() {
   return {
     peakMemoryMb: bytesToMb(process.memoryUsage.rss()),
     memoryFreeMb: bytesToMb(freemem()),
+  };
+}
+
+/** Output-shape request facts, resolved before the pipeline starts (survives a pre-perfSummary render_error). */
+function renderOutputShapeTelemetryPayload(
+  options: RenderOptions,
+): RenderOutputShapeTelemetryPayload {
+  return {
+    outputResolutionPreset: options.outputResolution,
+    outputFormat: options.format,
+    hdrMode: options.hdrMode,
+    videoFrameFormat: options.videoFrameFormat,
+    gifFpsCapped: options.gifFpsCapped,
+  };
+}
+
+/** Toolchain facts from local preflight; undefined on Docker renders (the container runs its own). */
+function renderEnvironmentTelemetryPayload(
+  options: RenderOptions,
+): RenderEnvironmentTelemetryPayload {
+  return {
+    ffmpegVersionMajor: options.ffmpegVersionMajor,
+    browserVersionMajor: options.browserVersionMajor,
+    browserInstall: options.browserInstall,
   };
 }
 
@@ -1064,37 +1575,40 @@ function createNoopProducerLogger(): ProducerLogger {
   };
 }
 
-/** Backstop cap: even absent an actual router failure, stop offering the
- * trial after this many engaged (routed or reverted) renders for an
- * install. Without this, a healthy router that never reverts would stay
- * force-enabled on every eligible render forever (review finding). */
-const DE_PARALLEL_ROUTER_TRIAL_MAX_RENDERS = 25;
-
 /**
- * True across every `renderLocal` call in THIS process once the trial has
- * armed `HF_DE_PARALLEL_ROUTER` here — distinct from the env var's own
- * value, which stays "true" across an entire `--batch` run. Without this,
- * a second batch row's `process.env.HF_DE_PARALLEL_ROUTER !== undefined`
- * check can't tell "we set this ourselves on row 1" from "the user set
- * this" and would wrongly treat itself as un-armed, silently dropping that
- * row's outcome from ever reaching `maybeConsumeDeParallelRouterTrial`
- * (review finding).
+ * The 25-render exposure cap that bounded the old opt-in TRIAL is gone: the
+ * router is default-ON as of 2026-07-27, so "stop offering it after N
+ * renders" would mean switching a shipped default off behind the user's
+ * back. What survives is the half that was always safety rather than
+ * sampling — the per-install circuit breaker below, which latches the router
+ * off for good the first time a render has to fall back.
  */
-let deParallelRouterTrialManagedByUs = false;
 
 /**
- * In-process latch mirroring `deParallelRouterTrialFired`: set the moment we
- * DECIDE the trial is over, independent of whether persisting that decision
- * to `~/.hyperframes/config.json` succeeds. `writeConfig` swallows all fs
+ * The user set `HF_DE_PARALLEL_ROUTER` themselves (either polarity), latched
+ * once at first observation. Their choice wins over the circuit breaker in
+ * BOTH directions: we never overwrite an explicit opt-in with `"false"` on a
+ * fallback, and never overwrite an explicit opt-out either. Latched rather
+ * than re-read because the breaker itself writes the var — after the first
+ * write a live `process.env` read could no longer tell "the user set this"
+ * from "we set this" (the same distinction the old trial needed for
+ * `--batch` rows sharing one process).
+ */
+let deParallelRouterUserManaged = false;
+let deParallelRouterUserManagedResolved = false;
+
+/**
+ * In-process latch mirroring the persisted `deParallelRouterTrialFired`: set
+ * the moment the breaker trips, independent of whether persisting that to
+ * `~/.hyperframes/config.json` succeeds. `writeConfig` swallows all fs
  * errors (by design — telemetry must never break the CLI), so on an
- * unwritable config (root-owned file, disk full) the fired flag can never
- * stick on disk; without this latch the trial would silently re-arm and
- * re-fail on every subsequent render in this process forever (review
- * finding). Later processes still re-arm — disk is the only cross-process
- * channel — but each process now stops after at most one failure it
- * couldn't record.
+ * unwritable config (root-owned file, disk full) the flag can never stick on
+ * disk; without this latch the router would re-enable and re-fail on every
+ * subsequent render in this process. Later processes re-arm — disk is the
+ * only cross-process channel — but each process now stops after at most one
+ * failure it couldn't record.
  */
-let deParallelRouterTrialFiredThisProcess = false;
+let deParallelRouterBreakerTrippedThisProcess = false;
 
 /**
  * Test-only reset for the module-level trial state — a real CLI process
@@ -1102,114 +1616,185 @@ let deParallelRouterTrialFiredThisProcess = false;
  * resetting outside a test process where many independent test cases share
  * one imported module instance.
  */
-// fallow-ignore-next-line unused-export
 export function __resetDeParallelRouterTrialStateForTests(): void {
-  deParallelRouterTrialManagedByUs = false;
-  deParallelRouterTrialFiredThisProcess = false;
+  deParallelRouterBreakerTrippedThisProcess = false;
+  deParallelRouterUserManaged = false;
+  deParallelRouterUserManagedResolved = false;
 }
 
 /**
- * True once the trial should stop offering itself: already failed (on disk
- * or via this process's in-memory latch), hit the render-count backstop, or
- * telemetry isn't actually recordable right now.
- *
- * Checks BOTH `shouldTrack()` and `config.telemetryEnabled` directly, not
- * `shouldTrack()` alone: `shouldTrack()` (`../telemetry/client.js`) memoizes
- * its verdict once per process and never invalidates, so during a long
- * `--batch` run (all rows share one process) a `hyperframes telemetry off`
- * issued from another terminal mid-batch would never be observed. The
- * caller must pass a `readConfigFresh()` snapshot for the same reason —
- * `readConfig()` serves a process-lifetime cache that is exactly as stale
- * as the `shouldTrack()` memoization this check exists to bypass (review
- * finding).
+ * Put the router back: lift the latch from both stores, store `next` as the
+ * remaining breaker state, and undo the "false" this process wrote.
  */
-function isDeParallelRouterTrialBlocked(config: HyperframesConfig): boolean {
-  const overRenderCap =
-    (config.deParallelRouterTrialRenderCount ?? 0) >= DE_PARALLEL_ROUTER_TRIAL_MAX_RENDERS;
+function rearmDeParallelRouter(next: DeRouterBreaker | undefined): void {
+  releaseDeParallelRouterLatch();
+  const config = readConfigFresh();
+  config.deParallelRouterBreaker = next;
+  writeConfig(config);
+  deParallelRouterBreakerTrippedThisProcess = false;
+  if (!deParallelRouterUserManaged) delete process.env.HF_DE_PARALLEL_ROUTER;
+}
+
+/** Is the router held off for this render? A stale or record-less latch is lifted here. */
+function routerHeldOff(config: HyperframesConfig): boolean {
+  if (deParallelRouterBreakerTrippedThisProcess) return true;
+  if (!config.deParallelRouterTrialFired) return false;
+  if (isRouterOff(config.deParallelRouterBreaker, VERSION)) return true;
+  rearmDeParallelRouter(forVersion(config.deParallelRouterBreaker, VERSION));
+  return false;
+}
+
+/** A render finished with the router held off: count it toward bringing the router back. */
+function countCleanRenderWithRouterOff(): void {
+  if (!deParallelRouterBreakerTrippedThisProcess || deParallelRouterUserManaged) return;
+  const config = readConfigFresh();
+  // A trip that never reached disk (unwritable config) lasts for this process only.
+  if (config.deParallelRouterBreaker?.trip === undefined) return;
+  const next = afterCleanRender(config.deParallelRouterBreaker);
+  if (next?.trip === undefined) {
+    rearmDeParallelRouter(next);
+    return;
+  }
+  config.deParallelRouterBreaker = next;
+  writeConfig(config);
+}
+
+type DeFallback = Pick<
+  NonNullable<NonNullable<RenderJob["perfSummary"]>["drawElement"]>,
+  "fallbackReason" | "fallbackFrameIndex" | "fallbackFailedDb" | "fallbackThresholdDb"
+>;
+
+/** The rejected frame's detail: the perf summary on a finished render, the capture observability on a failed one. */
+function fallbackOf(job: RenderJob): DeFallback {
+  const capture = job.errorDetails?.observability?.capture;
   return (
-    deParallelRouterTrialFiredThisProcess ||
-    Boolean(config.deParallelRouterTrialFired) ||
-    overRenderCap ||
-    !config.telemetryEnabled ||
-    !shouldTrack() ||
-    // cli.ts shows the first-run telemetry disclosure via a fire-and-forget,
-    // unawaited dynamic import — there's no guarantee it has printed before
-    // this render command reaches this point. Requiring telemetryNoticeShown
-    // means the trial simply never offers itself on a fresh install's very
-    // first invocation (before the disclosure is guaranteed to have run at
-    // least once), rather than racing an experimental opt-in message against
-    // the disclosure it depends on (review finding).
-    !config.telemetryNoticeShown
+    job.perfSummary?.drawElement ?? {
+      fallbackReason: capture?.deFallbackReason,
+      fallbackFrameIndex: capture?.deFallbackFrameIndex,
+      fallbackFailedDb: capture?.deFallbackFailedDb,
+      fallbackThresholdDb: capture?.deFallbackThresholdDb,
+    }
   );
 }
 
-/** Shared cleanup for both `maybeEnableDeParallelRouterTrial` (this process
- * should stop offering the trial) and `maybeConsumeDeParallelRouterTrial`
- * (the trial just failed/hit its cap) — a no-op unless WE were the ones
- * managing the env var. */
-function stopManagingDeParallelRouterTrial(): void {
-  if (!deParallelRouterTrialManagedByUs) return;
-  delete process.env.HF_DE_PARALLEL_ROUTER;
-  deParallelRouterTrialManagedByUs = false;
+function revertFrom(job: RenderJob, outcome: string, atRender: number): DeRouterRevert {
+  const fallback = fallbackOf(job);
+  return {
+    reason: fallback.fallbackReason ?? outcome,
+    frameIndex: fallback.fallbackFrameIndex,
+    failedDb: fallback.fallbackFailedDb,
+    thresholdDb: fallback.fallbackThresholdDb,
+    at: new Date().toISOString(),
+    version: VERSION,
+    atRender,
+  };
 }
 
 /**
- * Enable the DE parallel-router experiment (`HF_DE_PARALLEL_ROUTER`, default
- * off) for this render, on every eligible render for this install (up to
- * `DE_PARALLEL_ROUTER_TRIAL_MAX_RENDERS`), so we get real-traffic router
- * telemetry (revert rate, verify-db distribution) without requiring anyone
- * to manually set the env var — see `HyperframesConfig.deParallelRouterTrialFired`.
- * See `maybeConsumeDeParallelRouterTrial` for what turns it off. Returns
- * whether this call armed it (so the caller knows to check for consumption
- * afterward) — false unless the caller explicitly opted in (`enabled` —
- * OPT-IN polarity, review: only the top-level CLI render command's own
- * sequential call sites set it; programmatic `renderLocal` consumers get no
- * trial by default because the mechanism's process-wide state is unsafe
- * under concurrent invocation — see
- * `RenderOptions.enableDeParallelRouterTrial`), if it's already failed (or
- * hit the render cap) for this install, if the user already set the env var
- * themselves (never override an explicit choice — see
- * `deParallelRouterTrialManagedByUs` for how a later `--batch` row
- * distinguishes that from our own earlier arm), or if telemetry isn't
- * actually recordable right now (see `isDeParallelRouterTrialBlocked`; no
- * point risking the experimental path if we can't even record the
- * resulting signal).
+ * Latch the router OFF for the rest of this process by writing an explicit
+ * `"false"`.
+ *
+ * Under the old default-OFF flag this deleted the var, because absent meant
+ * off. With the router default-ON, deleting means ON — the same call would
+ * silently RE-ENABLE the router on exactly the host that just failed
+ * (review finding). Writing the explicit value is what makes the breaker a
+ * breaker. No-op when the user set the var themselves: their choice wins in
+ * both directions.
  */
-function maybeEnableDeParallelRouterTrial(quiet: boolean, enabled: boolean): boolean {
-  if (!enabled) return false;
-  // The in-process latch alone decides once it's set — short-circuit before
-  // the disk read so post-fired batch rows don't pay a config read + parse +
-  // shared-cache invalidation per row for an answer module state already
-  // knows (review finding).
-  if (deParallelRouterTrialFiredThisProcess) {
-    stopManagingDeParallelRouterTrial();
+/**
+ * Mirror of the producer's `isDeParallelRouterEnabled`. Deliberately
+ * duplicated rather than imported: `@hyperframes/producer` is lazily loaded
+ * (`loadProducer()`) to keep CLI startup fast, and this runs on the startup
+ * path. Keep the two in sync — the producer copy is the source of truth.
+ */
+function userValueEnablesDeParallelRouter(): boolean {
+  const raw = process.env.HF_DE_PARALLEL_ROUTER?.trim().toLowerCase();
+  if (raw === undefined || raw === "") return true;
+  return !(raw === "false" || raw === "0" || raw === "off" || raw === "no");
+}
+
+function applyDeParallelRouterBreaker(): void {
+  if (deParallelRouterUserManaged) return;
+  process.env.HF_DE_PARALLEL_ROUTER = "false";
+}
+
+/**
+ * Apply this install's router circuit breaker before a render.
+ *
+ * The router is default-ON, so the normal path does NOTHING here — the
+ * producer's own default takes over. This exists for the one case that must
+ * survive a shipped default: an install that already had a render fall back
+ * stays off, permanently, across processes (the verdict is persisted to
+ * `~/.hyperframes/config.json`). See `maybeConsumeDeParallelRouterTrial` for
+ * what trips it.
+ *
+ * Returns whether the router is active for this render, so the caller knows
+ * to inspect the outcome afterward.
+ */
+function applyDeParallelRouterCircuitBreaker(quiet: boolean): boolean {
+  // Latch the user's own choice on first observation, BEFORE the breaker can
+  // write the var itself and make the two indistinguishable.
+  //
+  // Ownership uses the SAME normalization as the two parsers: a set-but-empty
+  // (or whitespace) value means "unset / default ON", so it is NOT a user
+  // choice and must stay breaker-managed. Treating any defined value as
+  // user-managed would let `HF_DE_PARALLEL_ROUTER=` route the render (empty
+  // parses as ON) while exempting that install from the breaker — it would
+  // keep retrying a failing router forever, losing exactly the first-fallback
+  // protection this PR exists to provide (review finding).
+  if (!deParallelRouterUserManagedResolved) {
+    deParallelRouterUserManaged = (process.env.HF_DE_PARALLEL_ROUTER ?? "").trim() !== "";
+    deParallelRouterUserManagedResolved = true;
+  }
+  if (deParallelRouterUserManaged) {
+    // Explicit choice, either polarity — report whether it enables the
+    // router so outcomes are still consumed, but never override it.
+    return userValueEnablesDeParallelRouter();
+  }
+
+  // The in-process latch decides once set — short-circuit before the disk
+  // read so post-trip batch rows don't pay a config read + parse per row for
+  // an answer module state already knows.
+  if (deParallelRouterBreakerTrippedThisProcess) {
+    applyDeParallelRouterBreaker();
     return false;
   }
-  const userSetIt =
-    process.env.HF_DE_PARALLEL_ROUTER !== undefined && !deParallelRouterTrialManagedByUs;
-  if (userSetIt) return false;
-
-  // readConfigFresh, NOT readConfig: the cached read is exactly as stale as
-  // the shouldTrack() memoization the blocked-check exists to bypass — a
-  // mid-batch `hyperframes telemetry off` (or another process persisting
-  // fired=true) would never be observed through the cache (review finding).
-  if (isDeParallelRouterTrialBlocked(readConfigFresh())) {
-    stopManagingDeParallelRouterTrial();
+  // readConfigFresh, NOT readConfig: the cached read is process-lifetime, so
+  // another process persisting a trip mid-`--batch` would never be observed.
+  if (routerHeldOff(readConfigFresh())) {
+    deParallelRouterBreakerTrippedThisProcess = true;
+    applyDeParallelRouterBreaker();
+    if (!quiet) {
+      console.log(
+        c.dim(
+          "  Parallel drawElement capture is off for this install after two failed frame " +
+            "checks; it returns with the next version or after 20 more renders. " +
+            "Re-enable now with HF_DE_PARALLEL_ROUTER=true.",
+        ),
+      );
+    }
     return false;
   }
 
-  if (deParallelRouterTrialManagedByUs) return true;
-  deParallelRouterTrialManagedByUs = true;
-  process.env.HF_DE_PARALLEL_ROUTER = "true";
-  if (!quiet) {
-    console.log(
-      c.dim(
-        "  Trying the experimental parallel drawElement capture path for this install " +
-          "(disabled automatically if it ever needs to fall back; opt out anytime: " +
-          "HF_DE_PARALLEL_ROUTER=false)",
-      ),
-    );
-  }
+  // Nothing left to gate: the router is a shipped default for every install,
+  // so leave the var unset and let the producer's default-ON apply. The
+  // breaker above is the only thing that turns it off, per install, and only
+  // after a real fallback. `HF_DE_PARALLEL_ROUTER=false` remains the user-
+  // facing kill switch.
+  //
+  // The `de-parallel-router` canary that used to sit here was removed with its
+  // registry entry (they had to go together — at >=100 the evaluator
+  // short-circuits ahead of the CI/seedless exclusions, so deleting only the
+  // entry would have flipped whatever still resolved false at deletion time).
+  //
+  // Two claims from the ramp's rationale were wrong, recorded so they are not
+  // reintroduced: "~17x jump in exposure onto <=4 CPUs / Docker" overstated
+  // the reach — Docker renders never use drawElement at all (0 of 4,281
+  // measured) and the router requires it, so no percentage ever exposed
+  // Docker. And "~11% of installs already route" was an OUTCOME (the share
+  // clearing eligibility and the old 25-render cap), not an exposure setting;
+  // read as a rollout knob it inverted the arithmetic, which is how gating at
+  // 5% came to CUT fleet exposure ~25x rather than ramp it.
   return true;
 }
 
@@ -1247,90 +1832,161 @@ function resolveDeParallelRouterOutcome(job: RenderJob): string | undefined {
  */
 function persistDeParallelRouterTrialFired(): boolean {
   const MAX_ATTEMPTS = 3;
+  let mirrored = false;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     const config = readConfigFresh();
-    if (config.deParallelRouterTrialFired) return true;
+    // Both stores must carry the latch, not just config.json. Checking only
+    // the config let a run stop early after a failed mirror — and config.json
+    // is the copy a stale writer or a re-mint can erase, so the durable one
+    // is exactly the one that was missing. The read side merges install-state
+    // back in, so the two together are what make the trip survive.
+    if (config.deParallelRouterTrialFired && mirrored) return true;
     config.deParallelRouterTrialFired = true;
-    if (!writeConfig(config)) return false;
+    const result = writeConfigWithResult(config);
+    if (!result.ok) return false;
+    mirrored = result.mirrored !== false;
+    if (mirrored) return true;
+    // Config landed but the mirror did not — retry rather than report success.
   }
-  return Boolean(readConfigFresh().deParallelRouterTrialFired);
+  return false;
 }
 
 /**
- * After a trial-armed render, persist that the router's OWN bet actually
- * failed — its self-verify/generic-failure safety net fired
- * (`deParallelRouter === "reverted"`) — or that the render-count backstop
- * (`DE_PARALLEL_ROUTER_TRIAL_MAX_RENDERS`) was reached, so it's never
- * enabled again for this install. A clean "routed" (the render succeeded
- * with no fallback) does NOT consume the trial by itself — the whole point
- * is to keep trying on every eligible render until we see a real failure
- * signal (bounded by the render cap), maximizing successful-routing
- * telemetry volume rather than stopping at the first data point. Checks
- * both the success path (`perfSummary`) and the failure path
- * (`errorDetails.observability.capture`, mutated in place before a hard
- * failure throws) — a render that still failed even after the fallback
- * retry counts too. A render that crashed for an unrelated reason while
- * merely "routed" (never reached "reverted" — e.g. cancellation) does NOT
- * count as a router failure and does not turn the trial off. No-ops if the
- * router never became eligible for this render (e.g. too few frames): the
- * trial stays available for a future run either way, uncounted.
- *
- * Cross-process race semantics (no file locking exists here): the render
- * COUNTER is written exactly once, unverified — a lost increment under a
- * concurrent-writer race just under-counts the exposure cap by one
- * (benign), whereas retrying it would double-count this render whenever our
- * write actually landed but another writer raced the verify read (trips the
- * cap early, killing the trial prematurely — review finding). The FIRED
- * flag is the safety-critical bit and IS verified/re-asserted — see
- * `persistDeParallelRouterTrialFired`.
+ * Record how a router render went: a clean "routed" only counts it, any other
+ * outcome is a strike (see `deRouterBreaker.ts`), and a cancelled "routed" render is not one.
  */
 function maybeConsumeDeParallelRouterTrial(
-  trialArmed: boolean,
+  routerActive: boolean,
   job: RenderJob,
   quiet: boolean,
+  renderSucceeded = false,
 ): void {
-  if (!trialArmed) return;
+  if (!routerActive) {
+    if (renderSucceeded) countCleanRenderWithRouterOff();
+    return;
+  }
   const outcome = resolveDeParallelRouterOutcome(job);
   if (outcome === undefined) return;
 
   const config = readConfigFresh();
   const renderCount = (config.deParallelRouterTrialRenderCount ?? 0) + 1;
   config.deParallelRouterTrialRenderCount = renderCount;
-  const fired = outcome === "reverted" || renderCount >= DE_PARALLEL_ROUTER_TRIAL_MAX_RENDERS;
+  if (outcome === "routed") {
+    writeConfig(config);
+    return;
+  }
+  const breaker = afterRevert(
+    forVersion(config.deParallelRouterBreaker, VERSION),
+    revertFrom(job, outcome, renderCount),
+  );
+  config.deParallelRouterBreaker = breaker;
+  const fired = breaker.trip !== undefined;
   if (fired) {
     config.deParallelRouterTrialFired = true;
-    // Latch BEFORE attempting persistence — the decision holds for this
-    // process even if the disk write never sticks (unwritable config).
-    deParallelRouterTrialFiredThisProcess = true;
-    stopManagingDeParallelRouterTrial();
+    // Latch before persisting: the decision holds for this process even if the write never sticks.
+    deParallelRouterBreakerTrippedThisProcess = true;
+    applyDeParallelRouterBreaker();
   }
   writeConfig(config);
-  // `!quiet`-gated like every other trial message: quiet/batch-json renders
-  // must produce no unexpected terminal output — CI wrappers asserting
-  // empty stderr would misread the warning as a render failure (review
-  // finding). The in-process latch above already guarantees the safety
-  // behavior the warning describes, whether or not it prints.
-  if (fired && !persistDeParallelRouterTrialFired() && !quiet) {
-    console.warn(
-      c.warn(
-        "  Could not persist the parallel drawElement trial's off-switch to " +
-          "~/.hyperframes/config.json (unwritable?). The experiment stays off for this " +
-          "process; future runs may retry it. Set HF_DE_PARALLEL_ROUTER=false to opt out.",
-      ),
-    );
-  }
+  if (fired && !deParallelRouterUserManaged) reportDeParallelRouterBreakerTrip(quiet);
+}
+
+/**
+ * Tell the user the breaker tripped, and warn if the verdict couldn't be
+ * persisted. All output is `!quiet`-gated: quiet/batch-json renders must
+ * produce no unexpected terminal output — CI wrappers asserting empty stderr
+ * would misread a warning as a render failure (review finding). The
+ * in-process latch guarantees the safety behavior either way.
+ */
+function reportDeParallelRouterBreakerTrip(quiet: boolean): void {
+  const persisted = persistDeParallelRouterTrialFired();
+  if (quiet) return;
+  console.log(
+    c.dim(
+      "  Frames failed verification twice, so parallel drawElement capture is off for this " +
+        "install until the next version or 20 more renders. Re-enable now: " +
+        "HF_DE_PARALLEL_ROUTER=true",
+    ),
+  );
+  if (persisted) return;
+  console.warn(
+    c.warn(
+      "  Could not persist the parallel drawElement circuit breaker to " +
+        "~/.hyperframes/config.json (unwritable?). It stays off for this process; " +
+        "future runs may retry it. Set HF_DE_PARALLEL_ROUTER=false to opt out for good.",
+    ),
+  );
+}
+
+/**
+ * `job.currentStage`/`failedStage` are free-text progress labels
+ * (`updateJobStatus`'s callers each pass their own human sentence — "Compiling
+ * composition", "Extracting video frames", …), which makes an exact string
+ * property unbounded in a telemetry event. This maps the known set to a
+ * stable snake_case code, and slugifies anything unrecognized instead of
+ * bucketing it into a single opaque "unknown" — a future stage string still
+ * gets a distinct, readable code without needing this map updated first.
+ */
+const KNOWN_STAGE_CODES: Readonly<Record<string, string>> = {
+  Queued: "queued",
+  "Compiling composition": "compiling_composition",
+  "Extracting video frames": "extracting_video_frames",
+  "Processing audio tracks": "processing_audio_tracks",
+  "Starting frame capture": "starting_frame_capture",
+  "Render complete": "render_complete",
+  "Render cancelled": "render_cancelled",
+  pipeline: "pipeline",
+  "Starting browsers": "starting_browsers",
+  // Was "Encoding video" before encode reported frames; keeps the same bucket.
+  "Encoding frame": "encoding_video",
+};
+
+// Live counts in a progress label ("Capturing frame 120/600 (6 workers)") would make a code per render.
+const STAGE_COUNTS = /\([^)]*\)|\d+\/\d+|\d+ of \d+/g;
+
+export function normalizeStageCode(stage: string): string {
+  const base = stage.replace(STAGE_COUNTS, "").trim();
+  const known = KNOWN_STAGE_CODES[base];
+  if (known) return known;
+  const slug = base
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return slug || "unknown";
+}
+
+/**
+ * A Chrome launch failure is an environment problem, not a composition bug: the exact remediation for a Linux/WSL
+ * sandbox or shared-library failure, a macOS <13 dyld crash, or a Windows STATUS_STACK_BUFFER_OVERRUN, in that order.
+ */
+export function chromeLaunchFailure(
+  message: string,
+): { title: string; remediation: string } | null {
+  const detectors = [
+    sandboxDeniedRemediation,
+    chromeLaunchRemediation,
+    macosOldChromeCrashRemediation,
+  ];
+  const remediation = detectors.map((detect) => detect(message)).find(Boolean);
+  if (remediation) return { title: "Render failed — Chrome could not launch", remediation };
+  const windows = windowsChromeCrashRemediation(message);
+  return windows
+    ? { title: "Render failed — chrome-headless-shell crashed at launch", remediation: windows }
+    : null;
 }
 
 function handleRenderError(
   error: unknown,
   options: RenderOptions,
   startTime: number,
+  cpu: RenderCpuSampler,
   docker: boolean,
   hint: string,
   failedStage?: string,
   job?: RenderJob,
 ): never {
   const message = normalizeErrorMessage(error);
+  renderFailureDiagnostic(job, error, options.quiet);
   trackRenderError({
     fps: fpsToNumber(options.fps),
     quality: options.quality,
@@ -1338,11 +1994,27 @@ function handleRenderError(
     workers: options.workers,
     gpu: options.gpu,
     authoringSkill: options.authoringSkill,
+    authoringSkillSource: options.authoringSkillSource,
+    authoringSkillInvalid: options.authoringSkillInvalid,
+    hfEnvOverrides: options.hfEnvOverrides,
     elapsedMs: Date.now() - startTime,
     errorMessage: message,
     failedStage,
+    ...renderOutputShapeTelemetryPayload(options),
+    ...renderEnvironmentTelemetryPayload(options),
+    // A bucketable failure taxonomy alongside the free-text error_message
+    // above: error.name is one of ~20 typed producer error classes
+    // (CaptureFailure, DrawElementCaptureError, SwiftShaderAssertionError, …);
+    // failed_stage_code is the same job.currentStage value normalized to a
+    // stable code. Error-conditional by nature — there is no equivalent on
+    // the render_complete success path, since nothing failed to name.
+    errorName: error instanceof Error ? error.name : "unknown",
+    failedStageCode: normalizeStageCode(failedStage || "pipeline"),
+    missingPathKind: missingPathKind(error),
+    missingPath: job?.errorDetails?.missingPath,
     ...renderJobObservabilityTelemetryPayload(job),
     ...getMemorySnapshot(),
+    ...cpu.stop(),
   });
   // Failed renders join the recent-renders ring too — a bug report filed via
   // `hyperframes feedback` is MOST likely to be about a failed render.
@@ -1350,24 +2022,13 @@ function handleRenderError(
   if (options.throwOnError) {
     throw new Error(message);
   }
-  // A `Failed to launch the browser process` / `libnss3.so cannot open ...`
-  // failure on Linux/WSL is an environment problem, not a composition bug.
-  // Replace the generic "Try --docker" hint with the exact per-distro
-  // remediation and a pointer at `doctor`.
-  const remediation = chromeLaunchRemediation(message);
-  if (remediation) {
-    errorBox("Render failed — Chrome could not launch", message, remediation);
+  const shown = message.split(/\r?\n/).map(terminalText).join("\n");
+  const launch = chromeLaunchFailure(message);
+  if (launch) {
+    errorBox(launch.title, shown, launch.remediation);
     failCommand();
   }
-  // macOS <13 dyld Symbol-not-found on the pinned chrome-headless-shell
-  // build. Different remediation shape (older shell + env-var override)
-  // than the Linux shared-lib install, so it lives in its own detector.
-  const macosRemediation = macosOldChromeCrashRemediation(message);
-  if (macosRemediation) {
-    errorBox("Render failed — Chrome could not launch", message, macosRemediation);
-    failCommand();
-  }
-  errorBox("Render failed", message, hint);
+  errorBox("Render failed", shown, sourceFailureHint(error) ?? hint);
   failCommand();
 }
 
@@ -1383,6 +2044,7 @@ function trackRenderMetrics(
   elapsedMs: number,
   options: RenderOptions,
   docker: boolean,
+  cpuUsage: RenderCpuTelemetryPayload,
 ): void {
   // Successful render → recent-renders ring, so a later `hyperframes
   // feedback` can attach this render's telemetry id to the report.
@@ -1414,21 +2076,53 @@ function trackRenderMetrics(
     docker,
     gpu: options.gpu,
     authoringSkill: options.authoringSkill,
+    authoringSkillSource: options.authoringSkillSource,
+    authoringSkillInvalid: options.authoringSkillInvalid,
+    hfEnvOverrides: options.hfEnvOverrides,
+    catalogUsage: options.catalogUsage,
+    ...renderOutputShapeTelemetryPayload(options),
+    ...renderEnvironmentTelemetryPayload(options),
+    ...renderMotionBlurTelemetryPayload(perf?.motionBlur),
+    chromeBrowserRssPeakMb: perf?.chromeMemory?.browserRssPeakMb,
+    chromeRendererRssPeakMb: perf?.chromeMemory?.rendererRssPeakMb,
+    chromeRssLastMb: perf?.chromeMemory?.rssLastMb,
+    chromeGpuProcessSeenLastSample: perf?.chromeMemory?.gpuProcessSeenLastSample,
+    chromeMemorySamples: perf?.chromeMemory?.samples,
     staticDedupEnabled: perf?.staticDedup?.enabled,
     staticDedupArmed: perf?.staticDedup?.armed,
     staticDedupSkipReason: perf?.staticDedup?.skipReason,
+    staticDedupIneligibleCause: perf?.staticDedup?.ineligibleCause,
     staticDedupPredictedFrames: perf?.staticDedup?.predictedFrames,
     staticDedupReusedFrames: perf?.staticDedup?.reusedFrames,
     beginFrameNoDamageFrames: perf?.beginFrameReuse?.noDamageFrames,
     beginFrameHasDamageFrames: perf?.beginFrameReuse?.hasDamageFrames,
     deCaptureMode: perf?.drawElement?.mode,
+    vfxHostCount: perf?.drawElement?.vfxHostCount,
+    vfxCapture: perf?.drawElement?.vfxCapture,
+    vfxTypes: perf?.drawElement?.vfxTypes,
     deCompileGate: perf?.drawElement?.compileGate,
     deClampReason: perf?.drawElement?.clampReason,
     deWorkerInversion: perf?.drawElement?.workerInversion,
     dePreInversionWorkers: perf?.drawElement?.preInversionWorkers,
+    compositionElementCount: perf?.drawElement?.compositionElementCount,
+    compositionElementCountSource: perf?.drawElement?.compositionElementCountSource,
+    compositionElementTags: perf?.drawElement?.compositionElementTags,
+    arollVideoCount: perf?.drawElement?.arollVideoCount,
+    heygenVideoCount: perf?.drawElement?.heygenVideoCount,
+    adaptersUsed: perf?.drawElement?.adaptersUsed,
+    audioCount: perf?.drawElement?.audioCount,
+    imageCount: perf?.drawElement?.imageCount,
+    subCompositionCount: perf?.drawElement?.subCompositionCount,
+    audioGroupCount: perf?.drawElement?.audioGroupCount,
+    colorGradingCount: perf?.drawElement?.colorGradingCount,
+    hasLut: perf?.drawElement?.hasLut,
+    rootBodyMismatch: perf?.drawElement?.rootBodyMismatch,
+    rootBodyDeltaPxBucket: perf?.drawElement?.rootBodyDeltaPxBucket,
+    deShortBand: perf?.drawElement?.shortBand,
     deParallelRouter: perf?.drawElement?.parallelRouter,
     dePreRouterWorkers: perf?.drawElement?.preRouterWorkers,
     deGateReason: perf?.drawElement?.gateReason,
+    gpuRenderer: perf?.drawElement?.gpuRenderer,
     deWorkerEncode: perf?.drawElement?.workerEncode,
     deVerifyArmed: perf?.drawElement?.verifyArmed,
     deVerifyChecked: perf?.drawElement?.verifyChecked,
@@ -1439,11 +2133,14 @@ function trackRenderMetrics(
     deFallbackFailedDb: perf?.drawElement?.fallbackFailedDb,
     deFallbackFrameIndex: perf?.drawElement?.fallbackFrameIndex,
     deFallbackThresholdDb: perf?.drawElement?.fallbackThresholdDb,
+    deRouterBreakerOff: deParallelRouterBreakerTrippedThisProcess || undefined,
     deBlankSuspects: perf?.drawElement?.blankSuspects,
     deBlankDeterministicAccepts: perf?.drawElement?.blankDeterministicAccepts,
     deBlankRecaptures: perf?.drawElement?.blankRecaptures,
     deBoundaryFrames: perf?.drawElement?.boundaryFrames,
+    deRiskFrames: perf?.drawElement?.riskFrames,
     deNcprFallbacks: perf?.drawElement?.ncprFallbacks,
+    deFrameTimeouts: perf?.drawElement?.frameTimeouts,
     compositionDurationMs,
     compositionWidth: perf?.resolution.width,
     compositionHeight: perf?.resolution.height,
@@ -1451,6 +2148,10 @@ function trackRenderMetrics(
     speedRatio,
     captureAvgMs: perf?.captureAvgMs,
     captureP50Ms: perf?.captureP50Ms,
+    captureSeekAvgMs: perf?.captureSeekAvgMs,
+    captureBeforeCaptureAvgMs: perf?.captureBeforeCaptureAvgMs,
+    captureScreenshotAvgMs: perf?.captureScreenshotAvgMs,
+    encoderWaitAvgMs: perf?.encoderWaitAvgMs,
     subTimelineWait: perf?.subTimelineWait,
     videoCount: perf?.videoCount,
     capturePeakMs: perf?.capturePeakMs,
@@ -1475,51 +2176,87 @@ function trackRenderMetrics(
     extractCacheMisses: extract?.cacheMisses,
     ...renderJobObservabilityTelemetryPayload(job),
     ...getMemorySnapshot(),
+    ...cpuUsage,
   });
 }
 
-function printRenderComplete(
-  outputPath: string,
-  elapsedMs: number,
-  quiet: boolean,
-  outputDurationSeconds?: number,
-  frameCount?: number,
-): void {
-  if (quiet) return;
-
-  let fileSize = "unknown";
-  let isDirectory = false;
+function readOutputFootprint(outputPath: string): { fileSize: string; isDirectory: boolean } {
   try {
     const stat = statSync(outputPath);
-    isDirectory = stat.isDirectory();
-    if (stat.isDirectory()) {
-      // png-sequence output is a directory; sum the contained file sizes so
-      // the user sees the on-disk footprint of the deliverable rather than
-      // the platform-specific size of the directory inode itself.
-      let total = 0;
-      for (const entry of readdirSync(outputPath, { withFileTypes: true })) {
-        if (!entry.isFile()) continue;
-        try {
-          total += statSync(join(outputPath, entry.name)).size;
-        } catch {
-          // skip unreadable entries
-        }
+    if (!stat.isDirectory()) return { fileSize: formatBytes(stat.size), isDirectory: false };
+    // png-sequence and hls write a directory; sum contained file sizes so the
+    // user sees the deliverable footprint, not the directory inode size.
+    let total = 0;
+    for (const entry of readdirSync(outputPath, { withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      try {
+        total += statSync(join(outputPath, entry.name)).size;
+      } catch {
+        // skip unreadable entries
       }
-      fileSize = formatBytes(total);
-    } else {
-      fileSize = formatBytes(stat.size);
     }
+    return { fileSize: formatBytes(total), isDirectory: true };
   } catch {
-    // file doesn't exist or is inaccessible
+    return { fileSize: "unknown", isDirectory: false };
   }
+}
 
+/** A render points to the desktop app; a batch row does not. Drafts do too. */
+export function wantsDesktopHint(options: Pick<RenderOptions, "desktopHint">): boolean {
+  return options.desktopHint !== false;
+}
+
+function printRenderComplete(input: {
+  outputPath: string;
+  projectDir: string;
+  /** Print the desktop-app line: a delivered render, never a draft or a batch row. */
+  desktopHint: boolean;
+  elapsedMs: number;
+  quiet: boolean;
+  format: RenderFormat;
+  perf?: RenderPerfSummary;
+  requestedGpuMode?: "auto" | "hardware" | "software";
+}): void {
+  if (input.quiet) return;
+  const { outputPath, elapsedMs, perf } = input;
+  const { fileSize, isDirectory } = readOutputFootprint(outputPath);
   const detail = formatRenderSummaryDetail({
     elapsedMs,
-    outputDurationSeconds,
+    outputDurationSeconds: perf?.compositionDurationSeconds,
     isDirectory,
-    frameCount,
+    frameCount: perf?.totalFrames,
+    playlistDirectory: input.format === "hls",
   });
   console.log("");
-  console.log(c.success("\u25C7") + "  " + c.accent(outputPath));
+  console.log(c.success("\u25C7") + "  " + c.accent(terminalText(outputPath)));
   console.log("   " + c.bold(fileSize) + c.dim(" \u00B7 " + detail));
+  if (perf) printRenderPipeline(perf, input.requestedGpuMode);
+  const hint = input.desktopHint ? desktopHint(input.projectDir) : null;
+  if (hint) console.log("   " + c.dim(terminalText(hint)));
+}
+
+function printRenderPipeline(
+  perf: RenderPerfSummary,
+  requestedGpuMode?: "auto" | "hardware" | "software",
+): void {
+  // aggregateDrawElement reports "unknown" when no session recorded a mode.
+  const capture = {
+    captureMode: resolvePrintedCaptureMode(
+      perf.drawElement?.mode,
+      perf.observability?.capture.captureMode,
+    ),
+    browserGpuMode: perf.observability?.capture.browserGpuMode,
+  };
+  const pipeline = formatRenderPipelineDetail({
+    ...capture,
+    streamingEncode: perf.observability?.capture.useStreamingEncode,
+    stages: perf.stages,
+  });
+  if (pipeline) console.log("   " + c.dim(pipeline));
+  const hint = formatScreenshotFallbackHint({
+    ...capture,
+    requestedGpuMode,
+    platform: process.platform,
+  });
+  if (hint) console.log("   " + c.dim(hint));
 }

@@ -55,6 +55,33 @@ export interface ParsableDocumentLike {
   documentElement: { outerHTML?: string } | null;
   body?: { innerHTML?: string | null } | null;
   querySelector(selector: string): { innerHTML?: string | null } | null;
+  querySelectorAll(selector: string): ArrayLike<{ innerHTML?: string | null } & SceneTemplateLike>;
+}
+
+export interface SceneTemplateLike {
+  content: { querySelector(selector: string): unknown };
+}
+
+export function findSceneTemplate<T extends SceneTemplateLike>(
+  templates: ArrayLike<T>,
+): T | undefined {
+  return Array.from(templates).find(
+    (template) => template.content.querySelector("[data-composition-id]") != null,
+  );
+}
+
+/** Resolve authored content without invoking linkedom's synthetic body getter. */
+export function resolveSubCompositionContent(html: string, document: ParsableDocumentLike) {
+  const templates = Array.from(document.querySelectorAll("template"));
+  const template = findSceneTemplate(templates) ?? templates[0];
+  if (template) return { contentHtml: template.innerHTML ?? "", hasTemplate: true };
+
+  const body = document.querySelector("body");
+  if (body) return { contentHtml: body.innerHTML ?? "", hasTemplate: false };
+
+  // Browsers create a body for bare fragments; linkedom keeps their top-level nodes.
+  const contentHtml = document.querySelector("html") ? "" : html;
+  return { contentHtml, hasTemplate: false };
 }
 
 /**
@@ -63,7 +90,7 @@ export interface ParsableDocumentLike {
  * that actually contains renderable content.
  *
  * Mirrors the content-detection steps in `inlineSubCompositions` exactly
- * (resolve → parse → find `<template>` or `<body>` content → parse that →
+ * (resolve → parse → resolve template, body, or fragment content → parse that →
  * confirm a `[data-composition-id]` root exists in it), so a file that
  * passes this check is guaranteed to produce non-empty output from the
  * inliner, and a file that fails it is guaranteed to hit one of the
@@ -97,10 +124,7 @@ export function checkSubCompositionUsability(
     };
   }
 
-  // Find content: prefer <template>, fall back to <body> — same precedence
-  // inlineSubCompositions uses when extracting the sub-composition's markup.
-  const contentRoot = compDoc.querySelector("template");
-  const contentHtml = contentRoot ? contentRoot.innerHTML || "" : compDoc.body?.innerHTML || "";
+  const { contentHtml } = resolveSubCompositionContent(html, compDoc);
   if (!contentHtml.trim()) {
     return {
       ok: false,
@@ -114,7 +138,7 @@ export function checkSubCompositionUsability(
     return {
       ok: false,
       reason: "unparsable",
-      detail: "the file's <template>/<body> contents could not be parsed as HTML",
+      detail: "the file's resolved contents could not be parsed as HTML",
     };
   }
 
@@ -127,8 +151,7 @@ export function checkSubCompositionUsability(
     return {
       ok: false,
       reason: "no-composition-root",
-      detail:
-        "the file's <template>/<body> content has no element with a data-composition-id attribute",
+      detail: "the file's resolved content has no element with a data-composition-id attribute",
     };
   }
 

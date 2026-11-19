@@ -6,11 +6,36 @@ describe("classifyCaptureFailure", () => {
     ["Target closed", "transient_browser"],
     ["Runtime.callFunctionOn timed out after 30000ms", "protocol_timeout"],
     ["Runtime.evaluate timed out", "protocol_timeout"],
+    ["Network.enable timed out. Increase the protocolTimeout setting.", "protocol_timeout"],
+    ["[Parallel] Capture failed: Worker 0: Network.enable timed out", "protocol_timeout"],
+    [
+      "Page.captureScreenshot timed out. Increase the 'protocolTimeout' setting in launch/connect calls for a higher timeout if needed.",
+      "protocol_timeout",
+    ],
     ["drawElement worker encode timed out (frame 42)", "protocol_timeout"],
     ["Waiting failed: 30000ms exceeded", "protocol_timeout"],
     ["JavaScript heap out of memory", "memory_exhaustion"],
     ["drawElement self-verify failed", "verification"],
     ["Composition has zero duration. Runtime ready: true", "authoring"],
+    ["[FrameCapture] Composition setup did not finish within 45000ms.", "transient_browser"],
+    ["Protocol error (Page.captureScreenshot): Unable to capture screenshot", "transient_browser"],
+    [
+      "[Parallel] Capture failed: Worker 0: Protocol error (Page.captureScreenshot): Unable to capture screenshot",
+      "transient_browser",
+    ],
+    // The timed-out variant of the same call stays protocol_timeout (checked first).
+    ["Protocol error (Page.captureScreenshot): waiting for debugger timed out", "protocol_timeout"],
+    // A full disk and a struggling browser are the host's failure, never the composition's.
+    ["The disk filled up while video frames were extracted", "io"],
+    [
+      "[Parallel] Capture failed: Worker 0: net::ERR_INSUFFICIENT_RESOURCES at http://localhost:63145/index.html",
+      "transient_browser",
+    ],
+    [
+      "[FrameCapture] window.__hf not ready after 45000ms. Page must expose window.__hf = { duration, seek }.\nState: __hf=true, seek=true, player=true, renderReady=true, duration=241.5",
+      "transient_browser",
+    ],
+    ["something no rule names", "unknown"],
   ] as const)("classifies %s as %s", (message, kind) => {
     expect(classifyCaptureFailure(new Error(message)).kind).toBe(kind);
   });
@@ -56,12 +81,26 @@ describe("classifyCaptureFailure", () => {
     expect(Object.isFrozen(failure.workerDiagnostics[0]?.lines)).toBe(true);
   });
 
+  it("classifies a broken encoder pipe as io, not authoring", () => {
+    // The streaming encoder's stdin write fails this way when ffmpeg dies
+    // first. Bucketed as authoring, PostHog blamed the composition for a host
+    // event and the cohort could not be root-caused.
+    for (const code of ["EPIPE", "EOF", "ECONNRESET"]) {
+      const withCode = Object.assign(new Error(`write ${code}`), { code });
+      expect(classifyCaptureFailure(withCode).kind).toBe("io");
+      // Flattened through a worker-pool message boundary the code is lost;
+      // the message alone must still classify.
+      expect(classifyCaptureFailure(new Error(`[Parallel] write ${code}`)).kind).toBe("io");
+    }
+    expect(classifyCaptureFailure(new Error("write to EPIPEline")).kind).toBe("unknown");
+  });
+
   it("classifies repeated operation text in linear time", () => {
     const repeatedCopy = "copy".repeat(25_000);
 
-    expect(classifyCaptureFailure(new Error(repeatedCopy)).kind).toBe("authoring");
+    expect(classifyCaptureFailure(new Error(repeatedCopy)).kind).toBe("unknown");
     expect(classifyCaptureFailure(new Error(`${repeatedCopy} failed`)).kind).toBe("io");
-    expect(classifyCaptureFailure(new Error("copy\nfailed")).kind).toBe("authoring");
+    expect(classifyCaptureFailure(new Error("copy\nfailed")).kind).toBe("unknown");
   });
 
   it("marks structural failures fatal but leaves retryable failures non-fatal", () => {
@@ -69,9 +108,31 @@ describe("classifyCaptureFailure", () => {
       isFatalCaptureFailure(new CaptureFailure({ kind: "authoring", message: "bad source" })),
     ).toBe(true);
     expect(
+      isFatalCaptureFailure(new CaptureFailure({ kind: "unknown", message: "unnamed failure" })),
+    ).toBe(true);
+    expect(
       isFatalCaptureFailure(
         new CaptureFailure({ kind: "protocol_timeout", message: "protocol timeout" }),
       ),
     ).toBe(false);
+  });
+});
+
+describe("classifyCaptureFailure page errors", () => {
+  it("carries the page's error lines onto the classified failure", () => {
+    const failure = classifyCaptureFailure(new Error("Target closed"), {
+      pageErrorLines: ["[Browser:PAGEERROR] script threw"],
+    });
+    expect(failure.pageErrorLines).toEqual(["[Browser:PAGEERROR] script threw"]);
+  });
+
+  it("keeps the lines when an existing failure is reclassified", () => {
+    const original = new CaptureFailure({
+      kind: "transient_browser",
+      message: "Target closed",
+      pageErrorLines: ["[Browser:PAGEERROR] script threw"],
+    });
+    const failure = classifyCaptureFailure(original, { workerDiagnostics: [] });
+    expect(failure.pageErrorLines).toEqual(["[Browser:PAGEERROR] script threw"]);
   });
 });

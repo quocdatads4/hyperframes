@@ -1,36 +1,38 @@
-import { useCallback, type ReactNode } from "react";
+import { memo, useCallback, type ReactNode } from "react";
+import { matchesKey } from "../player/components/studioShortcuts";
 import { PreviewPane } from "./nle/PreviewPane";
+import { PreviewStage } from "./storyboard/PreviewStage";
 import { TimelinePane } from "./nle/TimelinePane";
 import { PreviewOverlays } from "./nle/PreviewOverlays";
+import { PreviewReadOnlyProvider } from "./editor/previewReadOnlyContext";
 import {
   useTimelineEditCallbacks,
   type TimelineEditCallbackDeps,
 } from "./nle/useTimelineEditCallbacks";
 import { NLEProvider, useNLEContext } from "./nle/NLEContext";
 import { CaptionTimeline } from "../captions/components/CaptionTimeline";
-import { StudioFeedbackBar } from "./StudioFeedbackBar";
 import { useStudioPlaybackContext, useStudioShellContext } from "../contexts/StudioContext";
-import { useDomEditActionsContext } from "../contexts/DomEditContext";
+import { useDomEditActionsContext, useDomEditSelectionContext } from "../contexts/DomEditContext";
 import { TimelineEditProvider } from "../contexts/TimelineEditContext";
-import type { TimelineElement } from "../player";
+import { usePlayerStore, type TimelineElement } from "../player";
 import type { BlockPreviewInfo } from "./sidebar/BlocksTab";
 import type { GestureRecordingState } from "./editor/GestureRecordControl";
+import { useTimelineSelectionPreviewSync } from "../hooks/useTimelineSelectionPreviewSync";
+import { StudioAgentTools } from "../webmcp/StudioAgentTools";
+import type { TimelineDropPlacement } from "../player/components/timelineCallbacks";
+import type { TimelineProps } from "../player/components/TimelineTypes";
+import { Dock } from "./dock/Dock";
 
 type RenderClipContent = (
   element: TimelineElement,
   style: { clip: string; label: string },
 ) => ReactNode;
-type TimelineDropPlacement = Pick<TimelineElement, "start" | "track">;
 
 // The seven move/resize/split/razor handlers come from TimelineEditCallbackDeps
 // (shared with useTimelineEditCallbacks); the rest are drop + wiring props.
 export interface EditorShellProps extends TimelineEditCallbackDeps {
-  /** Left sidebar (media/library), rendered in the top row. */
-  left: ReactNode;
-  /** Right panel (inspector/design) or null when collapsed, in the top row. */
-  right: ReactNode;
-  /** Hide the whole shell (e.g. while the storyboard view is active). */
-  hidden?: boolean;
+  /** Dock.Panel elements for every panel except the built-in preview and timeline. */
+  panels: ReactNode;
   timelineToolbar: ReactNode;
   renderClipContent: RenderClipContent;
   handleTimelineElementDelete: (element: TimelineElement) => Promise<void> | void;
@@ -54,23 +56,36 @@ export interface EditorShellProps extends TimelineEditCallbackDeps {
     files: File[],
     placement?: TimelineDropPlacement,
   ) => Promise<void> | void;
+  onCopyClip: () => boolean;
+  onPasteClip: () => Promise<void>;
+  onDuplicateClip: () => Promise<boolean>;
+  canPasteClip: () => boolean;
+  clipMenuItems?: TimelineProps["clipMenuItems"];
+  splitShortcut?: TimelineProps["splitShortcut"];
   setCompIdToSrc: (map: Map<string, string>) => void;
   setCompositionLoading: (loading: boolean) => void;
+  shouldShowMotionPath: boolean;
   shouldShowSelectedDomBounds: boolean;
   blockPreview?: BlockPreviewInfo | null;
   isGestureRecording?: boolean;
   recordingState?: GestureRecordingState;
   onToggleRecording?: () => void;
+  /**
+   * Host layer over the preview, positioned with `usePreviewCompositionRect`. Hidden in
+   * fullscreen and during a block preview; below the selection overlay past z-index 10.
+   */
   gestureOverlay?: ReactNode;
+  /** Clicks still select and report; the preview cannot move, edit or delete anything. */
+  readOnlyPreview?: boolean;
+  /** Short text shown on disabled hand-edit controls while `readOnlyPreview` is set. */
+  readOnlyPreviewReason?: string;
 }
 
-// The CapCut-style shell: [left | preview | right] in a top row, with a
-// full-width timeline spanning the bottom. Owns the shared player +
-// composition-stack state via NLEProvider so both rows share one player.
-export function EditorShell({
-  left,
-  right,
-  hidden,
+// The dockable shell: every panel lives in one Dock, arranged by the user's
+// saved layout. Owns the shared player + composition-stack state via
+// NLEProvider so every panel shares one player.
+export const EditorShell = memo(function EditorShell({
+  panels,
   timelineToolbar,
   renderClipContent,
   handleTimelineElementDelete,
@@ -84,23 +99,63 @@ export function EditorShell({
   handleTimelineElementResize,
   handleTimelineGroupResize,
   handleToggleTrackHidden,
+  setAudioGroupAttribute,
+  handleGroupClips,
+  setElementFxAttribute,
   handleBlockedTimelineEdit,
   handleTimelineElementSplit,
   handleRazorSplit,
   handleRazorSplitAll,
+  handleFreezeFrame,
+  handleLinkEdit,
+  handleTimelineElementDeleteOnly,
+  onCopyClip,
+  onPasteClip,
+  onDuplicateClip,
+  canPasteClip,
+  clipMenuItems,
+  splitShortcut,
   setCompIdToSrc,
   setCompositionLoading,
+  shouldShowMotionPath,
   shouldShowSelectedDomBounds,
   isGestureRecording,
   recordingState,
   onToggleRecording,
   blockPreview,
   gestureOverlay,
+  readOnlyPreview = false,
+  readOnlyPreviewReason,
 }: EditorShellProps) {
-  const { projectId, activeCompPath, setActiveCompPath, handlePreviewIframeRef } =
+  const { projectId, activeCompPath, setActiveCompPath, handlePreviewIframeRef, showToast } =
     useStudioShellContext();
-  const { refreshKey, captionEditMode, refreshPreviewDocumentVersion } = useStudioPlaybackContext();
-  const { handleTimelineElementSelect } = useDomEditActionsContext();
+  const { refreshKey, captionEditMode, refreshPreviewDocumentVersion, timelineElements } =
+    useStudioPlaybackContext();
+  const {
+    handleTimelineElementSelect,
+    buildDomSelectionForTimelineElement,
+    applyDomSelection,
+    applyMarqueeSelection,
+  } = useDomEditActionsContext();
+  const { domEditSelection, domEditGroupSelections } = useDomEditSelectionContext();
+  const selectedElementId = usePlayerStore((state) => state.selectedElementId);
+  const selectedElementIds = usePlayerStore((state) => state.selectedElementIds);
+  const reportTimelineSelectionNotFound = useCallback(() => {
+    showToast("The selected clip is not available in the preview yet.", "info");
+  }, [showToast]);
+
+  useTimelineSelectionPreviewSync({
+    selectedElementId,
+    selectedElementIds,
+    timelineElements,
+    domEditSelection,
+    domEditGroupSelections,
+    activeCompPath,
+    buildDomSelectionForTimelineElement,
+    applyDomSelection,
+    applyMarqueeSelection,
+    onSelectionNotFound: reportTimelineSelectionNotFound,
+  });
 
   const timelineEditCallbacks = useTimelineEditCallbacks({
     handleTimelineElementMove,
@@ -108,66 +163,81 @@ export function EditorShell({
     handleTimelineElementResize,
     handleTimelineGroupResize,
     handleToggleTrackHidden,
+    setAudioGroupAttribute,
+    handleGroupClips,
+    setElementFxAttribute,
     handleBlockedTimelineEdit,
     handleTimelineElementSplit,
     handleRazorSplit,
     handleRazorSplitAll,
+    handleFreezeFrame,
+    handleLinkEdit,
+    handleTimelineElementDeleteOnly,
   });
 
   return (
-    <div className={`flex flex-col flex-1 min-h-0${hidden ? " hidden" : ""}`}>
-      <TimelineEditProvider value={timelineEditCallbacks}>
-        <NLEProvider
-          projectId={projectId}
-          refreshKey={refreshKey}
-          activeCompositionPath={activeCompPath}
-          onIframeRef={handlePreviewIframeRef}
-          onCompIdToSrcChange={setCompIdToSrc}
-          onCompositionLoadingChange={setCompositionLoading}
-          onCompositionChange={(compPath) => {
-            // Sync activeCompPath when the user drills down via the timeline or
-            // navigates back — keeps sidebar + thumbnails in sync. Guard no-ops to
-            // avoid circular refresh cascades (activeCompPath → stack → onChange).
-            if (compPath !== activeCompPath) {
-              setActiveCompPath(compPath);
-              refreshPreviewDocumentVersion();
-            }
-          }}
-        >
-          <EditorShellBody
-            left={left}
-            right={right}
-            captionEditMode={captionEditMode}
-            onSelectTimelineElement={handleTimelineElementSelect}
-            onPreviewBlockDrop={handlePreviewBlockDrop}
-            timelineToolbar={timelineToolbar}
-            renderClipContent={renderClipContent}
-            onFileDrop={handleTimelineFileDrop}
-            onAssetDrop={handleTimelineAssetDrop}
-            onBlockDrop={handleTimelineBlockDrop}
-            onCompositionDrop={handleTimelineCompositionDrop}
-            onDeleteElement={handleTimelineElementDelete}
-            previewOverlay={
-              <PreviewOverlays
-                shouldShowSelectedDomBounds={shouldShowSelectedDomBounds}
-                blockPreview={blockPreview}
-                isGestureRecording={isGestureRecording}
-                recordingState={recordingState}
-                onToggleRecording={onToggleRecording}
-                gestureOverlay={gestureOverlay}
-              />
-            }
-          />
-        </NLEProvider>
-      </TimelineEditProvider>
-      <StudioFeedbackBar />
-    </div>
+    <PreviewReadOnlyProvider readOnly={readOnlyPreview} reason={readOnlyPreviewReason}>
+      <div className="flex flex-col flex-1 min-h-0">
+        <TimelineEditProvider value={timelineEditCallbacks}>
+          <NLEProvider
+            projectId={projectId}
+            refreshKey={refreshKey}
+            activeCompositionPath={activeCompPath}
+            onIframeRef={handlePreviewIframeRef}
+            onCompIdToSrcChange={setCompIdToSrc}
+            onPreviewReloadFailed={(message) => showToast(message, "error")}
+            onCompositionLoadingChange={setCompositionLoading}
+            onCompositionChange={(compPath) => {
+              // Sync activeCompPath when the user drills down via the timeline or
+              // navigates back — keeps sidebar + thumbnails in sync. Guard no-ops to
+              // avoid circular refresh cascades (activeCompPath → stack → onChange).
+              if (compPath !== activeCompPath) {
+                setActiveCompPath(compPath);
+                refreshPreviewDocumentVersion();
+              }
+            }}
+          >
+            <EditorShellBody
+              projectId={projectId}
+              panels={panels}
+              captionEditMode={captionEditMode}
+              onSelectTimelineElement={handleTimelineElementSelect}
+              onPreviewBlockDrop={handlePreviewBlockDrop}
+              timelineToolbar={timelineToolbar}
+              renderClipContent={renderClipContent}
+              onFileDrop={handleTimelineFileDrop}
+              onAssetDrop={handleTimelineAssetDrop}
+              onBlockDrop={handleTimelineBlockDrop}
+              onCompositionDrop={handleTimelineCompositionDrop}
+              onDeleteElement={handleTimelineElementDelete}
+              onCopyClip={onCopyClip}
+              onPasteClip={onPasteClip}
+              onDuplicateClip={onDuplicateClip}
+              canPasteClip={canPasteClip}
+              clipMenuItems={clipMenuItems}
+              splitShortcut={splitShortcut}
+              previewOverlay={
+                <PreviewOverlays
+                  shouldShowMotionPath={shouldShowMotionPath}
+                  shouldShowSelectedDomBounds={shouldShowSelectedDomBounds}
+                  blockPreview={blockPreview}
+                  isGestureRecording={isGestureRecording}
+                  recordingState={recordingState}
+                  onToggleRecording={onToggleRecording}
+                  gestureOverlay={gestureOverlay}
+                />
+              }
+            />
+          </NLEProvider>
+        </TimelineEditProvider>
+      </div>
+    </PreviewReadOnlyProvider>
   );
-}
+});
 
 interface EditorShellBodyProps {
-  left: ReactNode;
-  right: ReactNode;
+  panels: ReactNode;
+  projectId: string;
   captionEditMode: boolean;
   previewOverlay: ReactNode;
   onSelectTimelineElement: (element: TimelineElement | null) => void;
@@ -185,11 +255,17 @@ interface EditorShellBodyProps {
     placement: TimelineDropPlacement,
   ) => Promise<void> | void;
   onDeleteElement: (element: TimelineElement) => Promise<void> | void;
+  onCopyClip: () => boolean;
+  onPasteClip: () => Promise<void>;
+  onDuplicateClip: () => Promise<boolean>;
+  canPasteClip: () => boolean;
+  clipMenuItems?: TimelineProps["clipMenuItems"];
+  splitShortcut?: TimelineProps["splitShortcut"];
 }
 
 function EditorShellBody({
-  left,
-  right,
+  panels,
+  projectId,
   captionEditMode,
   previewOverlay,
   onSelectTimelineElement,
@@ -201,13 +277,25 @@ function EditorShellBody({
   onBlockDrop,
   onCompositionDrop,
   onDeleteElement,
+  onCopyClip,
+  onPasteClip,
+  onDuplicateClip,
+  canPasteClip,
+  clipMenuItems,
+  splitShortcut,
 }: EditorShellBodyProps) {
   const { compositionStack, updateCompositionStack, containerRef } = useNLEContext();
+
+  // The caption track's blocks are seek targets; CaptionTimeline took an onSeek
+  // prop that nothing ever passed, so clicking a block did nothing.
+  const seekCaptionTime = useCallback((time: number) => {
+    usePlayerStore.getState().requestSeek(time);
+  }, []);
 
   // Keyboard: Escape to pop composition level
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      if (e.key === "Escape" && compositionStack.length > 1) {
+      if (matchesKey(e, "cancel") && compositionStack.length > 1) {
         updateCompositionStack((prev) => prev.slice(0, -1));
       }
     },
@@ -217,49 +305,57 @@ function EditorShellBody({
   return (
     <div
       ref={containerRef}
-      // Shell canvas is a step LIGHTER than the near-black panel cards so the
-      // gaps between panels read as visible seams (CapCut-style).
-      className="flex flex-col flex-1 min-h-0 bg-[#18181B]"
+      className="flex flex-col flex-1 min-h-0"
       onKeyDown={handleKeyDown}
       tabIndex={-1}
     >
-      {/* Top row: [left | preview | right] — outer padding + the 8px resize
-          seams give the panels CapCut-style separation on the dark canvas. */}
-      <div className="flex flex-row flex-1 min-h-0 px-px pt-px">
-        {left}
-        <div className="flex-1 min-w-0 flex flex-col relative">
-          <PreviewPane
-            previewOverlay={previewOverlay}
-            onSelectTimelineElement={onSelectTimelineElement}
-            onPreviewBlockDrop={onPreviewBlockDrop}
-          />
-        </div>
-        {right}
-      </div>
-
-      {/* Full-width timeline row */}
-      <TimelinePane
-        timelineToolbar={timelineToolbar}
-        renderClipContent={renderClipContent}
-        onFileDrop={onFileDrop}
-        onAssetDrop={onAssetDrop}
-        onBlockDrop={onBlockDrop}
-        onCompositionDrop={onCompositionDrop}
-        onDeleteElement={onDeleteElement}
-        onSelectTimelineElement={onSelectTimelineElement}
-        timelineFooter={
-          captionEditMode ? (
-            <div className="border-t border-neutral-800/30 flex-shrink-0" style={{ height: 60 }}>
-              <div className="flex items-center gap-1.5 px-2 py-0.5">
-                <span className="text-[9px] font-medium text-neutral-500 uppercase tracking-wider">
-                  Captions
-                </span>
-              </div>
-              <CaptionTimeline pixelsPerSecond={100} />
+      {/* Renders nothing; exposes Studio's state to an agentic browser. Mounted
+          here rather than in App because it needs the DomEdit contexts. */}
+      <StudioAgentTools />
+      <Dock.Root projectId={projectId}>
+        <Dock.Panel id="preview">
+          <PreviewStage projectId={projectId}>
+            <div className="relative flex h-full w-full min-w-0 flex-col">
+              <PreviewPane
+                previewOverlay={previewOverlay}
+                onSelectTimelineElement={onSelectTimelineElement}
+                onPreviewBlockDrop={onPreviewBlockDrop}
+              />
             </div>
-          ) : undefined
-        }
-      />
+          </PreviewStage>
+        </Dock.Panel>
+        <Dock.Panel id="timeline">
+          <TimelinePane
+            timelineToolbar={timelineToolbar}
+            renderClipContent={renderClipContent}
+            onFileDrop={onFileDrop}
+            onAssetDrop={onAssetDrop}
+            onBlockDrop={onBlockDrop}
+            onCompositionDrop={onCompositionDrop}
+            onDeleteElement={onDeleteElement}
+            onCopyClip={onCopyClip}
+            onPasteClip={onPasteClip}
+            onDuplicateClip={onDuplicateClip}
+            canPasteClip={canPasteClip}
+            clipMenuItems={clipMenuItems}
+            splitShortcut={splitShortcut}
+            onSelectTimelineElement={onSelectTimelineElement}
+            timelineFooter={
+              captionEditMode ? (
+                <div className="border-t border-neutral-800/30 shrink-0" style={{ height: 60 }}>
+                  <div className="flex items-center gap-1.5 px-2 py-0.5">
+                    <span className="text-[9px] font-medium text-neutral-500 uppercase tracking-wider">
+                      Captions
+                    </span>
+                  </div>
+                  <CaptionTimeline pixelsPerSecond={100} onSeek={seekCaptionTime} />
+                </div>
+              ) : undefined
+            }
+          />
+        </Dock.Panel>
+        {panels}
+      </Dock.Root>
     </div>
   );
 }

@@ -10,16 +10,40 @@
 
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
+import { answerOwnLoopbackHostOnly, settleOnBrowserSafePort } from "@hyperframes/engine";
 import type { IncomingMessage } from "node:http";
-import { existsSync, realpathSync, statSync, createReadStream } from "node:fs";
-import { readFile } from "node:fs/promises";
+import {
+  existsSync,
+  realpathSync,
+  statSync,
+  createReadStream,
+  openSync,
+  fstatSync,
+  closeSync,
+  constants,
+  readFile,
+} from "node:fs";
+import { promisify } from "node:util";
+
 import { Readable } from "node:stream";
 import { join, extname, resolve, sep } from "node:path";
 import { injectScriptsAtHeadStart, injectScriptsIntoHtml } from "@hyperframes/core/compiler";
-import { fpsToNumber, type Fps } from "@hyperframes/core";
+import { injectTagsAtHeadStart } from "@hyperframes/core/compiler/html-document";
+import {
+  PREVIEW_FOR_ANOTHER_SITE_META,
+  serviceWorkerScriptFetch,
+} from "@hyperframes/core/studio-preview-mark";
+import { fpsToNumber, type Fps, terminalText } from "@hyperframes/core";
+import { isPrivateFileUnder, isStudioPrivatePath } from "@hyperframes/core/safe-path";
+import { stripSdrPngColourTags } from "@hyperframes/core/compiler/png-colour-tags";
+import { openRangeEnd } from "@hyperframes/studio-server/media-range";
 import { getVerifiedHyperframeRuntimeSource } from "./hyperframeRuntimeLoader.js";
+import { servedPath } from "./servedPath.js";
 import { getHfEarlyStub } from "../generated/hf-early-stub-inline.js";
 import { defaultLogger, type ProducerLogger } from "../logger.js";
+import { refusesOutsideLink } from "../utils/paths.js";
+
+const readFileAsync = promisify(readFile);
 
 export { injectScriptsAtHeadStart };
 
@@ -80,6 +104,7 @@ const MIME_TYPES: Record<string, string> = {
   ".css": "text/css; charset=utf-8",
   ".js": "application/javascript; charset=utf-8",
   ".mjs": "application/javascript; charset=utf-8",
+  ".cjs": "application/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
   ".cube": "text/plain; charset=utf-8",
   ".png": "image/png",
@@ -88,12 +113,17 @@ const MIME_TYPES: Record<string, string> = {
   ".gif": "image/gif",
   ".svg": "image/svg+xml",
   ".webp": "image/webp",
+  ".avif": "image/avif",
+  ".ico": "image/vnd.microsoft.icon",
   ".mp4": "video/mp4",
+  ".mov": "video/quicktime",
   ".webm": "video/webm",
   ".mp3": "audio/mpeg",
   ".wav": "audio/wav",
   ".ogg": "audio/ogg",
   ".aac": "audio/aac",
+  ".flac": "audio/flac",
+  ".m4a": "audio/mp4",
   ".woff": "font/woff",
   ".woff2": "font/woff2",
   ".ttf": "font/ttf",
@@ -124,7 +154,7 @@ export type RangeRequest =
  *
  * Supports the three forms of `bytes=...`:
  *   - `bytes=START-END`: closed range, both bounds inclusive.
- *   - `bytes=START-`: open-ended, serve from START to EOF.
+ *   - `bytes=start-`: open-ended, from start to EOF (audio/video: see `openRangeEnd`).
  *   - `bytes=-SUFFIX`: last SUFFIX bytes.
  *
  * Multi-range requests (`bytes=0-99,200-299`) are treated as `absent`. The
@@ -134,7 +164,11 @@ export type RangeRequest =
  *
  * Exported for unit tests; not part of the public package surface.
  */
-export function parseRangeHeader(header: string | null | undefined, size: number): RangeRequest {
+export function parseRangeHeader(
+  header: string | null | undefined,
+  size: number,
+  contentType = "application/octet-stream",
+): RangeRequest {
   if (!header) return { kind: "absent" };
   const match = /^\s*bytes\s*=\s*(.*?)\s*$/i.exec(header);
   if (!match) return { kind: "absent" };
@@ -163,10 +197,10 @@ export function parseRangeHeader(header: string | null | undefined, size: number
   const start = Number(rawStart);
   if (!Number.isFinite(start)) return { kind: "absent" };
 
-  // Open-ended form: `bytes=START-` returns from START to EOF.
+  // Open-ended form: `bytes=start-` returns from start to EOF, or one bounded piece of audio/video.
   if (rawEnd === "") {
     if (start >= size) return { kind: "unsatisfiable" };
-    return { kind: "satisfiable", start, end: size - 1 };
+    return { kind: "satisfiable", start, end: openRangeEnd(start, size - 1, contentType) };
   }
 
   // Closed form: `bytes=START-END`
@@ -181,49 +215,31 @@ export function parseRangeHeader(header: string | null | undefined, size: number
 }
 
 /**
- * Options for {@link buildVirtualTimeShim}.
+ * Page-side virtual-time shim, installed before page scripts on every render path.
+ * Holds Date.now, performance.now, rAF and later timers at the seek time, and seeds Math.random and
+ * crypto.getRandomValues from it, so a re-render repeats. Draws at page load or inside a frame also match
+ * across worker counts; a value resolved on a tween's first render depends on the frame a worker reaches first.
  */
-export interface VirtualTimeShimOptions {
-  /**
-   * When `true`, the shim additionally replaces `Math.random` and
-   * `crypto.getRandomValues` with a Mulberry32-seeded PRNG keyed by the
-   * current frame's virtual time. Compositions that call `Math.random()`
-   * during render then produce byte-identical pixels across machines and
-   * across replays of the same `(planDir, chunkIndex)` pair.
-   *
-   * Default `false`: leaves `Math.random` / `crypto.getRandomValues` native,
-   * preserving the in-process renderer's non-deterministic behavior for
-   * compositions that rely on it.
-   */
-  seedRandomFromFrame: boolean;
-}
+const VIRTUAL_TIME_SHIM = String.raw`(function() {
+  if (window.__HF_VIRTUAL_TIME__) return;
 
-/**
- * Build the page-side virtual-time shim script.
- *
- * The shim freezes `Date.now`, `performance.now`, and the rAF/setTimeout
- * pipeline so a render seek can deterministically advance the page's
- * notion of "now". The renderer issues `__HF_VIRTUAL_TIME__.seekToTime(ms)`
- * before every frame capture; everything timing-related on the page sees
- * exactly `ms` until the next seek.
- *
- * When `options.seedRandomFromFrame` is `true`, the returned script also
- * installs a seeded `Math.random` / `crypto.getRandomValues` keyed by the
- * current virtual time — so compositions with stochastic visuals retry
- * identically. When `false`, the shim emits no random-override code; the
- * page's native `Math.random` is left alone (the in-process default).
- */
-export function buildVirtualTimeShim(options: VirtualTimeShimOptions): string {
-  const seedRandomFromFrame = options.seedRandomFromFrame === true;
-  // The seeded-RNG block is gated at build time so the unlocked shim is
-  // byte-identical to the pre-flag form. Producer regression baselines
-  // compare on rendered pixels — but the file-server unit tests in
-  // `fileServer.test.ts` also string-match `VIRTUAL_TIME_SHIM`, and we want
-  // those matches to remain stable.
-  const seededRandomBlock = seedRandomFromFrame
-    ? String.raw`
+  var virtualNowMs = 0;
+  var rafId = 1;
+  var rafQueue = [];
+  var OriginalDate = Date;
+  var originalSetTimeout = window.setTimeout.bind(window);
+  var originalClearTimeout = window.clearTimeout.bind(window);
+  var originalSetInterval = window.setInterval.bind(window);
+  var originalClearInterval = window.clearInterval.bind(window);
+  var originalRequestAnimationFrame = window.requestAnimationFrame
+    ? window.requestAnimationFrame.bind(window)
+    : null;
+  var originalCancelAnimationFrame = window.cancelAnimationFrame
+    ? window.cancelAnimationFrame.bind(window)
+    : null;
+
   // Seeded Math.random / crypto.getRandomValues, keyed by virtual time.
-  // Mulberry32 — single uint32 state, deterministic, fast.
+  // Mulberry32: single uint32 state, deterministic, fast.
   var rngState = 0;
   function mulberry32() {
     rngState |= 0; rngState = (rngState + 0x6D2B79F5) | 0;
@@ -234,7 +250,7 @@ export function buildVirtualTimeShim(options: VirtualTimeShimOptions): string {
   }
   function reseedRngFromTime(ms) {
     var ms32 = Math.max(0, Math.floor(Number(ms) || 0)) | 0;
-    // Knuth's multiplicative hash + golden-ratio offset — gives a well-
+    // Knuth's multiplicative hash + golden-ratio offset gives a well-
     // distributed seed even for frame 0 (otherwise rngState=0 degenerates
     // the PRNG's first few outputs).
     rngState = (Math.imul(ms32, -1640531527) + 0x9E3779B9) | 0;
@@ -263,30 +279,7 @@ export function buildVirtualTimeShim(options: VirtualTimeShimOptions): string {
       window.crypto.getRandomValues = __seededGetRandomValues;
     } catch (e) {}
   }
-`
-    : "";
-  // The seekToTime hook reseeds when seeding is on; under seedRandomFromFrame=false
-  // we emit no extra call so the function body is byte-identical to the
-  // unseeded shim.
-  const seekToTimeReseedCall = seedRandomFromFrame ? "reseedRngFromTime(safeTimeMs);\n      " : "";
-  return String.raw`(function() {
-  if (window.__HF_VIRTUAL_TIME__) return;
 
-  var virtualNowMs = 0;
-  var rafId = 1;
-  var rafQueue = [];
-  var OriginalDate = Date;
-  var originalSetTimeout = window.setTimeout.bind(window);
-  var originalClearTimeout = window.clearTimeout.bind(window);
-  var originalSetInterval = window.setInterval.bind(window);
-  var originalClearInterval = window.clearInterval.bind(window);
-  var originalRequestAnimationFrame = window.requestAnimationFrame
-    ? window.requestAnimationFrame.bind(window)
-    : null;
-  var originalCancelAnimationFrame = window.cancelAnimationFrame
-    ? window.cancelAnimationFrame.bind(window)
-    : null;
-${seededRandomBlock}
   function flushAnimationFrame() {
     if (!rafQueue.length) return;
     var current = rafQueue.slice();
@@ -347,6 +340,83 @@ ${seededRandomBlock}
     }
   };
 
+  // Timers set once rendering has started run on film time: each seek fires every timer due by then, in
+  // due order. Until a seek after the page reports ready, timers keep the wall clock: setup code waits on
+  // them while the renderer may already be seeking.
+  var rendering = false;
+  var timerQueue = [];
+  var nextTimerId = 1000000000;
+  var firingDepth = 0;
+  function addTimer(callback, delay, args, repeats) {
+    // A timer set from a firing timer waits at least 1 ms, so a zero-delay chain cannot stall a seek.
+    var ms = Math.max(firingDepth > 0 ? 1 : 0, Number(delay) || 0);
+    var entry = { id: nextTimerId++, callback: callback, args: args, due: virtualNowMs + ms, every: repeats ? Math.max(1, ms) : 0, cancelled: false };
+    timerQueue.push(entry);
+    return entry.id;
+  }
+  function cancelTimer(id) {
+    for (var i = 0; i < timerQueue.length; i++) {
+      if (timerQueue[i].id === id) {
+        timerQueue[i].cancelled = true;
+        return true;
+      }
+    }
+    return false;
+  }
+  function fireDueTimers(untilMs) {
+    // Frame times are fractional, so a timer due on a frame lands a rounding error past it; it still fires on it.
+    untilMs += 0.000001;
+    while (true) {
+      var next = null;
+      for (var i = 0; i < timerQueue.length; i++) {
+        var candidate = timerQueue[i];
+        if (!candidate.cancelled && candidate.due <= untilMs && (next === null || candidate.due < next.due)) next = candidate;
+      }
+      if (next === null) break;
+      var dueMs = next.due;
+      if (next.every) next.due += next.every;
+      else next.cancelled = true;
+      virtualNowMs = dueMs;
+      firingDepth++;
+      try {
+        next.callback.apply(window, next.args);
+      } catch (err) {
+        originalSetTimeout(function() { throw err; }, 0);
+      }
+      firingDepth--;
+    }
+    timerQueue = timerQueue.filter(function(entry) { return !entry.cancelled; });
+  }
+  window.setTimeout = function(callback, delay) {
+    if (!rendering || typeof callback !== "function") return originalSetTimeout.apply(null, arguments);
+    return addTimer(callback, delay, Array.prototype.slice.call(arguments, 2), false);
+  };
+  window.setInterval = function(callback, delay) {
+    if (!rendering || typeof callback !== "function") return originalSetInterval.apply(null, arguments);
+    return addTimer(callback, delay, Array.prototype.slice.call(arguments, 2), true);
+  };
+  window.clearTimeout = function(id) {
+    if (!cancelTimer(id)) originalClearTimeout(id);
+  };
+  window.clearInterval = function(id) {
+    if (!cancelTimer(id)) originalClearInterval(id);
+  };
+
+  function seekToTime(nextTimeMs) {
+    var safeTimeMs = Math.max(0, Number(nextTimeMs) || 0);
+    if (!rendering && window.__renderReady === true) {
+      rendering = true;
+      // A worker whose first frame is past the start plays the film's first frame first, so timers the
+      // page starts there keep the schedule a one-worker render gives them.
+      if (safeTimeMs > 0) seekToTime(0);
+    }
+    reseedRngFromTime(safeTimeMs);
+    fireDueTimers(safeTimeMs);
+    virtualNowMs = safeTimeMs;
+    flushAnimationFrame();
+    return virtualNowMs;
+  }
+
   window.__HF_VIRTUAL_TIME__ = {
     originalSetTimeout: originalSetTimeout,
     originalClearTimeout: originalClearTimeout,
@@ -354,25 +424,12 @@ ${seededRandomBlock}
     originalClearInterval: originalClearInterval,
     originalRequestAnimationFrame: originalRequestAnimationFrame,
     originalCancelAnimationFrame: originalCancelAnimationFrame,
-    seekToTime: function(nextTimeMs) {
-      var safeTimeMs = Math.max(0, Number(nextTimeMs) || 0);
-      virtualNowMs = safeTimeMs;
-      ${seekToTimeReseedCall}flushAnimationFrame();
-      return virtualNowMs;
-    },
+    seekToTime: seekToTime,
     getTime: function() {
       return virtualNowMs;
     },
   };
 })();`;
-}
-
-/**
- * Default in-process virtual-time shim — `seedRandomFromFrame: false`.
- * Existing call sites (`renderOrchestrator`, `probeStage`) import this
- * constant. Distributed callers build their own with seeding enabled.
- */
-const VIRTUAL_TIME_SHIM = buildVirtualTimeShim({ seedRandomFromFrame: false });
 
 /**
  * Render mode extension -- adds renderSeek() for frame-accurate seeking
@@ -392,7 +449,7 @@ const RENDER_SEEK_OFFSET_FRACTION = Math.max(
   Math.min(0.95, Number(process.env.PRODUCER_RUNTIME_RENDER_SEEK_OFFSET_FRACTION || 0.5)),
 );
 
-function resolveRenderFpsConfig(fps: Fps | undefined): {
+export function resolveRenderFpsConfig(fps: Fps | undefined): {
   value: number;
   source: "render-options" | "default";
   fallbackReason?: "missing" | "invalid";
@@ -500,7 +557,7 @@ function buildRenderModeScript(fps: Fps | undefined): string {
     };
     window.__playerReady = true;
     // Media-fallback player has no timeline to bind, so render-ready is immediate.
-    // init.ts defers __renderReady until the timeline is bound — different runtime.
+    // init.ts defers __renderReady until the timeline is bound (a different runtime).
     window.__renderReady = true;
     return true;
   }
@@ -668,6 +725,9 @@ export interface FileServerOptions {
   fps?: Fps;
   /** Strip embedded runtime scripts from HTML before injection. Default: true. */
   stripEmbeddedRuntime?: boolean;
+  /** Serve project symlinks that lead outside projectDir, as local preview does. Default: false. */
+  allowOutsideProjectAssets?: boolean;
+  includeOutsideScripts?: boolean;
 }
 
 export interface FileServerHandle {
@@ -676,6 +736,16 @@ export interface FileServerHandle {
   close: () => void;
   addPreHeadScript: (script: string) => void;
 }
+
+const OFFER_NO_FRAMING_SITE_AN_EDITING_PORT = `<meta name="${PREVIEW_FOR_ANOTHER_SITE_META}">`;
+
+/**
+ * Set before the Hyperframes runtime executes so render/probe pages can avoid
+ * preview-only initialization work that mutates the live visual timeline.
+ * Audio automation is discovered by the producer in an isolated pass and
+ * baked before frame capture.
+ */
+export const RENDER_CAPTURE_MODE_SHIM = "globalThis.__HF_RENDER_CAPTURE_MODE = true;";
 
 /**
  * Close a file server handle, swallowing and logging any error.
@@ -701,8 +771,43 @@ export function closeFileServerSafely(
   }
 }
 
+function openRegularFile(filePath: string) {
+  let fd: number;
+  try {
+    // Reject FIFOs with fstat without waiting for a writer to connect.
+    fd = openSync(filePath, constants.O_RDONLY | constants.O_NONBLOCK);
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      (error.code === "ENOENT" || error.code === "ENOTDIR")
+    )
+      return null;
+    // A failed open of a directory/socket has platform-specific errors.
+    // Classifying it here never authorizes a later pathname read.
+    if (!statSync(filePath, { throwIfNoEntry: false })?.isFile()) return null;
+    throw error;
+  }
+  let accepted = false;
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return null;
+    accepted = true;
+    return { fd, stat, filePath };
+  } finally {
+    if (!accepted) closeSync(fd);
+  }
+}
+
 export function createFileServer(options: FileServerOptions): Promise<FileServerHandle> {
-  const { projectDir, compiledDir, port = 0, stripEmbeddedRuntime = true } = options;
+  const {
+    projectDir,
+    compiledDir,
+    port = 0,
+    stripEmbeddedRuntime = true,
+    allowOutsideProjectAssets = false,
+    includeOutsideScripts = false,
+  } = options;
 
   // HF_EARLY_STUB must run before *any* page script so libraries that write
   // to window.__hf during page-script execution (e.g. shader-transitions
@@ -710,151 +815,163 @@ export function createFileServer(options: FileServerOptions): Promise<FileServer
   // bodyScripts later upgrades this stub with `seek` / `duration` once the
   // Hyperframe runtime's __player is ready, while preserving any fields
   // already written.
-  const preHeadScripts = [HF_EARLY_STUB, ...(options.preHeadScripts ?? [])];
+  const preHeadScripts = [
+    HF_EARLY_STUB,
+    RENDER_CAPTURE_MODE_SHIM,
+    ...(options.preHeadScripts ?? []),
+  ];
   // Default scripts: Hyperframe runtime in <head>, render mode in </body>
   const headScripts = options.headScripts ?? [getVerifiedHyperframeRuntimeSource()];
   const bodyScripts = options.bodyScripts ?? [buildRenderModeScript(options.fps), HF_BRIDGE_SCRIPT];
 
   const app = new Hono();
+  const warnLeftOut = (line: string) => console.warn(`[FileServer] ${terminalText(line)}`);
+  const outsidePolicy = { includeScripts: includeOutsideScripts };
+  let listeningPort = -1;
+
+  app.use(async function loadEachFileOnlyAsItsNamedType(c, next) {
+    await next();
+    c.res.headers.set("X-Content-Type-Options", "nosniff");
+  });
+  answerOwnLoopbackHostOnly(app, () => listeningPort);
+  app.use(async function refuseServiceWorkerScripts(c, next) {
+    const serviceWorker = c.req.header("service-worker");
+    if (!serviceWorkerScriptFetch({ serviceWorker, fetchDest: c.req.header("sec-fetch-dest") }))
+      return next();
+    return c.text("Forbidden", 403);
+  });
 
   app.get("/*", async (c) => {
     let requestPath = c.req.path;
     if (requestPath === "/") requestPath = "/index.html";
 
-    const relativePath = requestPath
-      .replace(/^\//, "")
-      .split("/")
-      .map((seg) => {
-        try {
-          return decodeURIComponent(seg);
-        } catch {
-          return seg;
-        }
-      })
-      .join("/");
+    const relativePath = servedPath(requestPath);
 
-    // Resolve against compiledDir first (preferred — overrides project files
-    // for compositions emitted by the build), then projectDir as fallback.
-    // Each candidate is rejected if `..` segments push it outside the
-    // intended root: `path.join` normalizes traversal but does not enforce
-    // containment, so a request like `GET /../etc/passwd` would otherwise
-    // be served straight off the filesystem. Keep this lexical so project
-    // symlinks to sibling asset directories behave like preview mode.
-    let filePath: string | null = null;
-    if (compiledDir) {
-      const candidate = join(compiledDir, relativePath);
-      if (
-        existsSync(candidate) &&
-        isPathInside(candidate, compiledDir) &&
-        statSync(candidate).isFile()
-      ) {
-        filePath = candidate;
-      }
-    }
-    if (!filePath) {
-      const candidate = join(projectDir, relativePath);
-      if (
-        existsSync(candidate) &&
-        isPathInside(candidate, projectDir) &&
-        statSync(candidate).isFile()
-      ) {
-        filePath = candidate;
-      }
+    // compiledDir (the build's output) wins over projectDir. A candidate `..` pushes outside its root is
+    // rejected: `path.join` does not enforce containment, so `GET /../etc/passwd` would be served.
+    // compiledDir stays lexical: it links extracted frame directories in from the work directory.
+    let file: ReturnType<typeof openRegularFile> = null;
+    for (const root of compiledDir ? [compiledDir, projectDir] : [projectDir]) {
+      const candidate = join(root, relativePath);
+      const resolveSymlinks = !allowOutsideProjectAssets && root !== compiledDir;
+      if (!isPathInside(candidate, root, { resolveSymlinks })) continue;
+      if (isPrivateFileUnder(root, candidate, isStudioPrivatePath)) continue;
+      const checksLinks = allowOutsideProjectAssets && root !== compiledDir;
+      if (checksLinks && refusesOutsideLink(root, candidate, warnLeftOut, outsidePolicy)) continue;
+      file = openRegularFile(candidate);
+      if (file) break;
     }
 
-    if (!filePath) {
+    if (!file) {
       if (!/favicon\.ico$/i.test(requestPath)) {
-        console.warn(`[FileServer] 404 Not Found: ${requestPath}`);
+        console.warn(`[FileServer] 404 Not Found: ${terminalText(requestPath)}`);
       }
       return c.text("Not found", 404);
     }
 
-    const ext = extname(filePath).toLowerCase();
-    const contentType = MIME_TYPES[ext] || "application/octet-stream";
+    const { fd, stat, filePath } = file;
+    let streamOwnsFd = false;
+    try {
+      const ext = extname(filePath).toLowerCase();
+      const contentType = MIME_TYPES[ext] || "application/octet-stream";
 
-    if (ext === ".html") {
-      // Use the async read here so we don't block the Node event loop while
-      // reading an HTML file (typically small, but a 200KB+ AI-generated
-      // composition during a concurrent render still costs a ms of stall).
-      // The injection step is sync — it's pure string ops on the buffered
-      // HTML — but the read itself is the only step that touches the disk.
-      const rawHtml = await readFile(filePath, "utf-8");
-      const isIndex = relativePath === "index.html";
-      let html = rawHtml;
-      if (preHeadScripts.length > 0) {
-        html = injectScriptsAtHeadStart(html, preHeadScripts);
+      if (ext === ".html") {
+        // Use the async read here so we don't block the Node event loop while
+        // reading an HTML file (typically small, but a 200KB+ AI-generated
+        // composition during a concurrent render still costs a ms of stall).
+        // The injection step is sync — it's pure string ops on the buffered
+        // HTML — but the read itself is the only step that touches the disk.
+        const rawHtml = await readFileAsync(fd, "utf-8");
+        const isIndex = relativePath === "index.html";
+        let html = rawHtml;
+        if (preHeadScripts.length > 0) {
+          html = injectScriptsAtHeadStart(html, preHeadScripts);
+        }
+        html = isIndex
+          ? injectScriptsIntoHtml(html, headScripts, bodyScripts, stripEmbeddedRuntime)
+          : html;
+        html = injectTagsAtHeadStart(html, OFFER_NO_FRAMING_SITE_AN_EDITING_PORT);
+        return c.text(html, 200, { "Content-Type": contentType });
       }
-      html = isIndex
-        ? injectScriptsIntoHtml(html, headScripts, bodyScripts, stripEmbeddedRuntime)
-        : html;
-      return c.text(html, 200, { "Content-Type": contentType });
-    }
 
-    // Stream binary file content rather than buffering it with readFileSync.
-    // On video-heavy compositions Chrome requests several 32MB video files
-    // back-to-back through this server; each readFileSync(32MB) blocked the
-    // Node event loop long enough to wedge concurrent /health responses (see
-    // renderOrchestrator.ts:1277-1306 documenting the same regression class).
-    // createReadStream() pipes bounded chunks asynchronously, so the event
-    // loop stays responsive even when several large assets are in flight
-    // simultaneously. Chrome reassembles the chunks transparently.
-    //
-    // We also honor `Range:` requests (RFC 7233) so Chrome's <video> element
-    // can seek into and partial-load large media without re-pulling the whole
-    // file. `Accept-Ranges: bytes` is advertised on every response (including
-    // full-body 200s) so the client knows ranges are supported.
-    const stat = statSync(filePath);
-    const totalSize = stat.size;
-    const rangeHeader = c.req.header("range");
-    const rangeRequest = parseRangeHeader(rangeHeader, totalSize);
+      if (ext === ".png") {
+        const untagged = stripSdrPngColourTags(await readFileAsync(fd));
+        if (untagged) {
+          const headers = {
+            "Content-Type": contentType,
+            "Content-Length": String(untagged.length),
+          };
+          return new Response(c.req.method === "HEAD" ? null : new Uint8Array(untagged), {
+            headers,
+          });
+        }
+      }
 
-    if (rangeRequest.kind === "unsatisfiable") {
-      // 416 Range Not Satisfiable. RFC 7233 §4.4 mandates `Content-Range`
-      // carry the total length as `bytes */<size>` so clients know how to
-      // re-issue a valid range.
-      return new Response(null, {
-        status: 416,
+      // Stream binary file content rather than buffering it with readFileSync.
+      // On video-heavy compositions Chrome requests several 32MB video files
+      // back-to-back through this server; each readFileSync(32MB) blocked the
+      // Node event loop long enough to wedge concurrent /health responses (see
+      // renderOrchestrator.ts:1277-1306 documenting the same regression class).
+      // createReadStream() pipes bounded chunks asynchronously, so the event
+      // loop stays responsive even when several large assets are in flight
+      // simultaneously. Chrome reassembles the chunks transparently.
+      //
+      // We also honor `Range:` requests (RFC 7233) so Chrome's <video> element
+      // can seek into and partial-load large media without re-pulling the whole
+      // file. `Accept-Ranges: bytes` is advertised on every response (including
+      // full-body 200s) so the client knows ranges are supported.
+      const totalSize = stat.size;
+      const rangeHeader = c.req.header("range");
+      const rangeRequest = parseRangeHeader(rangeHeader, totalSize, contentType);
+
+      if (rangeRequest.kind === "unsatisfiable") {
+        // 416 Range Not Satisfiable. RFC 7233 §4.4 mandates `Content-Range`
+        // carry the total length as `bytes */<size>` so clients know how to
+        // re-issue a valid range.
+        return new Response(null, {
+          status: 416,
+          headers: {
+            "Content-Type": contentType,
+            "Content-Range": `bytes */${totalSize}`,
+            "Accept-Ranges": "bytes",
+          },
+        });
+      }
+
+      const range = rangeRequest.kind === "satisfiable" ? rangeRequest : null;
+      const responseOptions = {
+        status: range ? 206 : 200,
         headers: {
           "Content-Type": contentType,
-          "Content-Range": `bytes */${totalSize}`,
+          "Content-Length": String(range ? range.end - range.start + 1 : totalSize),
           "Accept-Ranges": "bytes",
+          ...(range ? { "Content-Range": `bytes ${range.start}-${range.end}/${totalSize}` } : {}),
         },
+      };
+      // HEAD has no body consumer to take ownership of a stream's descriptor.
+      if (c.req.method === "HEAD") return new Response(null, responseOptions);
+      const stream = createReadStream(filePath, {
+        fd,
+        autoClose: true,
+        start: range?.start ?? 0,
+        ...(range ? { end: range.end } : {}),
       });
+      streamOwnsFd = true;
+      try {
+        const webStream = Readable.toWeb(stream) as unknown as ReadableStream;
+        return new Response(webStream, responseOptions);
+      } catch (error) {
+        stream.destroy();
+        throw error;
+      }
+    } finally {
+      // Streams close on completion, error or cancellation. HTML/416/errors
+      // before stream creation remain owned by this request.
+      if (!streamOwnsFd) closeSync(fd);
     }
-
-    if (rangeRequest.kind === "satisfiable") {
-      const { start, end } = rangeRequest;
-      const length = end - start + 1;
-      const stream = createReadStream(filePath, { start, end });
-      const webStream = Readable.toWeb(stream) as unknown as ReadableStream;
-      return new Response(webStream, {
-        status: 206,
-        headers: {
-          "Content-Type": contentType,
-          "Content-Length": String(length),
-          "Content-Range": `bytes ${start}-${end}/${totalSize}`,
-          "Accept-Ranges": "bytes",
-        },
-      });
-    }
-
-    // No Range header (or malformed/multi-range): full-body 200 with
-    // Accept-Ranges advertised so the client knows future Range requests
-    // are supported. Node Readable -> Web ReadableStream so Hono's
-    // Response can consume it. Node 18+ supports Readable.toWeb directly.
-    const stream = createReadStream(filePath);
-    const webStream = Readable.toWeb(stream) as unknown as ReadableStream;
-    return new Response(webStream, {
-      status: 200,
-      headers: {
-        "Content-Type": contentType,
-        "Content-Length": String(totalSize),
-        "Accept-Ranges": "bytes",
-      },
-    });
   });
 
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     // Track open connections so we can force-destroy them on close.
     // Without this, server.close() waits for keep-alive connections to
     // drain, holding the Node.js event loop open indefinitely.
@@ -869,24 +986,31 @@ export function createFileServer(options: FileServerOptions): Promise<FileServer
     // it must not listen on 0.0.0.0 where an IDE's port auto-forward surfaces
     // it as a transient, breakage-prone "preview".
     const server = serve({ fetch: app.fetch, port, hostname: "127.0.0.1" }, (info) => {
-      resolve({
-        url: `http://localhost:${info.port}`,
-        port: info.port,
-        addPreHeadScript: (script: string) => {
-          preHeadScripts.push(script);
-        },
-        close: () => {
-          for (const socket of connections) socket.destroy();
-          connections.clear();
-          server.close();
-        },
-      });
+      // An OS-picked port (0) must be one Chromium will load from; a caller-chosen one is theirs.
+      const bound =
+        port === 0 ? settleOnBrowserSafePort(server, "127.0.0.1") : Promise.resolve(info.port);
+      bound.then((boundPort) => {
+        listeningPort = boundPort;
+        resolve({
+          url: `http://localhost:${boundPort}`,
+          port: boundPort,
+          addPreHeadScript: (script: string) => {
+            preHeadScripts.push(script);
+          },
+          close: () => {
+            for (const socket of connections) socket.destroy();
+            connections.clear();
+            server.close();
+          },
+        });
+      }, reject);
     });
 
     server.on("connection", (socket: IncomingMessage["socket"]) => {
       connections.add(socket);
       socket.on("close", () => connections.delete(socket));
     });
+    server.on("error", reject);
   });
 }
 

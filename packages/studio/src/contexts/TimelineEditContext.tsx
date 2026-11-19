@@ -1,7 +1,11 @@
-import { createContext, useContext, useMemo, type ReactNode } from "react";
+import { useContext, useMemo, type ReactNode } from "react";
+import { createStableContext } from "../utils/hmrStableContext";
 import type { TimelineEditCallbacks } from "../player/components/timelineCallbacks";
 
-const TimelineEditContext = createContext<TimelineEditCallbacks | null>(null);
+const TimelineEditContext = createStableContext<TimelineEditCallbacks | null>(
+  "TimelineEditContext",
+  null,
+);
 
 export function useTimelineEditContext(): TimelineEditCallbacks {
   const ctx = useContext(TimelineEditContext);
@@ -17,6 +21,42 @@ export function useTimelineEditContextOptional(): TimelineEditCallbacks {
   return useContext(TimelineEditContext) ?? {};
 }
 
+export function useTimelineEditContextValue(): TimelineEditCallbacks | null {
+  return useContext(TimelineEditContext);
+}
+
+const EDIT_CALLBACK_KEY_SET: Record<keyof TimelineEditCallbacks, true> = {
+  onMoveElement: true,
+  onMoveElements: true,
+  onResizeElement: true,
+  onResizeElements: true,
+  onToggleTrackHidden: true,
+  onSetAudioGroupAttributeLive: true,
+  onSetAudioGroupAttributeQuiet: true,
+  onRevertAudioGroupAttributeLive: true,
+  onGroupClips: true,
+  onSetElementAttributeLive: true,
+  onSetElementAttributeQuiet: true,
+  onSetElementsAttributeQuiet: true,
+  onRevertElementAttributeLive: true,
+  onBlockedEditAttempt: true,
+  onLinkEdit: true,
+  onDeleteElementOnly: true,
+  onSplitElement: true,
+  onRazorSplit: true,
+  onRazorSplitAll: true,
+  onFreezeFrame: true,
+  clipMenuTools: true,
+  onNotice: true,
+  onDeleteKeyframe: true,
+  onDeleteAllKeyframes: true,
+  onMoveKeyframeToPlayhead: true,
+  onMoveKeyframe: true,
+  onToggleKeyframeAtPlayhead: true,
+  onTogglePropertyGroupKeyframe: true,
+};
+const EDIT_CALLBACK_KEYS = Object.keys(EDIT_CALLBACK_KEY_SET) as (keyof TimelineEditCallbacks)[];
+
 export function TimelineEditProvider({
   value,
   children,
@@ -29,22 +69,7 @@ export function TimelineEditProvider({
     // Each callback is a stable reference from the parent — memoize the bag
     // so consumers don't re-render when unrelated parent state changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [
-      value.onMoveElement,
-      value.onMoveElements,
-      value.onResizeElement,
-      value.onToggleTrackHidden,
-      value.onBlockedEditAttempt,
-      value.onSplitElement,
-      value.onRazorSplit,
-      value.onRazorSplitAll,
-      value.onDeleteKeyframe,
-      value.onDeleteAllKeyframes,
-      value.onChangeKeyframeEase,
-      value.onMoveKeyframeToPlayhead,
-      value.onMoveKeyframe,
-      value.onToggleKeyframeAtPlayhead,
-    ],
+    EDIT_CALLBACK_KEYS.map((key) => value[key]),
   );
   return <TimelineEditContext.Provider value={memoized}>{children}</TimelineEditContext.Provider>;
 }

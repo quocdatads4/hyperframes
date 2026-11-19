@@ -36,6 +36,7 @@ function runTwoMutationTransaction(
 describe("runGestureTransaction", () => {
   beforeEach(() => {
     trackStudioEventMock.mockReset();
+    localStorage.clear();
   });
 
   it("settles synchronously before persist reaches its first await", async () => {
@@ -249,7 +250,7 @@ describe("runGestureTransaction", () => {
       .spyOn(element, "getBoundingClientRect")
       .mockReturnValueOnce(rect(10.04, 20.05, 100.05, 80.05))
       .mockReturnValueOnce(rect(11.19, 17.89, 100.29, 78.99));
-    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     const now = vi.spyOn(performance, "now").mockReturnValueOnce(50).mockReturnValueOnce(58.44);
 
     await runGestureTransaction({
@@ -261,13 +262,7 @@ describe("runGestureTransaction", () => {
     });
 
     expect(getRect).toHaveBeenCalledTimes(2);
-    expect(error).toHaveBeenCalledWith(
-      "[hf-commit] persist changed pixels",
-      expect.objectContaining({
-        label: "Resize layer",
-        delta: expect.objectContaining({ x: expect.any(Number) }),
-      }),
-    );
+    expect(log).not.toHaveBeenCalled();
     expect(trackStudioEventMock).toHaveBeenCalledWith("commit_invariant_violation", {
       label: "Resize layer",
       delta_x: 1.2,
@@ -283,13 +278,73 @@ describe("runGestureTransaction", () => {
       expect.objectContaining({ pixel_asserted: true }),
     );
     now.mockRestore();
-    error.mockRestore();
+    log.mockRestore();
+  });
+
+  it("measures a box undo painted back mid-save as the edit drew it, so it reports no change", async () => {
+    const element = document.createElement("div");
+    let undone = false;
+    vi.spyOn(element, "getBoundingClientRect").mockImplementation(() =>
+      undone ? rect(0, 0, 50, 40) : rect(10, 20, 100, 80),
+    );
+    const draw = <T>(run: () => T): T => {
+      undone = false;
+      try {
+        return run();
+      } finally {
+        undone = true;
+      }
+    };
+
+    await runGestureTransaction({
+      element,
+      label: "Resize layer",
+      settle: vi.fn(),
+      persist: async () => void (undone = true),
+      restore: vi.fn(),
+      draw,
+    });
+
+    expect(trackStudioEventMock).not.toHaveBeenCalledWith(
+      "commit_invariant_violation",
+      expect.anything(),
+    );
+  });
+
+  it("measures as the edit drew it when undo painted the box back before the transaction began", async () => {
+    const element = document.createElement("div");
+    let undone = true;
+    vi.spyOn(element, "getBoundingClientRect").mockImplementation(() =>
+      undone ? rect(0, 0, 50, 40) : rect(10, 20, 100, 80),
+    );
+    const draw = <T>(run: () => T): T => {
+      undone = false;
+      try {
+        return run();
+      } finally {
+        undone = true;
+      }
+    };
+
+    await runGestureTransaction({
+      element,
+      label: "Resize layer",
+      settle: vi.fn(),
+      persist: async () => undefined,
+      restore: vi.fn(),
+      draw,
+    });
+
+    expect(trackStudioEventMock).not.toHaveBeenCalledWith(
+      "commit_invariant_violation",
+      expect.anything(),
+    );
   });
 
   it("skips the pixel assertion for live position tweens", async () => {
     const element = document.createElement("div");
     const getRect = vi.spyOn(element, "getBoundingClientRect");
-    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
 
     await runGestureTransaction({
       element,
@@ -301,11 +356,11 @@ describe("runGestureTransaction", () => {
     });
 
     expect(getRect).not.toHaveBeenCalled();
-    expect(error).not.toHaveBeenCalledWith("[hf-commit] persist changed pixels", expect.anything());
+    expect(log).not.toHaveBeenCalled();
     expect(trackStudioEventMock).not.toHaveBeenCalledWith(
       "commit_invariant_violation",
       expect.anything(),
     );
-    error.mockRestore();
+    log.mockRestore();
   });
 });

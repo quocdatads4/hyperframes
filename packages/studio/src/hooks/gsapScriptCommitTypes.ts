@@ -1,13 +1,24 @@
 import type { ParsedGsap } from "@hyperframes/core/gsap-parser";
 import type { Composition } from "@hyperframes/sdk";
 import type { DomEditSelection } from "../components/editor/domEditingTypes";
-import type { EditHistoryKind } from "../utils/editHistory";
 import type { PublishSdkSession } from "../utils/sdkCutover";
+import type { StudioEditInFlight } from "../utils/studioPendingEdits";
 import type { RuntimeTweenChange } from "./gsapRuntimePatch";
+import type { KeyframeUsageAction } from "../utils/keyframeUsage";
+import type { RecordEditInput } from "../utils/studioFileHistory";
+
+/** The file a selection's GSAP write goes to. */
+export function gsapWriteFile(
+  selection: Pick<DomEditSelection, "sourceFile">,
+  activeCompPath: string | null | undefined,
+): string {
+  return selection.sourceFile || activeCompPath || "index.html";
+}
 
 export interface MutationResult {
   ok: boolean;
   changed?: boolean;
+  mutationChanges?: boolean[];
   parsed?: ParsedGsap;
   before?: string;
   after?: string;
@@ -16,11 +27,29 @@ export interface MutationResult {
 
 export interface CommitMutationOptions {
   label: string;
+  keyframeTelemetry?: boolean;
+  keyframeAction?: KeyframeUsageAction;
+  keyframeProperty?: string;
+  /** Observe the durable writer result without duplicating the request path. */
+  onResult?: (result: MutationResult) => void;
   coalesceKey?: string;
   coalesceMs?: number;
   softReload?: boolean;
   skipReload?: boolean;
+  /**
+   * Write the source but leave the preview alone; the caller renders once when it
+   * is done. For a multi-write action like a group drag, rendering after each
+   * write shows a source where the members not yet written still hold their old
+   * values, so they snap back until their own write lands. This also defers the
+   * in-place runtime patch's seek, which re-renders the whole timeline and repaints
+   * the queued members the same way. Unlike `skipReload` this changes nothing about
+   * error handling — a failed write still throws.
+   */
+  deferPreviewSync?: boolean;
+  /** Carries a deferred write not yet on screen (no patch, or a missed one) to the final render. */
+  previewFallbackLatch?: { pending: boolean };
   beforeReload?: () => void;
+  pendingEdit?: StudioEditInFlight;
   /**
    * Serialize this commit against others sharing the same key. Used to chain
    * per-animationId GSAP meta updates. Every commit independently takes the
@@ -37,6 +66,14 @@ export interface CommitMutationOptions {
    * existing soft/full reload path. Structural edits omit this and reload as before.
    */
   instantPatch?: { selector: string; change: RuntimeTweenChange };
+  /**
+   * The same fast path for a batched commit: one patch per element the batch
+   * wrote, applied in order. All of them must land for the reload to be skipped
+   * — one that can't be applied leaves the preview half-patched, so the whole
+   * batch falls back to the reload. Only the last patch re-renders (see
+   * `deferSeek`), so a ten-element batch repaints once.
+   */
+  instantPatches?: Array<{ selector: string; change: RuntimeTweenChange }>;
 }
 
 export interface CommitMutationCall {
@@ -72,15 +109,8 @@ export interface GsapScriptCommitsParams {
   activeCompPath: string | null;
   previewIframeRef: React.RefObject<HTMLIFrameElement | null>;
   editHistory: {
-    recordEdit: (entry: {
-      label: string;
-      kind: EditHistoryKind;
-      coalesceKey?: string;
-      coalesceMs?: number;
-      files: Record<string, { before: string; after: string }>;
-    }) => Promise<void>;
+    recordEdit: (entry: RecordEditInput) => Promise<void>;
   };
-  domEditSaveTimestampRef: React.MutableRefObject<number>;
   reloadPreview: () => void;
   onCacheInvalidate: () => void;
   onFileContentChanged?: (path: string, content: string) => void;

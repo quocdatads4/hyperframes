@@ -1,9 +1,13 @@
 ---
 name: changelog-video
 description: Turn a weekly changelog .md into a finished branded changelog video (square 1080, ~45-60s, Annie VO, animated brand background, mock-UI visualizations, lowkey captions). Use when the user provides a changelog/digest markdown and wants the weekly video, or says "changelog video". Self-contained — fonts, background, lexicon, and scripts ship in this skill.
+metadata:
+  internal: true
 ---
 
 # Changelog → Branded Video
+
+<!-- skill-scripts: relative-ok, runs from the HyperFrames repo root -->
 
 Input: a changelog .md (themes + items, like the weekly HyperFrames digest).
 Output: a lint-clean, seam-gate-green HyperFrames project in
@@ -145,14 +149,15 @@ scaffold.
 
 ### 6 · Gates (all green before presenting)
 
-1. `bun run --cwd packages/cli hyperframes check` (or the installed
+1. `node packages/cli/bin/hyperframes.mjs check --caption-zone "x0=0;y0=.90;x1=1;y1=1;severity=error;seek=.02,.06,.10,.14,.18,.22,.26,.30,.34,.38,.42,.46,.50,.54,.58,.62,.66,.70,.74,.78,.82,.86,.90,.94,.98"` (or the installed
    `hyperframes` CLI from the repo-local `skills/hyperframes-cli/` skill) —
-   0 errors (contrast: dim text ≥ .66 alpha). Do NOT reach for
+   0 errors (contrast: dim text ≥ .66 alpha; scene content stays above the
+   caption rail). Do NOT reach for
    `npx hyperframes@latest`; the tracked repo-local CLI is the source of
    truth for the composition contract this skill produces against.
 2. `seam-gate.mjs verify` — 0 fail.
 3. Restart the preview server (it caches the bundle), spot-check 3-4 beats
-   via `__player.seek` on the raw comp page.
+   via `await __player.seek(t)` on the raw comp page (it resolves async).
 4. Do NOT render unless the user asks. After a requested render, verify
    frames from the MP4 (`ffmpeg -ss <t> … -frames:v 1`): captions present,
    background video not black, no tiny/frozen frames.

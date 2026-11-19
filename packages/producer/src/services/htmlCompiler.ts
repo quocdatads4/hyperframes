@@ -1,3 +1,17 @@
+import { decodedUrlPath } from "@hyperframes/parsers/asset-paths";
+import {
+  cssRuleMatches,
+  cssUrlMatches,
+  fontFaceBlockMatches,
+  hasBackgroundImageDeclaration,
+  importRuleMatches,
+  localFontFaceUrlMatches,
+  remoteBackgroundUrlMatches,
+  remoteFontFaceUrlMatches,
+  replaceMatches,
+  styleBlockMatches,
+  stylesheetLinkMatches,
+} from "@hyperframes/parsers/css-url-scans";
 // fallow-ignore-file code-duplication complexity
 /**
  * HTML Compiler for Producer
@@ -10,56 +24,142 @@
  * recursively extracting nested media from sub-sub-compositions.
  */
 
-import { readFileSync, existsSync, mkdirSync } from "fs";
-import { join, dirname, resolve, basename } from "path";
+import { createHash } from "node:crypto";
+import { createReadStream, existsSync, mkdirSync, readFileSync } from "fs";
+import { join, dirname, resolve, basename, relative, sep } from "path";
 import { parseHTML } from "linkedom";
+import { bundledScript } from "./bundledScripts.js";
 import {
+  inlineScriptBlocks,
+  remoteSrcUrls,
+  removeDelimitedRuns,
+  replaceGsapDistScripts,
+  stripCrossoriginAttr,
+  stripPreloadNone,
+} from "./htmlTagScans.js";
+import {
+  COMPOSITION_SOURCE_URL,
   compileTimingAttrs,
   injectDurations,
   extractResolvedMedia,
   clampDurations,
   shouldClampResolvedMediaDuration,
-  CSS_URL_RE,
   isNonRelativeUrl,
+  parseStrictFiniteTimingNumber,
+  readMediaStart,
+  redactTelemetryString,
+  resolveNaturalMediaTimelineDurationFromValues,
+  rewriteAssetPath,
+  rewriteAssetPaths,
+  rewriteCssAssetUrls,
+  rewriteInlineStyleAssetUrls,
+  type RateSpec,
   type ResolvedDuration,
   type UnresolvedElement,
+  terminalText,
 } from "@hyperframes/core";
+import { MAX_AUDIO_GAIN } from "@hyperframes/core/audio-gain";
+import { CAPTURE_CANVAS_SELECTOR } from "@hyperframes/core/html-in-canvas";
+import { readPlaybackRate } from "@hyperframes/parsers/media-duration";
+import { resolveRateSpec } from "@hyperframes/core/speed-ramp";
+import { gsapCdnDist, normalizeGsapBaseUrl } from "@hyperframes/core/gsap-cdn";
 import {
   assignBundledRuntimeCompositionIds,
+  assignMediaRenderIds,
   type BundledHostCompositionIdentity,
-  buildVariablesByCompScript,
+  emitVariablesByCompScript,
   inlineSubCompositions as inlineSubCompositionsShared,
+  ensureExternalLinkTag,
+  ensureExternalScriptTag,
+  deferScriptsUntilFonts,
+  emitMountedModuleScripts,
+  isJavaScriptType,
   prepareFlattenedInnerRoot,
   emitRootCompositionVariableStyles,
   readDeclaredDefaults,
   parseHostVariableValues,
+  boundMediaSrc,
+  headStyleRuns,
+  isAlwaysAppliedStyle,
+  dedupeFontFaceRules,
+  inlineScriptRuns,
+  parsesAsScript,
+  styleElementsFor,
+  insertBeforeCloseTag,
+  isRuntimeFileUrl,
 } from "@hyperframes/core/compiler";
 import {
   checkSubCompositionUsability,
   type ParsableDocumentLike,
 } from "@hyperframes/parsers/sub-composition-validity";
-import { extractMediaMetadata, extractAudioMetadata } from "../utils/ffprobe.js";
-import { isPathInside, toExternalAssetKey } from "../utils/paths.js";
 import {
-  parseVideoElements,
-  parseImageElements,
+  isUnresolvedAssetPlaceholder,
+  namesAnotherNetworkRoot,
+  projectAssetExists,
+  readProjectFile,
+  readTextFile,
+  resolveCompositionSrc,
+} from "@hyperframes/parsers/asset-resolution";
+import { isPrivateFileUnder, isStudioPrivatePath } from "@hyperframes/core/safe-path";
+import { linksOutside } from "@hyperframes/studio-server/outside-file";
+import { extractMediaMetadata, extractAudioMetadata } from "../utils/ffprobe.js";
+import {
+  assertCompositionFileSize,
+  CompositionExpansionBudget,
+  REMOTE_SCRIPTS,
+  REMOTE_STYLESHEETS,
+} from "./compositionSizeLimit.js";
+import {
+  escapesAssetRoot,
+  isPathInside,
+  leftOutOfRender,
+  outsideAssetRefusal,
+  type OutsideFilePolicy,
+  refusesOutsideLink,
+  toExternalAssetKey,
+} from "../utils/paths.js";
+import { collectHiddenVideoIds, collectRenderMedia } from "./renderMediaCollector.js";
+import {
   type VideoElement,
   type ImageElement,
-  parseAudioElements,
   type AudioElement,
   type AudioVolumeKeyframe,
+  type MediaProbeProfile,
   analyzeKeyframeIntervals,
+  assertMediaPayload,
+  createConcurrencyLimit,
+  isPrivateUnderAssetRoots,
+  NotMediaPayloadError,
+  parseMasterFxChain,
+  probeMediaProfile,
 } from "@hyperframes/engine";
-import { assertPublicHttpsUrl, downloadToTemp, isHttpUrl } from "../utils/urlDownloader.js";
+import {
+  downloadToTemp,
+  fetchPublicHttpsBytes,
+  fetchPublicHttpsText,
+  isHttpUrl,
+  safeDownloadUrlIdentity,
+  type UrlDownloadTelemetry,
+} from "../utils/urlDownloader.js";
 import type { Page } from "puppeteer-core";
 import {
   injectDeterministicFontFaces,
   normalizeSystemFontPrimaryFamilies,
-} from "./deterministicFonts.js";
+} from "@hyperframes/core/fonts/embed";
 import { prepareAnimatedGifInputs } from "./animatedGifPrep.js";
-import { createStudioPositionSeekReapplyScript } from "@hyperframes/studio-server/manual-edits-render-script";
+import { prepareHeifImageInputs } from "./heifImagePrep.js";
+import {
+  createStudioPositionSeekReapplyScript,
+  htmlHasStudioPositionEdits,
+} from "@hyperframes/studio-server/manual-edits-render-script";
 import { getPositionEditsRenderScript } from "@hyperframes/core/runtime/position-edits-render";
 import { defaultLogger, type ProducerLogger } from "../logger.js";
+import { assertAssetMediaTypeProfile } from "./assetMediaType.js";
+import { withMediaProbeSlot } from "../utils/mediaProbeConcurrency.js";
+
+function logRemoteDownloadTelemetry(event: UrlDownloadTelemetry): void {
+  defaultLogger.debug("[Compiler] Remote asset download integrity", { ...event });
+}
 
 export interface CompiledComposition {
   html: string;
@@ -67,7 +167,11 @@ export interface CompiledComposition {
   videos: VideoElement[];
   audios: AudioElement[];
   images: ImageElement[];
+  droppedMediaIds: Set<string>;
+  gradedCanvas: boolean;
+  masterFxChain?: string;
   unresolvedCompositions: UnresolvedElement[];
+  variablesByComp: Record<string, Record<string, unknown>>;
   /** Assets that resolve outside projectDir. Keys are the path used in HTML, values are absolute filesystem paths. */
   externalAssets: Map<string, string>;
   width: number;
@@ -77,15 +181,35 @@ export interface CompiledComposition {
   hasShaderTransitions: boolean;
   /** Author HTML/CSS/scripts use a CSS 3D rendering context (pre-CDN-inline scan). */
   usesThreeDTransforms: boolean;
-  /** Author HTML/CSS use mix-blend-mode (pre-CDN-inline scan). */
-  usesMixBlendMode: boolean;
   /** Ancestors of the composition root carry a background-image (gradient/url). */
   hasAncestorBackgroundImage: boolean;
 }
 
+const INFERRED_MEDIA_DURATION_ATTR = "data-hf-inferred-duration";
+
 /** Adapts linkedom's `parseHTML` to the `checkSubCompositionUsability` contract. */
 function parseSubCompHtmlForValidity(html: string): ParsableDocumentLike {
   return parseHTML(html).document as unknown as ParsableDocumentLike;
+}
+
+function endsWithSourceUrl(code: string): boolean {
+  const trimmed = code.trimEnd();
+  const lastLine = trimmed.slice(trimmed.lastIndexOf("\n") + 1).trimStart();
+  return lastLine.startsWith("//# sourceURL=") || lastLine.startsWith("//@ sourceURL=");
+}
+
+// One name for the composition's inline code lets a render keep its errors and not a widget's.
+function prepareCompositionScripts(html: string): string {
+  const { document } = parseHTML(html);
+  for (const el of document.querySelectorAll("script:not([src])")) {
+    const isModule = (el.getAttribute("type") || "").trim().toLowerCase() === "module";
+    const runsAsScript = isModule || isJavaScriptType(el as unknown as Element);
+    const code = el.textContent ?? "";
+    if (!runsAsScript || endsWithSourceUrl(code)) continue;
+    el.textContent = `${code}\n//# sourceURL=${COMPOSITION_SOURCE_URL}`;
+  }
+  deferScriptsUntilFonts(document as unknown as Document);
+  return document.toString();
 }
 
 export function injectSdkPositionEditsRenderScript(html: string): string {
@@ -93,10 +217,8 @@ export function injectSdkPositionEditsRenderScript(html: string): string {
     return html;
   }
   const scriptBody = getPositionEditsRenderScript().replace(/<\/script/gi, "<\\/script");
-  const script = `<script>${scriptBody}</script>`;
-  const bodyClose = html.search(/<\/body\s*>/i);
-  if (bodyClose < 0) return `${html}${script}`;
-  return `${html.slice(0, bodyClose)}${script}${html.slice(bodyClose)}`;
+  const script = `<script>${scriptBody}\n//# sourceURL=hyperframes://position-edits</script>`;
+  return insertBeforeCloseTag(html, "body", script) ?? `${html}${script}`;
 }
 
 /**
@@ -133,12 +255,128 @@ class EmptyCompositionError extends Error {
       `${problems.length} composition file${problems.length === 1 ? "" : "s"} referenced by ` +
         `data-composition-src cannot be rendered:\n${lines.join("\n")}\n\n` +
         "Check that each file referenced by data-composition-src contains valid HTML with a " +
-        "<template> or <body> containing a [data-composition-id] element. If a scene-authoring " +
+        "[data-composition-id] element in a <template>, <body>, or bare fragment. If a scene-authoring " +
         "step is still running, wait for it to finish before referencing the file.",
     );
     this.name = "EmptyCompositionError";
     this.problems = problems;
   }
+}
+
+/** The html with each data-composition-src as the project-relative path it names (%xx decoded, no leading /, \ or ./). */
+function normalizeCompositionSrcs(html: string, projectDir: string): string {
+  return html.replace(/(\bdata-composition-src=)(["'])([^"']*)\2/g, (whole, name, quote, value) => {
+    if (!value.includes("%") && !/^\.?[\\/]/.test(value)) return whole;
+    const file = resolveCompositionSrc(projectDir, value);
+    if (file === null) return whole;
+    return `${name}${quote}${relative(projectDir, file).split(sep).join("/")}${quote}`;
+  });
+}
+
+const COMPOSITION_FILE = /\.html?$/i;
+const NOT_A_COMPOSITION_FILE = "it is not an .html file, so it is refused";
+
+function resolveCompositionPath(
+  projectDir: string,
+  src: string,
+  assetRoot: string | undefined,
+): string | null {
+  const file = resolveCompositionSrc(projectDir, src);
+  return file === null || escapesAssetRoot(file, assetRoot) ? null : file;
+}
+
+function resolveCompositionFile(
+  projectDir: string,
+  src: string,
+  assetRoot: string | undefined,
+): string | null {
+  const file = resolveCompositionPath(projectDir, src, assetRoot);
+  return file !== null && COMPOSITION_FILE.test(file) ? file : null;
+}
+
+const OUTSIDE_COMPOSITION_NEEDS_FLAG =
+  "it is outside the project, and any scripts in it would run; move it into the project, or pass --include-outside-files to hyperframes render, to include it";
+
+/** A trusted local render was not told to run markup whose real file is outside the project. */
+const runsOutsideMarkupUnasked = (
+  projectDir: string,
+  filePath: string,
+  assetRoot: string | undefined,
+  outsideFiles: OutsideFilePolicy,
+): boolean =>
+  assetRoot === undefined && !outsideFiles.includeScripts && linksOutside(projectDir, filePath);
+
+/** The readers check again, so a file swapped for an outside link after the pre-flight is still refused. */
+function assertOutsideMarkupAsked(
+  projectDir: string,
+  filePath: string,
+  srcPath: string,
+  assetRoot: string | undefined,
+  outsideFiles: OutsideFilePolicy,
+): void {
+  if (runsOutsideMarkupUnasked(projectDir, filePath, assetRoot, outsideFiles)) {
+    throw new EmptyCompositionError([{ srcPath, detail: OUTSIDE_COMPOSITION_NEEDS_FLAG }]);
+  }
+}
+
+// Git metadata, env files and the app's `.hyperframes/` records are never inlined into a render, as preview refuses them.
+const isPrivateCompositionFile = (projectDir: string, filePath: string): boolean =>
+  isPrivateFileUnder(projectDir, filePath, isStudioPrivatePath);
+
+type CompositionProblem = { srcPath: string; detail: string };
+
+/** `templated` holds mounts inside templates. Reading `template.content` per level would clone each subtree again. */
+function compositionSrcsIn(html: string): { mounts: string[]; templated: string[] } {
+  const { document } = parseHTML(html);
+  const mounts: string[] = [];
+  const templated: string[] = [];
+  const stack: Array<[Element, boolean]> = [...document.children]
+    .reverse()
+    .map((el) => [el, false]);
+  for (let next = stack.pop(); next; next = stack.pop()) {
+    const [el, inTemplate] = next;
+    const srcPath = el.getAttribute("data-composition-src");
+    if (srcPath && !isUnresolvedAssetPlaceholder(srcPath)) {
+      (inTemplate ? templated : mounts).push(srcPath);
+    }
+    const childrenInTemplate = inTemplate || el.localName === "template";
+    const children = [...el.children];
+    for (let i = children.length - 1; i >= 0; i -= 1)
+      stack.push([children[i]!, childrenInTemplate]);
+  }
+  return { mounts, templated };
+}
+
+function compositionPathProblem(
+  projectDir: string,
+  filePath: string,
+  assetRoot: string | undefined,
+  outsideFiles: OutsideFilePolicy,
+): string | null {
+  if (outsideAssetRefusal(projectDir, filePath) === "blocklisted") {
+    return "it is outside the project in a private location";
+  }
+  if (runsOutsideMarkupUnasked(projectDir, filePath, assetRoot, outsideFiles)) {
+    return OUTSIDE_COMPOSITION_NEEDS_FLAG;
+  }
+  if (isPrivateCompositionFile(projectDir, filePath)) {
+    return "it is git metadata, an env file or a private tool record";
+  }
+  return COMPOSITION_FILE.test(filePath) ? null : NOT_A_COMPOSITION_FILE;
+}
+
+function readSubCompositionFile(
+  filePath: string,
+  srcPath: string,
+): { detail: string } | { bytes: number; mounts: string[]; templated: string[] } {
+  assertCompositionFileSize(filePath, srcPath);
+  const read = readProjectFile(filePath);
+  if (read.kind === "missing") return { detail: "the file does not exist" };
+  if (read.kind === "folder") return { detail: "it is a folder, not an HTML file" };
+  const validity = checkSubCompositionUsability(read.text, parseSubCompHtmlForValidity);
+  if (!validity.ok)
+    return { detail: validity.detail ?? "the file is empty or could not be parsed" };
+  return { bytes: Buffer.byteLength(read.text), ...compositionSrcsIn(read.text) };
 }
 
 /**
@@ -155,71 +393,74 @@ class EmptyCompositionError extends Error {
  * exchange for failing in milliseconds instead of after the browser has
  * already launched and waited out a capture timeout.
  */
-// fallow-ignore-next-line complexity
 function assertSubCompositionsUsable(
   html: string,
   projectDir: string,
-  visited: Set<string> = new Set(),
+  assetRoot: string | undefined,
+  outsideFiles: OutsideFilePolicy,
 ): void {
-  const { document } = parseHTML(html);
-  const hosts = [...document.querySelectorAll("[data-composition-src]")];
-  const problems: Array<{ srcPath: string; detail: string }> = [];
+  const budget = new CompositionExpansionBudget();
+  const files = new Map<string, ReturnType<typeof readSubCompositionFile>>();
+  const problems = new Map<string, CompositionProblem>();
+  const report = (srcPath: string, detail: string) =>
+    problems.set(`${srcPath}\0${detail}`, { srcPath, detail });
+  // The files on the current mount chain. A repeat is a cycle, which the compiler skips silently too.
+  const chain = new Set<string>();
+  const paths = new Map<string, { detail: string } | { filePath: string }>();
+  const resolveMount = (srcPath: string): { detail: string } | { filePath: string } => {
+    const filePath = resolveCompositionPath(projectDir, srcPath, assetRoot);
+    if (filePath === null) return { detail: "it is outside the project folder" };
+    const detail = compositionPathProblem(projectDir, filePath, assetRoot, outsideFiles);
+    return detail ? { detail } : { filePath };
+  };
 
-  for (const el of hosts) {
-    const srcPath = el.getAttribute("data-composition-src");
-    if (!srcPath) continue;
-    if (/^__[A-Z_]+__$/.test(srcPath)) continue; // template placeholder, not a real reference — matches lint's skip
-
-    const filePath = resolve(projectDir, srcPath);
-    // Circular reference guard. parseSubCompositions (below) silently
-    // `continue`s on a repeat visit with no reporting at all — mirror that
-    // silence here rather than pretend it surfaces an error somewhere else.
-    if (visited.has(filePath)) continue;
-
-    if (!existsSync(filePath)) {
-      problems.push({ srcPath, detail: "the file does not exist" });
-      continue;
-    }
-
-    const fileHtml = readFileSync(filePath, "utf-8");
-    const validity = checkSubCompositionUsability(fileHtml, parseSubCompHtmlForValidity);
-    if (!validity.ok) {
-      problems.push({
-        srcPath,
-        detail: validity.detail ?? "the file is empty or could not be parsed",
-      });
-      continue;
-    }
-
-    // Recurse into nested sub-compositions so a broken scene three levels
-    // deep is still named directly instead of surfacing as a parent-level
-    // "no error, just missing content" mystery.
-    //
-    // Pass `projectDir` unchanged (not dirname(filePath)) — data-composition-src
-    // is always resolved root-relative, even from within a nested
-    // sub-composition. This must match parseSubCompositions' own recursive
-    // call below exactly (it threads the original projectDir through every
-    // level too), or this pre-flight check resolves nested references to the
-    // wrong path and aborts renders that would have actually succeeded.
-    const nestedVisited = new Set(visited);
-    nestedVisited.add(filePath);
-    try {
-      assertSubCompositionsUsable(fileHtml, projectDir, nestedVisited);
-    } catch (err) {
-      if (err instanceof EmptyCompositionError) {
-        problems.push(...err.problems);
-      } else {
-        throw err;
+  // data-composition-src resolves root-relative at every level, as parseSubCompositions and the inliner
+  // resolve it, so `projectDir` stays unchanged. Each path is checked, and each file read, once.
+  // A mount inside a template is charged to the budget but not reported: the inliner skips it with a warning.
+  const walk = (srcPaths: readonly string[], quiet: boolean): void => {
+    for (const srcPath of srcPaths) {
+      let resolved = paths.get(srcPath);
+      if (!resolved) {
+        resolved = resolveMount(srcPath);
+        paths.set(srcPath, resolved);
       }
-    }
-  }
+      if ("detail" in resolved) {
+        if (!quiet) report(srcPath, resolved.detail);
+        continue;
+      }
+      const { filePath } = resolved;
+      if (chain.has(filePath)) continue;
 
-  if (problems.length > 0) {
-    throw new EmptyCompositionError(problems);
+      let file = files.get(filePath);
+      if (!file) {
+        file = readSubCompositionFile(filePath, srcPath);
+        files.set(filePath, file);
+      }
+      if ("detail" in file) {
+        if (!quiet) report(srcPath, file.detail);
+        continue;
+      }
+      budget.charge(srcPath, file.bytes);
+      chain.add(filePath);
+      walk(file.mounts, quiet);
+      walk(file.templated, true);
+      chain.delete(filePath);
+    }
+  };
+  const entry = compositionSrcsIn(html);
+  walk(entry.mounts, false);
+  walk(entry.templated, true);
+
+  if (problems.size > 0) {
+    throw new EmptyCompositionError([...problems.values()]);
   }
 }
 
-export type RenderModeHintCode = "iframe" | "requestAnimationFrame" | "htmlInCanvas";
+export type RenderModeHintCode =
+  | "iframe"
+  | "requestAnimationFrame"
+  | "htmlInCanvas"
+  | "captureMotionBlur";
 
 export interface RenderModeHint {
   code: RenderModeHintCode;
@@ -231,41 +472,44 @@ export interface RenderModeHints {
   reasons: RenderModeHint[];
 }
 
-function dedupeElementsById<T extends { id: string }>(elements: T[]): T[] {
-  const deduped = new Map<string, T>();
-  for (const element of elements) {
-    deduped.set(element.id, element);
-  }
-  return Array.from(deduped.values());
-}
-
-const INLINE_SCRIPT_PATTERN = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
 const COMPILER_MOUNT_BLOCK_START = "/* __HF_COMPILER_MOUNT_START__ */";
 const COMPILER_MOUNT_BLOCK_END = "/* __HF_COMPILER_MOUNT_END__ */";
 
 function stripJsComments(source: string): string {
-  return source.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+  return removeDelimitedRuns(source.replace(/\/\/.*$/gm, ""), "/*", "*/");
 }
 
 function stripCompilerMountBootstrap(source: string): string {
-  return source.replace(
-    new RegExp(
-      `${COMPILER_MOUNT_BLOCK_START.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[\\s\\S]*?${COMPILER_MOUNT_BLOCK_END.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
-      "g",
-    ),
-    "",
+  return removeDelimitedRuns(source, COMPILER_MOUNT_BLOCK_START, COMPILER_MOUNT_BLOCK_END);
+}
+
+/** The composition the runtime reads data-motion-blur from: `data-root="true"`, else the first. */
+function runtimeRoot(document: ParentNode): Element | null {
+  return (
+    document.querySelector('[data-composition-id][data-root="true"]') ??
+    document.querySelector("[data-composition-id]")
   );
 }
 
-export function detectRenderModeHints(html: string): RenderModeHints {
+export function detectRenderModeHints(html: string, pageMotionBlur?: "off"): RenderModeHints {
   const reasons: RenderModeHint[] = [];
   const { document } = parseHTML(html);
 
-  if (document.querySelector("canvas[layoutsubtree]")) {
+  if (document.querySelector(CAPTURE_CANVAS_SELECTOR)) {
     reasons.push({
       code: "htmlInCanvas",
       message:
         "Detected html-in-canvas API (layoutsubtree canvas). Chrome does not support concurrent drawElementImage across multiple workers; render is pinned to a single worker.",
+    });
+  } else if (
+    pageMotionBlur !== "off" &&
+    runtimeRoot(document)?.getAttribute("data-motion-blur") === "on"
+  ) {
+    // Not pinned to one worker: k3-promo measured identical across 1 and 4 workers, 2× faster.
+    reasons.push({
+      code: "captureMotionBlur",
+      message:
+        'Detected motion blur (data-motion-blur="on"), drawn per frame with an SVG filter or, on the capture tier, html-in-canvas; routed through screenshot capture mode.',
     });
   }
 
@@ -277,12 +521,9 @@ export function detectRenderModeHints(html: string): RenderModeHints {
     });
   }
 
-  let scriptMatch: RegExpExecArray | null;
-  const scriptPattern = new RegExp(INLINE_SCRIPT_PATTERN.source, INLINE_SCRIPT_PATTERN.flags);
-  while ((scriptMatch = scriptPattern.exec(html)) !== null) {
-    const attrs = scriptMatch[1] || "";
+  for (const { attrs, body } of inlineScriptBlocks(html)) {
     if (/\bsrc\s*=/i.test(attrs)) continue;
-    const content = stripJsComments(stripCompilerMountBootstrap(scriptMatch[2] || ""));
+    const content = stripJsComments(stripCompilerMountBootstrap(body));
     if (!/requestAnimationFrame\s*\(/.test(content)) continue;
     reasons.push({
       code: "requestAnimationFrame",
@@ -321,16 +562,6 @@ export function detectThreeDTransformUsage(html: string): boolean {
   return THREE_D_CONTEXT_PATTERN.test(html);
 }
 
-const MIX_BLEND_MODE_PATTERN = /mix-blend-mode\s*:/i;
-
-function detectMixBlendModeUsage(html: string): boolean {
-  return MIX_BLEND_MODE_PATTERN.test(html);
-}
-
-/** A background declaration whose value paints an image (gradient or url). */
-const BACKGROUND_IMAGE_DECL_PATTERN =
-  /(?:^|;|\{)\s*background(?:-image)?\s*:[^;}]*(?:\bgradient\s*\(|url\s*\()/i;
-
 /**
  * Background-image signals on ancestors of the composition root.
  * drawElementImage only paints the captured subtree; drawElementService's
@@ -357,7 +588,7 @@ export function detectAncestorBackgroundImage(html: string): boolean {
   // Inline styles on the ancestor chain.
   for (const el of ancestors) {
     const style = el.getAttribute("style");
-    if (style && BACKGROUND_IMAGE_DECL_PATTERN.test(`{${style}}`)) return true;
+    if (style && hasBackgroundImageDeclaration(`{${style}}`)) return true;
   }
   // <style> rules: any rule carrying an image-painting background declaration
   // whose selector resolves to an ancestor of the root. Selector matching goes
@@ -365,9 +596,9 @@ export function detectAncestorBackgroundImage(html: string): boolean {
   // covered, not just literal `body`/`html`.
   for (const styleEl of document.querySelectorAll("style")) {
     const css = styleEl.textContent ?? "";
-    for (const rule of css.matchAll(/([^{}]+)\{([^}]*)\}/g)) {
-      const [, selectorList = "", declarations = ""] = rule;
-      if (!BACKGROUND_IMAGE_DECL_PATTERN.test(`{${declarations}}`)) continue;
+    for (const { parts: rule } of cssRuleMatches(css)) {
+      const [, selectorList, declarations] = rule;
+      if (!hasBackgroundImageDeclaration(`{${declarations}}`)) continue;
       for (const selector of selectorList.split(",")) {
         const sel = selector.trim();
         if (!sel || sel.startsWith("@")) continue;
@@ -389,62 +620,148 @@ const SHADER_TRANSITION_USAGE_PATTERN =
   /\b(?:(?:window|globalThis)\s*\.\s*)?HyperShader\s*\.\s*init\s*\(|\b__hf\s*\.\s*transitions\s*=/;
 
 export function detectShaderTransitionUsage(html: string): boolean {
-  let scriptMatch: RegExpExecArray | null;
-  const scriptPattern = new RegExp(INLINE_SCRIPT_PATTERN.source, INLINE_SCRIPT_PATTERN.flags);
-  while ((scriptMatch = scriptPattern.exec(html)) !== null) {
-    const attrs = scriptMatch[1] || "";
+  for (const { attrs, body } of inlineScriptBlocks(html)) {
     if (/\bsrc\s*=/i.test(attrs)) continue;
-    const content = stripJsComments(stripCompilerMountBootstrap(scriptMatch[2] || ""));
+    const content = stripJsComments(stripCompilerMountBootstrap(body));
     if (SHADER_TRANSITION_USAGE_PATTERN.test(content)) return true;
   }
 
   return false;
 }
 
+type SourceProbe = { profile: MediaProbeProfile; fileDuration: number | null } | { error: unknown };
+
+/** One probe per unique source for a whole compile, whatever number of elements point at it. */
+type SourceProbes = Map<string, Promise<SourceProbe>>;
+
 async function resolveMediaDuration(
   src: string,
   mediaStart: number,
+  playbackRate: RateSpec,
+  projectDir: string,
   baseDir: string,
   downloadDir: string,
   tagName: string,
-): Promise<{ duration: number; resolvedPath: string }> {
+  elementIdentity: string,
+  log?: ProducerLogger,
+  urlByAbsentLocalPath?: ReadonlyMap<string, string>,
+  probes?: SourceProbes,
+  assetRoot?: string,
+): Promise<{ duration: number | null; resolvedPath: string }> {
   let filePath = src;
 
   if (isHttpUrl(src)) {
-    if (!existsSync(downloadDir)) mkdirSync(downloadDir, { recursive: true });
+    const remoteDir = join(downloadDir, REMOTE_MEDIA_SUBDIR);
+    if (!existsSync(remoteDir)) mkdirSync(remoteDir, { recursive: true });
     try {
-      filePath = await downloadToTemp(src, downloadDir);
+      filePath = await downloadToTemp(src, remoteDir, undefined, undefined, undefined, {
+        onTelemetry: logRemoteDownloadTelemetry,
+      });
     } catch {
       // Download failed (e.g. 404 placeholder URL) — skip gracefully.
       // The element will get duration 0 and be excluded from the render.
-      return { duration: 0, resolvedPath: src };
+      return { duration: null, resolvedPath: src };
     }
-  } else if (!filePath.startsWith("/")) {
-    filePath = join(baseDir, filePath);
-  }
-
-  if (!existsSync(filePath)) {
-    return { duration: 0, resolvedPath: filePath };
-  }
-
-  let metadata: { durationSeconds: number };
-  if (tagName === "video") {
-    metadata = await extractMediaMetadata(filePath);
   } else {
-    try {
-      metadata = await extractAudioMetadata(filePath);
-    } catch {
-      // Source file has no audio stream (e.g. a silent video used as an audio src).
-      // Return duration 0 so the element is excluded from the composition gracefully,
-      // matching how missing files and failed downloads are already handled above.
-      return { duration: 0, resolvedPath: filePath };
+    filePath = decodedUrlPath(src);
+    if (!filePath.startsWith("/")) filePath = join(baseDir, filePath);
+    if (
+      escapesAssetRoot(filePath, assetRoot) ||
+      isPrivateUnderAssetRoots(filePath, [projectDir, downloadDir])
+    ) {
+      return { duration: null, resolvedPath: filePath };
+    }
+    // ffprobe reads only the header of a remote source, so it is probed in place.
+    filePath = urlByAbsentLocalPath?.get(filePath) ?? filePath;
+    if (!isHttpUrl(filePath) && namesAnotherNetworkRoot(baseDir, filePath)) {
+      return { duration: null, resolvedPath: filePath };
     }
   }
 
-  const fileDuration = metadata.durationSeconds;
-  const effectiveDuration = fileDuration - mediaStart;
-  const duration = effectiveDuration > 0 ? effectiveDuration : fileDuration;
+  if (!isHttpUrl(filePath) && !existsSync(filePath)) {
+    return { duration: null, resolvedPath: filePath };
+  }
 
+  // STUDIO-5433: attach the remote `src` to any ffprobe failure surfaced from
+  // this branch. `extractMediaMetadata` → `runFfprobe` intentionally redacts
+  // its local `filePath` out of the error message (see
+  // engine/utils/ffprobe.ts::redactFfprobeInput), so a bare `moov atom not
+  // found` in Datadog carries no attribution and requires a Temporal history
+  // dump to identify the offending source. Re-throwing with the `src`
+  // (query-string redacted via `redactTelemetryString` so pre-signed URL
+  // signatures never reach telemetry) makes the next occurrence diagnosable
+  // directly from the render error. Fail-fast semantics for the video branch
+  // are preserved — only the message is enriched.
+  const withSrcContext = (error: unknown): Error => {
+    // A NotMediaPayloadError already carries its own attribution AND the
+    // routing metadata downstream keys on — `.code = "NOT_MEDIA_PAYLOAD"`,
+    // `.owner = "user"`, `.retryable = false`, `.elementFingerprints`. Wrapping
+    // it in a bare Error drops all four, flipping a user-input bug to
+    // generic/system/retryable: it pages ops and re-runs the render. Pass it
+    // through untouched.
+    if (error instanceof NotMediaPayloadError) return error;
+    const originalMessage = error instanceof Error ? error.message : String(error);
+    const safeSrc = redactTelemetryString(src);
+    const wrapped = new Error(`${originalMessage} [src=${safeSrc}]`);
+    if (error instanceof Error && error.stack) wrapped.stack = error.stack;
+    return wrapped;
+  };
+
+  const probe = () =>
+    withMediaProbeSlot(async (): Promise<SourceProbe> => {
+      try {
+        // Payload sniff (STUDIO-5433): if an authoring bug hands us a text
+        // payload (e.g. an unresolved nested-composition preview URL), fail with
+        // a typed NotMediaPayloadError instead of letting ffprobe emit an opaque
+        // `[mov,mp4,...] moov atom not found` that routes as a codec bug.
+        await assertMediaPayload(filePath, elementIdentity);
+        const profile = await probeMediaProfile(filePath);
+        if (tagName === "video") {
+          return { profile, fileDuration: (await extractMediaMetadata(filePath)).durationSeconds };
+        }
+        try {
+          return { profile, fileDuration: (await extractAudioMetadata(filePath)).durationSeconds };
+        } catch {
+          // Source file has no audio stream (e.g. a silent video used as an audio src).
+          // Duration 0 excludes the element from the composition, as missing files do.
+          return { profile, fileDuration: null };
+        }
+      } catch (error) {
+        return { error };
+      }
+    });
+  const key = `${tagName}\0${filePath}`;
+  let probed = probes?.get(key);
+  if (!probed) {
+    probed = probe();
+    probes?.set(key, probed);
+  }
+  const outcome = await probed;
+  if ("error" in outcome) {
+    // Invalid video sources surface their probe failure; invalid or unreadable
+    // audio sources resolve to zero duration and are excluded by the compiler.
+    if (tagName !== "video") {
+      if (outcome.error instanceof NotMediaPayloadError) {
+        log?.warn(
+          `[compile] Audio "${elementIdentity}" (${src}) is a text document, not a media ` +
+            "file, so the element is dropped from the render. Point it at a rendered media file.",
+        );
+      }
+      return { duration: null, resolvedPath: filePath };
+    }
+    throw withSrcContext(outcome.error);
+  }
+  assertAssetMediaTypeProfile(
+    tagName === "video" ? "video" : "audio",
+    outcome.profile,
+    elementIdentity,
+  );
+  if (outcome.fileDuration === null) return { duration: null, resolvedPath: filePath };
+  const duration = resolveNaturalMediaTimelineDurationFromValues(
+    outcome.fileDuration,
+    mediaStart,
+    playbackRate,
+  );
   return { duration, resolvedPath: filePath };
 }
 
@@ -452,11 +769,32 @@ async function resolveMediaDuration(
  * Compile a single HTML file: static pass + ffprobe for unresolved media.
  * Returns compiled HTML and any unresolved composition elements that need browser resolution.
  */
+function markInferredVariableMediaDurations(
+  html: string,
+  unresolvedMedia: readonly UnresolvedElement[],
+): string {
+  const unresolvedIds = new Set(unresolvedMedia.map((element) => element.id));
+  if (unresolvedIds.size === 0) return html;
+
+  const { document } = parseHTML(html);
+  let changed = false;
+  for (const element of document.querySelectorAll("video[data-var-src], audio[data-var-src]")) {
+    if (!unresolvedIds.has(element.id)) continue;
+    element.setAttribute(INFERRED_MEDIA_DURATION_ATTR, "");
+    changed = true;
+  }
+  return changed ? document.toString() : html;
+}
+
 async function compileHtmlFile(
   html: string,
+  projectDir: string,
   baseDir: string,
   downloadDir: string,
   log?: ProducerLogger,
+  urlByAbsentLocalPath?: ReadonlyMap<string, string>,
+  probes?: SourceProbes,
+  assetRoot?: string,
 ): Promise<{ html: string; unresolvedCompositions: UnresolvedElement[] }> {
   const { html: staticCompiled, unresolved } = compileTimingAttrs(html);
 
@@ -469,29 +807,51 @@ async function compileHtmlFile(
   // Phase 1: Resolve missing durations (parallel ffprobe)
   const resolvedResults = await Promise.all(
     mediaUnresolved.map((el) =>
-      resolveMediaDuration(el.src!, el.mediaStart, baseDir, downloadDir, el.tagName).then(
-        ({ duration }) => ({ id: el.id, duration }),
-      ),
+      resolveMediaDuration(
+        el.src!,
+        el.mediaStart,
+        el.playbackRate,
+        projectDir,
+        baseDir,
+        downloadDir,
+        el.tagName,
+        el.id,
+        log,
+        urlByAbsentLocalPath,
+        probes,
+        assetRoot,
+      ).then(({ duration }) => ({ id: el.id, duration })),
     ),
   );
-  const resolutions: ResolvedDuration[] = resolvedResults.filter((r) => r.duration > 0);
+  const resolutions: ResolvedDuration[] = resolvedResults.filter(
+    (r): r is ResolvedDuration => r.duration != null && Number.isFinite(r.duration),
+  );
 
+  const markedStaticHtml = markInferredVariableMediaDurations(staticCompiled, mediaUnresolved);
   let compiledHtml =
-    resolutions.length > 0 ? injectDurations(staticCompiled, resolutions) : staticCompiled;
+    resolutions.length > 0 ? injectDurations(markedStaticHtml, resolutions) : markedStaticHtml;
 
   // Phase 2: Bound authored audio to playable source (parallel ffprobe).
   // Explicit video slots may outlive their source and hold the final frame.
   const preResolved = extractResolvedMedia(compiledHtml);
+  const hiddenVideoIds = collectHiddenVideoIds(compiledHtml);
   const clampResults = await Promise.all(
     preResolved
-      .filter((el) => !!el.src && !el.loop)
+      .filter((el) => !!el.src && !el.loop && !hiddenVideoIds.has(el.id))
       .map(async (el) => {
         const { duration: maxDuration } = await resolveMediaDuration(
           el.src!,
           el.mediaStart,
+          el.playbackRate,
+          projectDir,
           baseDir,
           downloadDir,
           el.tagName,
+          el.id,
+          log,
+          undefined,
+          probes,
+          assetRoot,
         );
         return { id: el.id, tagName: el.tagName, duration: el.duration, maxDuration, src: el.src! };
       }),
@@ -499,7 +859,7 @@ async function compileHtmlFile(
   const clampList: ResolvedDuration[] = [];
   for (const r of clampResults) {
     if (
-      r.maxDuration > 0 &&
+      r.maxDuration != null &&
       shouldClampResolvedMediaDuration(r.tagName, r.duration, r.maxDuration)
     ) {
       clampList.push({ id: r.id, duration: r.maxDuration });
@@ -509,7 +869,7 @@ async function compileHtmlFile(
       // thread `log` through parseSubCompositions to warn for it too.
       log?.warn(
         `[compile] Audio "${r.id}" (${r.src}) is ${r.maxDuration.toFixed(2)}s but its ` +
-          `data-duration is ${r.duration.toFixed(2)}s — the slot is shortened to the media ` +
+          `data-duration is ${r.duration.toFixed(2)}s, so the slot is shortened to the media ` +
           `length. Set data-duration to ~${r.maxDuration.toFixed(2)}s, trim data-media-start, ` +
           `or use a longer/looping source if that isn't intended.`,
       );
@@ -524,13 +884,13 @@ async function compileHtmlFile(
   // injected frame images, so the browser never needs to load the source.
   // Without this, videos with crossorigin="anonymous" targeting CORS-restricted
   // origins (e.g. S3 without CORS headers) keep readyState=0, blocking page setup.
-  compiledHtml = compiledHtml.replace(/(<video\b[^>]*)\s+crossorigin(?:=["'][^"']*["'])?/gi, "$1");
+  compiledHtml = stripCrossoriginAttr(compiledHtml, "video");
 
   // Strip crossorigin from img elements. The renderer captures DOM frames visually —
   // no canvas readback — so CORS compliance is unnecessary. External images from
   // CORS-restricted origins (e.g. S3) render blank when crossorigin forces a failed
   // CORS request against the renderer's localhost file server.
-  compiledHtml = compiledHtml.replace(/(<img\b[^>]*)\s+crossorigin(?:=["'][^"']*["'])?/gi, "$1");
+  compiledHtml = stripCrossoriginAttr(compiledHtml, "img");
 
   // Strip crossorigin from audio elements. Audio is processed out-of-band via
   // FFmpeg; the browser's CORS policy for audio elements is irrelevant to
@@ -539,32 +899,32 @@ async function compileHtmlFile(
   // headers reject — leaving audio elements in a failed network state. The
   // FFmpeg audio path reads the src URL directly and is unaffected by browser
   // CORS, so stripping the attribute has no side effects.
-  compiledHtml = compiledHtml.replace(/(<audio\b[^>]*)\s+crossorigin(?:=["'][^"']*["'])?/gi, "$1");
+  compiledHtml = stripCrossoriginAttr(compiledHtml, "audio");
 
   return { html: compiledHtml, unresolvedCompositions };
 }
 
 /**
- * Parse sub-compositions referenced via data-composition-src.
- * Reads each file, compiles it, extracts video/audio, adjusts timing offsets.
- * Recurses into nested sub-compositions with accumulated offsets.
+ * Compile every sub-composition referenced via data-composition-src, keyed by
+ * its source path for the inliner to hoist into the render document.
+ * Recurses so nested references are compiled too.
+ *
+ * Media used to be extracted here as well, with each file's clips offset onto
+ * the parent timeline. That is now read off the inlined document instead
+ * (collectRenderMedia): per-file extraction had to merge on element id, which
+ * is not unique across files, so colliding clips silently collapsed (#3340).
  */
 async function parseSubCompositions(
   html: string,
   projectDir: string,
   downloadDir: string,
-  parentOffset: number = 0,
-  parentEnd: number = Infinity,
   visited: Set<string> = new Set(),
-): Promise<{
-  videos: VideoElement[];
-  audios: AudioElement[];
-  images: ImageElement[];
-  subCompositions: Map<string, string>;
-}> {
-  const videos: VideoElement[] = [];
-  const audios: AudioElement[] = [];
-  const images: ImageElement[] = [];
+  urlByAbsentLocalPath?: ReadonlyMap<string, string>,
+  probes?: SourceProbes,
+  assetRoot?: string,
+  outsideFiles: OutsideFilePolicy = {},
+  compiledSrcs: Set<string> = new Set(),
+): Promise<{ subCompositions: Map<string, string> }> {
   const subCompositions = new Map<string, string>();
 
   const { document } = parseHTML(html);
@@ -573,8 +933,6 @@ async function parseSubCompositions(
   // Build work items, filtering out invalid/circular entries synchronously
   const workItems: Array<{
     srcPath: string;
-    absoluteStart: number;
-    absoluteEnd: number;
     filePath: string;
     rawSubHtml: string;
     nestedVisited: Set<string>;
@@ -584,62 +942,61 @@ async function parseSubCompositions(
     const srcPath = el.getAttribute("data-composition-src");
     if (!srcPath) continue;
 
-    const elStart = parseFloat(el.getAttribute("data-start") || "0");
-    const elEndRaw = el.getAttribute("data-end");
-    const elEnd = elEndRaw ? parseFloat(elEndRaw) : Infinity;
-
-    const absoluteStart = parentOffset + elStart;
-    const absoluteEnd = Math.min(parentEnd, isFinite(elEnd) ? parentOffset + elEnd : Infinity);
-
-    const filePath = resolve(projectDir, srcPath);
+    const filePath = resolveCompositionFile(projectDir, srcPath, assetRoot);
+    if (filePath === null || isPrivateCompositionFile(projectDir, filePath)) continue;
 
     // Circular reference guard
     if (visited.has(filePath)) {
       continue;
     }
+    // A path compiles the same wherever it is mounted, so each one is compiled once per render.
+    if (compiledSrcs.has(srcPath)) continue;
+    compiledSrcs.add(srcPath);
 
-    if (!existsSync(filePath)) {
+    assertOutsideMarkupAsked(projectDir, filePath, srcPath, assetRoot, outsideFiles);
+    assertCompositionFileSize(filePath, srcPath);
+    const read = readProjectFile(filePath);
+    if (read.kind !== "file") {
       continue;
     }
 
-    const rawSubHtml = readFileSync(filePath, "utf-8");
+    const rawSubHtml = normalizeCompositionSrcs(read.text, projectDir);
     const nestedVisited = new Set(visited);
     nestedVisited.add(filePath);
 
-    workItems.push({ srcPath, absoluteStart, absoluteEnd, filePath, rawSubHtml, nestedVisited });
+    workItems.push({ srcPath, filePath, rawSubHtml, nestedVisited });
   }
 
   // Parallelize file compilation + recursive parsing
   const results = await Promise.all(
     workItems.map(async (item) => {
       const { html: compiledSub } = await compileHtmlFile(
-        item.rawSubHtml,
+        rewriteUnresolvableGsapToCdn(item.rawSubHtml, projectDir, item.srcPath),
+        projectDir,
         dirname(item.filePath),
         downloadDir,
+        undefined,
+        urlByAbsentLocalPath,
+        probes,
+        assetRoot,
       );
 
       const nested = await parseSubCompositions(
         compiledSub,
         projectDir,
         downloadDir,
-        item.absoluteStart,
-        item.absoluteEnd,
         item.nestedVisited,
+        urlByAbsentLocalPath,
+        probes,
+        assetRoot,
+        outsideFiles,
+        compiledSrcs,
       );
-
-      const subVideos = parseVideoElements(compiledSub);
-      const subAudios = parseAudioElements(compiledSub);
-      const subImages = parseImageElements(compiledSub);
 
       return {
         srcPath: item.srcPath,
         compiledSub,
         nested,
-        subVideos,
-        subAudios,
-        subImages,
-        absoluteStart: item.absoluteStart,
-        absoluteEnd: item.absoluteEnd,
       };
     }),
   );
@@ -651,55 +1008,9 @@ async function parseSubCompositions(
     for (const [key, value] of r.nested.subCompositions) {
       subCompositions.set(key, value);
     }
-    videos.push(...r.nested.videos);
-    audios.push(...r.nested.audios);
-    images.push(...r.nested.images);
-
-    for (const v of r.subVideos) {
-      v.start += r.absoluteStart;
-      v.end += r.absoluteStart;
-      if (v.end > r.absoluteEnd) {
-        v.end = r.absoluteEnd;
-      }
-      if (v.start < r.absoluteEnd) {
-        videos.push(v);
-      }
-    }
-
-    for (const a of r.subAudios) {
-      a.start += r.absoluteStart;
-      a.end += r.absoluteStart;
-      if (a.end > r.absoluteEnd) {
-        a.end = r.absoluteEnd;
-      }
-      if (a.start < r.absoluteEnd) {
-        audios.push(a);
-      }
-    }
-
-    for (const img of r.subImages) {
-      img.start += r.absoluteStart;
-      img.end += r.absoluteStart;
-      if (img.end > r.absoluteEnd) {
-        img.end = r.absoluteEnd;
-      }
-      if (img.start < r.absoluteEnd) {
-        images.push(img);
-      }
-    }
-
-    if (
-      r.subVideos.length > 0 ||
-      r.subAudios.length > 0 ||
-      r.subImages.length > 0 ||
-      r.nested.videos.length > 0 ||
-      r.nested.audios.length > 0 ||
-      r.nested.images.length > 0
-    ) {
-    }
   }
 
-  return { videos, audios, images, subCompositions };
+  return { subCompositions };
 }
 
 /**
@@ -804,9 +1115,9 @@ class ProducerHostIdentityMap extends Map<Element, BundledHostCompositionIdentit
 }
 
 /**
- * Merge all `<head>` `<style>` blocks into a single tag with `@import` rules
- * at the top, and merge all inline `<body>` `<script>` blocks into one at the
- * end of `<body>`.
+ * Merge each run of adjacent same-condition `<head>` `<style>` blocks into one, `@import`
+ * rules at its top, and merge each run of adjacent inline `<body>` `<script>` blocks
+ * into one, without moving any of them past a `<script src>` or module script.
  *
  * Mirrors the bundler's `coalesceHeadStylesAndBodyScripts` to guarantee
  * identical CSS cascade order and script execution order between preview and
@@ -817,19 +1128,24 @@ function coalesceHeadStylesAndBodyScripts(html: string): string {
   const { document } = parseHTML(html);
   const head = document.querySelector("head");
   const body = document.querySelector("body");
-  if (!head) return html;
+  if (!head && !body) return html;
 
-  const styleEls = Array.from(head.querySelectorAll("style"));
-  if (styleEls.length > 1) {
-    const importRe = /@import\s+url\([^)]*\)\s*;|@import\s+["'][^"']+["']\s*;/gi;
+  const liveStyles = [...document.querySelectorAll("style")].filter(isAlwaysAppliedStyle);
+  const dedupedStyles = dedupeFontFaceRules(liveStyles.map((el) => el.textContent || ""));
+  liveStyles.forEach((el, i) => {
+    el.textContent = dedupedStyles[i] ?? "";
+  });
+
+  const styleEls = head ? Array.from(head.querySelectorAll("style")) : [];
+  for (const run of styleEls.length > 1 ? headStyleRuns(styleEls) : []) {
     const imports: string[] = [];
     const cssParts: string[] = [];
     const seenImports = new Set<string>();
 
-    for (const el of styleEls) {
+    for (const el of run) {
       const raw = (el.textContent || "").trim();
       if (!raw) continue;
-      const nonImportCss = raw.replace(importRe, (match) => {
+      const nonImportCss = replaceMatches(raw, importRuleMatches(raw), (match) => {
         const cleaned = match.trim();
         if (!seenImports.has(cleaned)) {
           seenImports.add(cleaned);
@@ -842,37 +1158,27 @@ function coalesceHeadStylesAndBodyScripts(html: string): string {
     }
 
     const mergedCss = [...imports, ...cssParts].join("\n\n").trim();
-    if (mergedCss) {
-      const firstStyleEl = styleEls[0];
-      if (firstStyleEl) firstStyleEl.textContent = mergedCss;
-      for (let i = 1; i < styleEls.length; i++) {
-        const el = styleEls[i];
-        if (el) el.remove();
-      }
-    }
+    if (!mergedCss) continue;
+    run[0]!.textContent = mergedCss;
+    for (const el of run.slice(1)) el.remove();
   }
 
   if (body) {
-    const bodyScripts = Array.from(body.querySelectorAll("script")).filter((el) => {
-      const src = (el.getAttribute("src") || "").trim();
-      if (src) return false;
-      const type = (el.getAttribute("type") || "").trim().toLowerCase();
-      return !type || type === "text/javascript" || type === "application/javascript";
-    });
-    if (bodyScripts.length > 0) {
-      const mergedJs = bodyScripts
+    for (const { members, anchor } of inlineScriptRuns(
+      Array.from(body.querySelectorAll("script")),
+    )) {
+      const mergedJs = members
         .map((el) => (el.textContent || "").trim())
         .filter(Boolean)
         .join("\n;\n")
         .trim();
-      for (const el of bodyScripts) {
-        el.remove();
-      }
-      if (mergedJs) {
-        const script = document.createElement("script");
-        script.textContent = mergedJs;
-        body.appendChild(script);
-      }
+      if (mergedJs && !parsesAsScript(mergedJs)) continue;
+      for (const el of members) el.remove();
+      if (!mergedJs) continue;
+      const script = document.createElement("script");
+      script.textContent = mergedJs;
+      if (anchor) anchor.before(script);
+      else body.appendChild(script);
     }
   }
 
@@ -890,8 +1196,11 @@ function inlineSubCompositions(
   html: string,
   subCompositions: Map<string, string>,
   projectDir: string,
-  variableOverrides: Record<string, unknown> = {},
-): string {
+  variableOverrides: Record<string, unknown>,
+  assetRoot: string | undefined,
+  outsideFiles: OutsideFilePolicy,
+  budget: CompositionExpansionBudget,
+): { html: string; variablesByComp: Record<string, Record<string, unknown>> } {
   const { document } = parseHTML(html);
   const head = document.querySelector("head");
   const body = document.querySelector("body");
@@ -906,9 +1215,36 @@ function inlineSubCompositions(
       document as unknown as Document,
       {},
       variableOverrides,
+      { chargeBytes: (bytes) => budget.chargeGenerated("composition variables", bytes) },
     );
-    return emitted ? document.toString() : html;
+    return { html: emitted ? document.toString() : html, variablesByComp: {} };
   }
+
+  const readOnce = new Map<string, string | null>();
+  const readMountHtml = (srcPath: string): string | null => {
+    const filePath = resolveCompositionFile(projectDir, srcPath, assetRoot);
+    if (filePath) {
+      assertOutsideMarkupAsked(projectDir, filePath, srcPath, assetRoot, outsideFiles);
+      assertCompositionFileSize(filePath, srcPath);
+    }
+    const read =
+      filePath && !isPrivateCompositionFile(projectDir, filePath)
+        ? readProjectFile(filePath)
+        : null;
+    return read?.kind === "file"
+      ? rewriteUnresolvableGsapToCdn(
+          normalizeCompositionSrcs(read.text, projectDir),
+          projectDir,
+          srcPath,
+        )
+      : null;
+  };
+  const resolveMountHtml = (srcPath: string): string | null => {
+    const compiled = subCompositions.get(srcPath);
+    if (compiled) return compiled;
+    if (!readOnce.has(srcPath)) readOnce.set(srcPath, readMountHtml(srcPath));
+    return readOnce.get(srcPath) ?? null;
+  };
 
   // Assign per-instance runtime composition ids before each host is inlined,
   // mirroring the preview bundler. Initial hosts are assigned as one pre-pass;
@@ -936,18 +1272,20 @@ function inlineSubCompositions(
       hostIdentityMap: hostIdentityByElement,
       readVariableDefaults: readDeclaredDefaults,
       parseHostVariables: parseHostVariableValues,
+      resolveFilePath: (srcPath: string) => {
+        const file = resolveCompositionFile(projectDir, srcPath, assetRoot);
+        return file && relative(projectDir, file).split(sep).join("/");
+      },
       resolveHtml: (srcPath: string) => {
-        let compHtml = subCompositions.get(srcPath) || null;
-        if (!compHtml) {
-          const filePath = resolve(projectDir, srcPath);
-          if (existsSync(filePath)) {
-            compHtml = readFileSync(filePath, "utf-8");
-          }
-        }
+        const compHtml = resolveMountHtml(srcPath);
+        if (compHtml) budget.charge(srcPath, Buffer.byteLength(compHtml));
         return compHtml;
       },
+      chargeEmitted: (srcPath: string, bytes: number) => budget.chargeGenerated(srcPath, bytes),
       parseHtml: (htmlStr: string) => parseHTML(htmlStr).document as unknown as Document,
-      scriptErrorLabel: "[Compiler] Composition script failed",
+      // Mirrors the preview bundler: a sub-composition's SIBLING assets resolve
+      // against its own directory, project-root refs stay as authored.
+      assetExists: projectAssetExists(projectDir),
       // Preserve the authored root wrapper as a child of the host, matching
       // the preview bundler's shape (htmlBundler.ts's prepareFlattenedInnerRoot,
       // which the runtime compositionLoader mirrors with its own copy for the
@@ -962,7 +1300,9 @@ function inlineSubCompositions(
         // hit here means the file changed on disk between that pre-flight
         // check and this later inline step (e.g. a concurrent scene-writer).
         console.warn(
-          `[Compiler] Skipping sub-composition "${srcPath}": ${reason ?? "the file is missing or empty"}.`,
+          terminalText(
+            `[Compiler] Skipping sub-composition "${srcPath}": ${reason ?? "the file is missing or empty"}.`,
+          ),
         );
       },
     },
@@ -990,60 +1330,59 @@ function inlineSubCompositions(
     }
   }
 
-  if (result.externalLinks.length && head) {
-    for (const link of result.externalLinks) {
-      const escapedHref = link.href.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-      if (document.querySelector(`link[href="${escapedHref}"]`)) continue;
-      const el = document.createElement("link");
-      el.setAttribute("rel", link.rel);
-      el.setAttribute("href", link.href);
-      if (link.crossorigin != null) el.setAttribute("crossorigin", link.crossorigin);
-      head.appendChild(el);
+  if (head) for (const link of result.externalLinks) ensureExternalLinkTag(document, link);
+
+  // Append collected styles to <head>
+  if (head) {
+    for (const style of styleElementsFor(document, result.styles, (css) => css.join("\n\n"))) {
+      head.appendChild(style);
     }
   }
 
-  // Append collected styles to <head>
-  if (result.styles.length && head) {
-    const styleEl = document.createElement("style");
-    styleEl.textContent = result.styles.join("\n\n");
-    head.appendChild(styleEl);
-  }
-
-  // Inject external CDN scripts before inline scripts so plugins (e.g.
-  // TextPlugin, ScrollTrigger) are registered before composition code runs.
-  // Deduplicate against scripts already present in the document.
-  if (result.externalScriptSrcs.length && body) {
-    const existingScriptSrcs = new Set(
-      Array.from(document.querySelectorAll("script[src]")).map((el: Element) =>
-        (el.getAttribute("src") || "").trim(),
-      ),
-    );
-    for (const src of result.externalScriptSrcs) {
-      if (!existingScriptSrcs.has(src)) {
-        const scriptEl = document.createElement("script");
-        scriptEl.setAttribute("src", src);
-        body.appendChild(scriptEl);
-        existingScriptSrcs.add(src);
+  // CDN and integrity-pinned scripts go first so plugins (e.g. TextPlugin,
+  // ScrollTrigger) register before composition code, as in htmlBundler. A local
+  // src script keeps its authored place among the inline scripts (see below).
+  const isHoisted = (item: { src: string; integrity?: string }) =>
+    Boolean(item.integrity?.trim()) || isNonRelativeUrl(item.src);
+  if (body) {
+    for (const item of result.scriptItems) {
+      if (item.kind === "external" && isHoisted(item)) {
+        ensureExternalScriptTag(document, item.src, item);
       }
     }
   }
 
-  // Append collected inline scripts to <body>. The per-instance variables
-  // table MUST be written before the sub-comp scripts run — their scoped
-  // getVariables() reads window.__hfVariablesByComp[compId]. htmlBundler
-  // (preview/snapshot) prepends this; the render path emitted only the CSS
-  // custom properties (below) and dropped the JS table, so getVariables()
-  // returned {} during render and parametrized sub-comps shipped blank/default
-  // text (issue #2064). Same shared builder as the bundler so they stay in
-  // lockstep.
-  const variablesByCompScript = buildVariablesByCompScript(result.variablesByComp);
-  const inlineScripts = variablesByCompScript
-    ? [variablesByCompScript, ...result.scripts]
-    : result.scripts;
-  if (inlineScripts.length && body) {
-    const scriptEl = document.createElement("script");
-    scriptEl.textContent = inlineScripts.join("\n;\n");
-    body.appendChild(scriptEl);
+  // The per-instance variables table must exist before the sub-comp scripts run (their scoped getVariables() reads
+  // it); the render path once dropped it (issue #2064). Same shared emitter as the bundler so they stay in lockstep.
+  emitVariablesByCompScript(document as unknown as Document, result.variablesByComp);
+  if (body) {
+    let pending: string[] = [];
+    const flushInline = () => {
+      if (!pending.length) return;
+      const joined = pending.join("\n;\n");
+      for (const text of parsesAsScript(joined) ? [joined] : pending) {
+        const scriptEl = document.createElement("script");
+        scriptEl.textContent = text;
+        body.appendChild(scriptEl);
+      }
+      pending = [];
+    };
+    for (const item of result.scriptItems) {
+      if (item.kind === "inline") {
+        pending.push(item.content);
+      } else if (!isHoisted(item)) {
+        flushInline();
+        ensureExternalScriptTag(document, item.src, item);
+      }
+    }
+    flushInline();
+  }
+  if (body) {
+    emitMountedModuleScripts(
+      document as unknown as Document,
+      result.importMaps,
+      result.moduleScripts,
+    );
   }
 
   // Compile-time CSS custom properties (mirrors the preview bundler): root
@@ -1053,9 +1392,16 @@ function inlineSubCompositions(
     document as unknown as Document,
     result.variablesByComp,
     variableOverrides,
+    { chargeBytes: (bytes) => budget.chargeGenerated("composition variables", bytes) },
   );
 
-  return document.toString();
+  // Inlining is what makes element ids ambiguous: each composition file is
+  // internally consistent, the union of them is not. Hand every media element a
+  // document-unique key here, while the merged document is in hand and before
+  // anything downstream keys media on an id. See core's mediaRenderIds.ts.
+  assignMediaRenderIds(document as unknown as Document);
+
+  return { html: document.toString(), variablesByComp: result.variablesByComp };
 }
 
 /**
@@ -1106,11 +1452,63 @@ function injectTextRenderingRule(html: string): string {
   return document.toString();
 }
 
+class ScriptIntegrityError extends Error {}
+
+/** Match SRI's strongest supported digest before decoding or rewriting script bytes. */
+function matchesScriptIntegrity(bytes: Uint8Array, metadata: string): boolean {
+  const hashes = [
+    ...metadata.matchAll(
+      /(?:^|[\t\n\f\r ])(sha256|sha384|sha512)-([A-Za-z0-9+/_-]+={0,2})(?:\?[\x21-\x7e]*)?(?=$|[\t\n\f\r ])/gi,
+    ),
+  ];
+  const strongest = ["sha512", "sha384", "sha256"].find((alg) =>
+    hashes.some((hash) => hash[1]?.toLowerCase() === alg),
+  );
+  // Browsers ignore metadata containing no supported, syntactically valid hash.
+  if (!strongest) return true;
+  const actual = createHash(strongest).update(bytes).digest();
+  return hashes.some(
+    (hash) =>
+      hash[1]?.toLowerCase() === strongest && actual.equals(Buffer.from(hash[2]!, "base64")),
+  );
+}
+
+const MAX_SCRIPT_BYTES = 16 * 1024 * 1024;
+
+/** The operator's `HYPERFRAMES_GSAP_BASE_URL` may be on this machine; a composition's own URLs never are. */
+function operatorGsapMirror(): string | undefined {
+  const raw = process.env.HYPERFRAMES_GSAP_BASE_URL?.trim();
+  if (!raw || raw.startsWith("/")) return undefined;
+  try {
+    return `${normalizeGsapBaseUrl(raw)}/`;
+  } catch {
+    return undefined;
+  }
+}
+
+async function downloadScript(src: string, mirror: string | undefined): Promise<Uint8Array> {
+  if (mirror && new URL(src).href.startsWith(mirror)) {
+    const response = await fetch(src, { redirect: "error", signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) throw new Error(`HTTP ${response.status} for ${src}`);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength > MAX_SCRIPT_BYTES) throw new Error(`Script over 16 MiB: ${src}`);
+    return bytes;
+  }
+  return fetchPublicHttpsBytes(src, { maxBytes: MAX_SCRIPT_BYTES, timeoutMs: 15_000 });
+}
+
+const MAX_CONCURRENT_SCRIPT_FETCHES = 4;
+
 /**
  * Download external CDN scripts and inline them into the HTML so rendering
- * works without network access (Docker, CI, restricted environments).
+ * works without network access (Docker, CI, restricted environments). Each URL
+ * is fetched once, a few at a time, and every inlined copy is charged to the
+ * render's budget as it arrives, so going over stops the downloads still queued.
  */
-export async function inlineExternalScripts(html: string): Promise<string> {
+export async function inlineExternalScripts(
+  html: string,
+  budget = new CompositionExpansionBudget(),
+): Promise<string> {
   const fullHtml = ensureFullDocument(html);
   const wrappedFragment = fullHtml !== html;
   const { document } = parseHTML(fullHtml);
@@ -1119,22 +1517,62 @@ export async function inlineExternalScripts(html: string): Promise<string> {
 
   for (const el of scripts) {
     const src = (el.getAttribute("src") || "").trim();
-    if (src && isHttpUrl(src)) {
+    if (src && isHttpUrl(src) && !isRuntimeFileUrl(src)) {
       externalScripts.push({ el: el as unknown as Element, src });
     }
   }
 
   if (externalScripts.length === 0) return html;
 
+  const mirror = operatorGsapMirror();
+  const limit = createConcurrencyLimit(MAX_CONCURRENT_SCRIPT_FETCHES);
+  const stop = new AbortController();
+  const fail = (error: unknown): never => {
+    stop.abort(error);
+    throw error;
+  };
+  const charge = (bytes: number) => {
+    try {
+      budget.chargeGenerated(REMOTE_SCRIPTS, bytes);
+    } catch (error) {
+      fail(error);
+    }
+  };
+  // A download is charged as it arrives, so bodies held for later tags are counted too.
+  const fetches = new Map<string, Promise<Uint8Array>>();
+  const fetchOnce = (src: string) => {
+    let bytes = fetches.get(src);
+    if (!bytes) {
+      bytes = limit(async () => {
+        if (stop.signal.aborted) throw stop.signal.reason;
+        const downloaded = await downloadScript(src, mirror);
+        charge(downloaded.byteLength);
+        return downloaded;
+      }, stop.signal);
+      fetches.set(src, bytes);
+    }
+    return bytes;
+  };
+  const placed = new Set<string>();
   const downloads = await Promise.allSettled(
-    externalScripts.map(async ({ src }) => {
-      const response = await fetch(src, {
-        signal: AbortSignal.timeout(15_000),
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status} for ${src}`);
-      return { src, text: await response.text() };
+    externalScripts.map(async ({ el, src }) => {
+      const integrity = el.getAttribute("integrity") || "";
+      // The host's own copy needs no network; one that fails the tag's integrity metadata is not used.
+      let bytes = bundledScript(src);
+      if (bytes && matchesScriptIntegrity(bytes, integrity)) {
+        charge(bytes.byteLength);
+      } else {
+        bytes = await fetchOnce(src);
+        if (!matchesScriptIntegrity(bytes, integrity)) {
+          fail(new ScriptIntegrityError(`Subresource integrity mismatch for ${src}`));
+        }
+        if (placed.has(src)) charge(bytes.byteLength);
+        placed.add(src);
+      }
+      return { src, text: new TextDecoder().decode(bytes) };
     }),
   );
+  if (stop.signal.aborted) throw stop.signal.reason;
 
   for (let i = 0; i < downloads.length; i++) {
     const download = downloads[i]!;
@@ -1149,12 +1587,15 @@ export async function inlineExternalScripts(html: string): Promise<string> {
         if (attr.name.toLowerCase() === "src") continue;
         inlineScript.setAttribute(attr.name, attr.value);
       }
-      inlineScript.textContent = `/* inlined: ${src} */\n${safeText}\n`;
+      inlineScript.textContent = `/* inlined: ${src} */\n${safeText}\n//# sourceURL=${new URL(src).href}\n`;
       el.replaceWith(inlineScript);
-      defaultLogger.info(`[Compiler] Inlined CDN script: ${src}`);
+      defaultLogger.debug(`[Compiler] Inlined CDN script: ${src}`);
     } else {
+      // A verified mismatch must never fall back to an executable external tag:
+      // browser support for integrity metadata (including casing) can differ.
+      if (download.reason instanceof ScriptIntegrityError) throw download.reason;
       defaultLogger.warn(
-        `[Compiler] WARNING: Failed to download CDN script: ${src} — ${download.reason}. ` +
+        `[Compiler] WARNING: Failed to download CDN script: ${src} (${download.reason}). ` +
           `The render may fail if this script is required (e.g. GSAP). ` +
           `Consider bundling it locally in your project.`,
       );
@@ -1174,9 +1615,13 @@ export async function inlineExternalScripts(html: string): Promise<string> {
 export function collectExternalAssets(
   html: string,
   projectDir: string,
+  log: ProducerLogger = defaultLogger,
+  file = "index.html",
+  policy: OutsideFilePolicy = {},
 ): { html: string; externalAssets: Map<string, string> } {
   const absProjectDir = resolve(projectDir);
   const externalAssets = new Map<string, string>();
+  const leftOut = new Set<string>();
 
   function processPath(rawPath: string): string | null {
     const trimmed = rawPath.trim();
@@ -1185,7 +1630,14 @@ export function collectExternalAssets(
     if (isPathInside(absPath, absProjectDir)) {
       return null; // inside projectDir, file server handles this
     }
-    if (!existsSync(absPath)) return null;
+    const onShare = namesAnotherNetworkRoot(absProjectDir, absPath);
+    if (!onShare && !existsSync(absPath)) return null;
+    const refusal = onShare ? "network_share" : outsideAssetRefusal(absProjectDir, absPath, policy);
+    if (refusal) {
+      if (!leftOut.has(trimmed)) log.warn(`[Compiler] ${leftOutOfRender(file, trimmed, refusal)}`);
+      leftOut.add(trimmed);
+      return null;
+    }
     // resolve() already canonicalises the path (no .. components remain);
     // toExternalAssetKey() produces a cross-platform relative key that
     // `path.join(compileDir, key)` cannot escape on any OS.
@@ -1210,7 +1662,7 @@ export function collectExternalAssets(
   for (const styleEl of document.querySelectorAll("style")) {
     const css = styleEl.textContent || "";
     if (!css.includes("url(")) continue;
-    const rewritten = css.replace(CSS_URL_RE, (full, quote: string, rawUrl: string) => {
+    const rewritten = replaceMatches(css, cssUrlMatches(css), (full, quote, rawUrl) => {
       const result = processPath((rawUrl || "").trim());
       if (!result) return full;
       return `url(${quote || ""}${result}${quote || ""})`;
@@ -1222,7 +1674,7 @@ export function collectExternalAssets(
   for (const el of document.querySelectorAll("[style]")) {
     const style = el.getAttribute("style") || "";
     if (!style.includes("url(")) continue;
-    const rewritten = style.replace(CSS_URL_RE, (full, quote: string, rawUrl: string) => {
+    const rewritten = replaceMatches(style, cssUrlMatches(style), (full, quote, rawUrl) => {
       const result = processPath((rawUrl || "").trim());
       if (!result) return full;
       return `url(${quote || ""}${result}${quote || ""})`;
@@ -1231,8 +1683,8 @@ export function collectExternalAssets(
   }
 
   if (externalAssets.size > 0) {
-    defaultLogger.info(
-      `[Compiler] Found ${externalAssets.size} asset(s) outside project directory — will copy to render output`,
+    defaultLogger.debug(
+      `[Compiler] Found ${externalAssets.size} asset(s) outside project directory, will copy to render output`,
     );
   }
 
@@ -1242,21 +1694,7 @@ export function collectExternalAssets(
   };
 }
 
-const REMOTE_MEDIA_SUBDIR = "_remote_media";
-// Match opening tags of <video> or <audio> elements that carry an HTTP(S) src.
-// Uses [^>]* to span attributes — safe for composition elements that won't
-// have `>` inside quoted attribute values (data-title etc.).
-const REMOTE_MEDIA_TAG_RE =
-  /<(?:video|audio)\b[^>]*?\bsrc\s*=\s*["'](https?:\/\/[^"']+)["'][^>]*>/gi;
-// Match <img> tags (including agent-pipeline-emitted variants where `src` is
-// not the first attribute). Producer-side localisation is the primary fix for
-// the remote-<img> flicker; frameCapture's `pollImagesReady`/`decodeAllImages`
-// are the defense-in-depth layer for any remote URL that bypasses this step.
-// The `(?<![\w-])` lookbehind pins the match to a real `src` attribute so we
-// don't rewrite `data-src` / `data-*-src` (lazy-loader placeholders whose URL
-// is not what Chrome actually paints). `srcset` is excluded by the `\s*=`.
-const REMOTE_IMG_TAG_RE = /<img\b[^>]*?(?<![\w-])src\s*=\s*["'](https?:\/\/[^"']+)["'][^>]*>/gi;
-
+export const REMOTE_MEDIA_SUBDIR = "_remote_media";
 /**
  * Download a set of remote URLs in parallel into `remoteDir`, build the
  * `{ relPath → absPath }` asset map, and rewrite every occurrence of each
@@ -1282,14 +1720,17 @@ async function downloadAndRewriteUrls(
   await Promise.all(
     [...urlSet].map(async (url) => {
       try {
-        const localPath = await downloadToTemp(url, remoteDir);
+        const localPath = await downloadToTemp(url, remoteDir, undefined, undefined, undefined, {
+          onTelemetry: logRemoteDownloadTelemetry,
+        });
         urlToLocal.set(url, localPath);
       } catch (err) {
-        defaultLogger.warn(
-          `[Compiler] ${warnLabel} ${url} — using original URL as fallback. ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
+        const identity = safeDownloadUrlIdentity(url);
+        defaultLogger.warn(`[Compiler] ${warnLabel}, using original URL as fallback.`, {
+          urlFingerprint: identity.urlFingerprint,
+          host: identity.host,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }),
   );
@@ -1310,15 +1751,16 @@ async function downloadAndRewriteUrls(
     if (extraRewrite) result = extraRewrite(result, url, relPath);
   }
 
-  defaultLogger.info(`[Compiler] ${logLabel} ${urlToLocal.size} to ${REMOTE_MEDIA_SUBDIR}/`);
+  defaultLogger.debug(`[Compiler] ${logLabel} ${urlToLocal.size} to ${REMOTE_MEDIA_SUBDIR}/`);
   return { html: result, remoteMediaAssets };
 }
 
 /**
- * Download any remote `src` URLs on `<video>` and `<audio>` elements into a
- * local subdirectory of `downloadDir`, rewrite the HTML src attributes to
- * relative paths, and return the updated HTML along with a map of
- * `{ relativePath → absoluteLocalPath }` for callers to add to `externalAssets`.
+ * Download any remote `src` URLs on `<video>` / `<audio>` elements and their
+ * `<source>` children into a local subdirectory of `downloadDir`, rewrite the
+ * HTML src attributes to relative paths, and return the updated HTML along with
+ * a map of `{ relativePath → absoluteLocalPath }` for callers to add to
+ * `externalAssets`.
  *
  * Skips URLs that fail to download (warns and preserves the original URL so
  * the browser can still attempt the remote fetch as a fallback).
@@ -1334,20 +1776,32 @@ export async function localizeRemoteMediaSources(
   html: string,
   downloadDir: string,
 ): Promise<{ html: string; remoteMediaAssets: Map<string, string> }> {
-  // Collect unique HTTP URLs from <video>/<audio> src attributes.
-  const urlSet = new Set<string>();
-  const re = new RegExp(REMOTE_MEDIA_TAG_RE.source, REMOTE_MEDIA_TAG_RE.flags);
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) !== null) {
-    if (m[1]) urlSet.add(m[1]);
-  }
-  return downloadAndRewriteUrls(
+  const urlSet = new Set([...remoteSrcUrls(html, "media"), ...remoteSrcUrls(html, "source")]);
+  const localized = await downloadAndRewriteUrls(
     urlSet,
     html,
     join(downloadDir, REMOTE_MEDIA_SUBDIR),
-    "Remote media download failed for",
+    "Remote media download failed",
     "Localized remote media source(s)",
   );
+  return { ...localized, html: dropBindingOnLocalizedMedia(localized.html) };
+}
+
+/**
+ * A bound element now holds the downloaded copy. Its `data-var-src` would make the browser set the
+ * link back, giving the clip a second name and its sound a second lane.
+ */
+function dropBindingOnLocalizedMedia(html: string): string {
+  if (!html.includes("data-var-src")) return html;
+  const { document } = parseHTML(html);
+  let changed = false;
+  for (const el of document.querySelectorAll("video[data-var-src], audio[data-var-src]")) {
+    if (el.closest("[data-variable-values]")) continue;
+    if (!el.getAttribute("src")?.startsWith(`${REMOTE_MEDIA_SUBDIR}/`)) continue;
+    el.removeAttribute("data-var-src");
+    changed = true;
+  }
+  return changed ? document.toString() : html;
 }
 
 /**
@@ -1378,26 +1832,16 @@ export async function localizeRemoteImageSources(
   html: string,
   downloadDir: string,
 ): Promise<{ html: string; remoteMediaAssets: Map<string, string> }> {
-  const urlSet = new Set<string>();
-  const re = new RegExp(REMOTE_IMG_TAG_RE.source, REMOTE_IMG_TAG_RE.flags);
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) !== null) {
-    if (m[1]) urlSet.add(m[1]);
-  }
+  // frameCapture's `pollImagesReady`/`decodeAllImages` cover any remote URL this misses.
+  const urlSet = new Set(remoteSrcUrls(html, "img"));
   return downloadAndRewriteUrls(
     urlSet,
     html,
     join(downloadDir, REMOTE_MEDIA_SUBDIR),
-    "Remote image download failed for",
+    "Remote image download failed",
     "Localized remote image source(s)",
   );
 }
-
-// Match a remote url() inside a `background` / `background-image` CSS declaration
-// (style blocks or inline style attrs). `[^;}"']*?` lets position/color tokens
-// precede the url() in the shorthand while stopping at the declaration boundary.
-const REMOTE_BG_URL_RE =
-  /background(?:-image)?\s*:\s*[^;}"']*?url\(\s*["']?(https?:\/\/[^"')]+)["']?\s*\)/gi;
 
 /**
  * Download remote CSS `background-image: url(https://...)` references and rewrite
@@ -1417,32 +1861,20 @@ export async function localizeRemoteBackgroundImages(
   downloadDir: string,
 ): Promise<{ html: string; remoteMediaAssets: Map<string, string> }> {
   const urlSet = new Set<string>();
-  const re = new RegExp(REMOTE_BG_URL_RE.source, REMOTE_BG_URL_RE.flags);
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) !== null) {
-    if (m[1] && !isGoogleFontsUrl(m[1])) urlSet.add(m[1]);
+  for (const { parts } of remoteBackgroundUrlMatches(html)) {
+    if (parts[1] && !isGoogleFontsUrl(parts[1])) urlSet.add(parts[1]);
   }
   return downloadAndRewriteUrls(
     urlSet,
     html,
     join(downloadDir, REMOTE_MEDIA_SUBDIR),
-    "Remote background-image download failed for",
+    "Remote background-image download failed",
     "Localized remote background-image(s)",
     // Quoted url('..')/url("..") are rewritten by downloadAndRewriteUrls' default
     // replaceAll; this handles the unquoted url(https://..) form.
     (h, url, rel) => h.replaceAll(`url(${url})`, `url(${rel})`),
   );
 }
-
-// Match url("https://...") or url('https://...') inside @font-face blocks.
-// We scan the full HTML (which includes <style> blocks) — matching against
-// @font-face context precisely would require a CSS parser; instead we match
-// any url(https?://...) that appears inside a @font-face rule by looking for
-// the surrounding context. Simple pattern: capture all HTTP url() references
-// that follow a @font-face opener (before the closing brace). The regex is
-// applied to the CSS text extracted from <style> blocks so it can't
-// accidentally match JavaScript string literals.
-const REMOTE_FONTFACE_URL_RE = /url\(["']?(https?:\/\/[^"')]+)["']?\)/gi;
 
 /**
  * Download any remote font URLs from `@font-face` src declarations, rewrite
@@ -1468,42 +1900,18 @@ function isGoogleFontsUrl(href: string): boolean {
 const MAX_STYLESHEET_BYTES = 2 * 1024 * 1024;
 
 async function fetchExternalStylesheetCss(href: string): Promise<string | null> {
+  const identity = safeDownloadUrlIdentity(href);
   try {
-    assertPublicHttpsUrl(href);
-  } catch {
-    return null;
-  }
-  try {
-    const response = await fetch(href, {
-      signal: AbortSignal.timeout(15_000),
+    return await fetchPublicHttpsText(href, {
+      maxBytes: MAX_STYLESHEET_BYTES,
+      timeoutMs: 15_000,
     });
-    if (!response.ok) {
-      defaultLogger.warn(
-        `[Compiler] External stylesheet fetch failed for ${href} — HTTP ${response.status}`,
-      );
-      return null;
-    }
-    const contentLength = response.headers.get("content-length");
-    if (contentLength && parseInt(contentLength, 10) > MAX_STYLESHEET_BYTES) {
-      defaultLogger.warn(
-        `[Compiler] External stylesheet too large (${contentLength} bytes): ${href}`,
-      );
-      return null;
-    }
-    const text = await response.text();
-    if (text.length > MAX_STYLESHEET_BYTES) {
-      defaultLogger.warn(
-        `[Compiler] External stylesheet too large (${text.length} bytes): ${href}`,
-      );
-      return null;
-    }
-    return text;
   } catch (err) {
-    defaultLogger.warn(
-      `[Compiler] External stylesheet fetch failed for ${href} — ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
+    defaultLogger.warn("[Compiler] External stylesheet fetch failed, preserving link tag.", {
+      urlFingerprint: identity.urlFingerprint,
+      host: identity.host,
+      error: err instanceof Error ? err.message : String(err),
+    });
     return null;
   }
 }
@@ -1515,26 +1923,41 @@ async function fetchExternalStylesheetCss(href: string): Promise<string | null> 
  * Uses a depth-tracking scan instead of `[^}]*` so blocks with nested
  * descriptor values that happen to contain `}` (rare but valid in
  * `format(...)` hints with custom idents) are captured correctly.
+ *
+ * @internal exported for unit testing only
  */
-function extractFontFaceBlocks(css: string): string[] {
+export function extractFontFaceBlocks(css: string): string[] {
   const blocks: string[] = [];
+  const closes = matchingBraces(css);
   const atRule = /@font-face\s*/gi;
-  let m: RegExpExecArray | null;
-  while ((m = atRule.exec(css)) !== null) {
-    const openIdx = css.indexOf("{", m.index + m[0].length);
-    if (openIdx === -1) break;
-    let depth = 1;
-    let i = openIdx + 1;
-    for (; i < css.length && depth > 0; i++) {
-      if (css[i] === "{") depth++;
-      else if (css[i] === "}") depth--;
-    }
-    if (depth === 0) {
-      blocks.push(css.slice(m.index, i));
-      atRule.lastIndex = i;
-    }
+  let open = -1;
+  for (let m = atRule.exec(css); m; m = atRule.exec(css)) {
+    if (open < atRule.lastIndex) open = css.indexOf("{", atRule.lastIndex);
+    if (open === -1) break;
+    const close = closes.get(open);
+    if (close === undefined) continue;
+    blocks.push(css.slice(m.index, close + 1));
+    atRule.lastIndex = close + 1;
   }
   return blocks;
+}
+
+/** The `}` that closes each `{` that has one, as a depth count from that `{` finds it. */
+function matchingBraces(css: string): Map<number, number> {
+  const closes = new Map<number, number>();
+  const unclosed: number[] = [];
+  for (let i = 0; i < css.length; i++) {
+    if (css[i] === "{") unclosed.push(i);
+    else if (css[i] === "}" && unclosed.length > 0) closes.set(unclosed.pop()!, i);
+  }
+  return closes;
+}
+
+/** The address of a stylesheet link this compile inlines the font rules of, if it is one. */
+function remoteFontStylesheetHref(tag: string): string | undefined {
+  const href = /\bhref=["']([^"']+)["']/i.exec(tag)?.[1];
+  if (!href || !/^https?:\/\//i.test(href) || isGoogleFontsUrl(href)) return undefined;
+  return href;
 }
 
 /**
@@ -1547,50 +1970,78 @@ function extractFontFaceBlocks(css: string): string[] {
  * handles those. If a fetch fails or the CSS has no `@font-face` blocks,
  * the original `<link>` tag is preserved (graceful degradation).
  */
-// fallow-ignore-next-line complexity
-async function inlineExternalFontStylesheets(html: string): Promise<string> {
-  const linkRe = /<link\b[^>]*\brel=["']stylesheet["'][^>]*>/gi;
-  const hrefRe = /\bhref=["']([^"']+)["']/i;
-
-  const linkMatches: { fullMatch: string; href: string }[] = [];
-  let linkMatch: RegExpExecArray | null;
-  while ((linkMatch = linkRe.exec(html)) !== null) {
-    const tag = linkMatch[0];
-    const hrefMatch = hrefRe.exec(tag);
-    if (!hrefMatch?.[1]) continue;
-    const href = hrefMatch[1];
-    if (!/^https?:\/\//i.test(href)) continue;
-    if (isGoogleFontsUrl(href)) continue;
-    linkMatches.push({ fullMatch: tag, href });
+async function inlineExternalFontStylesheets(
+  html: string,
+  budget = new CompositionExpansionBudget(),
+): Promise<string> {
+  const hrefs = new Set<string>();
+  for (const { parts } of stylesheetLinkMatches(html)) {
+    const href = remoteFontStylesheetHref(parts[0]);
+    if (href) hrefs.add(href);
   }
+  if (hrefs.size === 0) return html;
 
-  if (linkMatches.length === 0) return html;
-
+  // Each sheet is fetched once and only its font rules are kept, charged as they arrive.
   const MAX_CONCURRENT_STYLESHEET_FETCHES = 4;
-  const fetches: { fullMatch: string; href: string; css: string | null }[] = [];
-  for (let i = 0; i < linkMatches.length; i += MAX_CONCURRENT_STYLESHEET_FETCHES) {
-    const batch = linkMatches.slice(i, i + MAX_CONCURRENT_STYLESHEET_FETCHES);
-    const results = await Promise.all(
-      batch.map(async ({ fullMatch, href }) => {
-        const css = await fetchExternalStylesheetCss(href);
-        return { fullMatch, href, css };
-      }),
-    );
-    fetches.push(...results);
+  const inlineByHref = new Map<string, string>();
+  const unique = [...hrefs];
+  for (let i = 0; i < unique.length; i += MAX_CONCURRENT_STYLESHEET_FETCHES) {
+    const batch = unique.slice(i, i + MAX_CONCURRENT_STYLESHEET_FETCHES);
+    const sheets = await Promise.all(batch.map(fetchExternalStylesheetCss));
+    batch.forEach((href, index) => {
+      const css = sheets[index];
+      const fontFaceBlocks = css ? extractFontFaceBlocks(css) : [];
+      if (fontFaceBlocks.length === 0) return;
+      const inlineStyle = `<style>/* Inlined external font stylesheet */\n${fontFaceBlocks.join("\n")}\n</style>`;
+      budget.chargeGenerated(REMOTE_STYLESHEETS, inlineStyle.length);
+      inlineByHref.set(href, inlineStyle);
+      const identity = safeDownloadUrlIdentity(href);
+      defaultLogger.debug("[Compiler] Inlined external @font-face rule(s)", {
+        count: fontFaceBlocks.length,
+        urlFingerprint: identity.urlFingerprint,
+        host: identity.host,
+      });
+    });
   }
 
-  let result = html;
-  for (const { fullMatch, href, css } of fetches) {
-    if (css === null) continue;
-    const fontFaceBlocks = extractFontFaceBlocks(css);
-    if (fontFaceBlocks.length === 0) continue;
-    const inlineStyle = `<style>/* Inlined from ${href} */\n${fontFaceBlocks.join("\n")}\n</style>`;
-    result = result.replace(fullMatch, inlineStyle);
-    defaultLogger.info(
-      `[Compiler] Inlined ${fontFaceBlocks.length} @font-face rule(s) from external stylesheet: ${href}`,
-    );
+  const placed = new Set<string>();
+  return replaceMatches(html, stylesheetLinkMatches(html), (tag) => {
+    const href = remoteFontStylesheetHref(tag);
+    const inlineStyle = href ? inlineByHref.get(href) : undefined;
+    if (!href || !inlineStyle) return tag;
+    // The first copy was charged when it arrived; each repeat adds the whole sheet again.
+    if (placed.has(href)) budget.chargeGenerated(REMOTE_STYLESHEETS, inlineStyle.length);
+    placed.add(href);
+    return inlineStyle;
+  });
+}
+
+// Families a linked project stylesheet declares with an @font-face file the project ships.
+function projectStylesheetFontFamilies(html: string, projectDir: string): string[] {
+  const families: string[] = [];
+  for (const {
+    parts: [tag],
+  } of stylesheetLinkMatches(html)) {
+    const href = /\bhref=["']([^"']+)["']/i.exec(tag)?.[1];
+    if (!href || /^(?:[a-z][a-z\d+.-]*:|\/\/)/i.test(href)) continue;
+    const sheet = resolve(projectDir, decodedUrlPath(href).replace(/^(?:\.?\/)+/, ""));
+    if (!isPathInside(sheet, projectDir) || !existsSync(sheet)) continue;
+    for (const face of extractFontFaceBlocks(readFileSync(sheet, "utf8"))) {
+      const family = /font-family\s*:\s*([^;}]+)/i
+        .exec(face)?.[1]
+        ?.trim()
+        .replace(/^['"]|['"]$/g, "");
+      const shipsFile = [...localFontFaceUrlMatches(face)].some(({ parts: [, url = ""] }) => {
+        const path = decodedUrlPath(url);
+        const file = path.startsWith("/")
+          ? resolve(projectDir, `.${path}`)
+          : resolve(dirname(sheet), path);
+        return isPathInside(file, projectDir) && existsSync(file);
+      });
+      if (family && shipsFile) families.push(family);
+    }
   }
-  return result;
+  return families;
 }
 
 /**
@@ -1599,12 +2050,10 @@ async function inlineExternalFontStylesheets(html: string): Promise<string> {
  */
 // fallow-ignore-next-line complexity
 function collectFontFaceUrls(html: string): Set<string> {
-  const styleBlockRe = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
   const urlSet = new Set<string>();
 
-  let styleMatch: RegExpExecArray | null;
-  while ((styleMatch = styleBlockRe.exec(html)) !== null) {
-    const cssText = styleMatch[1] ?? "";
+  for (const { parts } of styleBlockMatches(html)) {
+    const cssText = parts[1];
     // Depth-tracking scanner to correctly handle @font-face blocks that
     // contain nested braces (e.g. unicode-range fallback rules).
     let i = 0;
@@ -1621,10 +2070,8 @@ function collectFontFaceUrls(html: string): Set<string> {
         j++;
       }
       const block = cssText.slice(braceStart + 1, j - 1);
-      const urlRe = new RegExp(REMOTE_FONTFACE_URL_RE.source, REMOTE_FONTFACE_URL_RE.flags);
-      let urlMatch: RegExpExecArray | null;
-      while ((urlMatch = urlRe.exec(block)) !== null) {
-        if (urlMatch[1]) urlSet.add(urlMatch[1]);
+      for (const { parts } of remoteFontFaceUrlMatches(block)) {
+        if (parts[1]) urlSet.add(parts[1]);
       }
       i = j;
     }
@@ -1637,69 +2084,148 @@ export async function localizeRemoteFontFaces(
   html: string,
   downloadDir: string,
 ): Promise<{ html: string; remoteMediaAssets: Map<string, string> }> {
-  // Phase 1: Inline @font-face rules from external <link rel="stylesheet"> tags.
-  const processed = await inlineExternalFontStylesheets(html);
+  return localizeFontFaceUrls(await inlineExternalFontStylesheets(html), downloadDir);
+}
 
-  // Phase 2: Download font file URLs from all @font-face blocks (both
-  // pre-existing inline blocks and the ones just inlined from external sheets).
-  const urlSet = collectFontFaceUrls(processed);
-
+/** Download the remote font files of the page's inline @font-face rules and point the rules at them. */
+function localizeFontFaceUrls(
+  html: string,
+  downloadDir: string,
+): Promise<{ html: string; remoteMediaAssets: Map<string, string> }> {
   return downloadAndRewriteUrls(
-    urlSet,
-    processed,
+    collectFontFaceUrls(html),
+    html,
     join(downloadDir, REMOTE_MEDIA_SUBDIR),
-    "Remote font download failed for",
+    "Remote font download failed",
     "Localized remote font face(s)",
     (h, url, relPath) => h.replaceAll(`url(${url})`, `url("${relPath}")`),
   );
 }
 
-const LOCAL_FONTFACE_URL_RE = /url\(["']?(?!data:|https?:\/\/)([^"')]+)["']?\)/gi;
+// Base64 expands bytes by ~33%, then immutable HTML replacements retain more
+// string copies while compiling. Files up to and including 5 MiB remain inline;
+// the first byte above that stays file-backed. This conservative ceiling keeps
+// verified 19 MiB+ TTC collections out of the V8 heap while both local and
+// distributed file servers continue serving project assets at authored paths.
+const MAX_LOCAL_FONT_DATA_URI_BYTES = 5 * 1024 * 1024;
 
-// fallow-ignore-next-line complexity
-async function embedLocalFontFaces(html: string, projectDir: string): Promise<string> {
-  const { fontToDataUri: toDataUri } = await import("./fontCompression.js");
-  const styleBlockRe = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
-  const fontFaceRe = /@font-face\s*\{([^}]*)\}/gi;
-  let result = html;
-  const embeddedPaths = new Set<string>();
-  const dataUriByAbsolutePath = new Map<string, string>();
+type LocalFontRead = { kind: "file-backed" } | { kind: "inline"; buffer: Buffer };
 
-  let styleMatch: RegExpExecArray | null;
-  while ((styleMatch = styleBlockRe.exec(html)) !== null) {
-    const cssText = styleMatch[1] ?? "";
-    const ffRe = new RegExp(fontFaceRe.source, fontFaceRe.flags);
-    let ffMatch: RegExpExecArray | null;
-    while ((ffMatch = ffRe.exec(cssText)) !== null) {
-      const block = ffMatch[1] ?? "";
-      const urlRe = new RegExp(LOCAL_FONTFACE_URL_RE.source, LOCAL_FONTFACE_URL_RE.flags);
-      let urlMatch: RegExpExecArray | null;
-      while ((urlMatch = urlRe.exec(block)) !== null) {
-        const localPath = urlMatch[1];
-        if (!localPath || embeddedPaths.has(localPath)) continue;
-        const absPath = localPath.startsWith("/") ? localPath : resolve(projectDir, localPath);
-        if (!isPathInside(absPath, projectDir)) continue;
-        if (!existsSync(absPath)) continue;
-        const ext = absPath.match(/\.(woff2?|ttf|otf|ttc)$/i)?.[1]?.toLowerCase() ?? "ttf";
-        try {
-          let dataUri = dataUriByAbsolutePath.get(absPath);
-          if (!dataUri) {
-            const buffer = readFileSync(absPath);
-            dataUri = await toDataUri(buffer, ext);
-            dataUriByAbsolutePath.set(absPath, dataUri);
-            defaultLogger.info(
-              `[Compiler] Embedded local font file: ${localPath} (${(buffer.length / 1024).toFixed(0)} KB → data URI)`,
-            );
-          }
-          result = result.replaceAll(localPath, dataUri);
-          embeddedPaths.add(localPath);
-        } catch {
-          // File read or compression failed — keep the original path
-        }
+async function readLocalFont(absPath: string): Promise<LocalFontRead> {
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  for await (const chunk of createReadStream(absPath)) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += buffer.length;
+    if (totalBytes > MAX_LOCAL_FONT_DATA_URI_BYTES) {
+      return { kind: "file-backed" };
+    }
+    chunks.push(buffer);
+  }
+  return { kind: "inline", buffer: Buffer.concat(chunks, totalBytes) };
+}
+
+/** The data URI a project font path embeds as, or undefined when it stays a file. */
+async function localFontDataUri(
+  localPath: string,
+  projectDir: string,
+  assetRoot: string | undefined,
+  dataUriByAbsolutePath: Map<string, string | undefined>,
+  log: ProducerLogger,
+): Promise<string | undefined> {
+  const absPath = localPath.startsWith("/") ? localPath : resolve(projectDir, localPath);
+  if (!isPathInside(absPath, projectDir) || escapesAssetRoot(absPath, assetRoot)) return undefined;
+  // A project font that is a link leading outside obeys the same policy as the file server.
+  if (refusesOutsideLink(projectDir, absPath, (line) => log.warn(`[Compiler] ${line}`))) {
+    return undefined;
+  }
+  if (isPrivateCompositionFile(projectDir, absPath)) return undefined;
+  if (dataUriByAbsolutePath.has(absPath)) return dataUriByAbsolutePath.get(absPath);
+  const ext = absPath.match(/\.(woff2?|ttf|otf|ttc)$/i)?.[1]?.toLowerCase() ?? "ttf";
+  try {
+    const font = await readLocalFont(absPath);
+    if (font.kind === "file-backed") {
+      dataUriByAbsolutePath.set(absPath, undefined);
+      defaultLogger.debug(
+        `[Compiler] Kept large local font file-backed: ${localPath} (> ${(MAX_LOCAL_FONT_DATA_URI_BYTES / 1024 / 1024).toFixed(1)} MB)`,
+      );
+      return undefined;
+    }
+    const { fontToDataUri } = await import("@hyperframes/core/fonts/embed");
+    const dataUri = await fontToDataUri(font.buffer, ext, { compressToWoff2: false });
+    dataUriByAbsolutePath.set(absPath, dataUri);
+    defaultLogger.debug(
+      `[Compiler] Embedded local font file: ${localPath} (${(font.buffer.length / 1024).toFixed(0)} KB → data URI)`,
+    );
+    return dataUri;
+  } catch (error) {
+    // Keep the original path: a font that cannot be read must not fail the render, but say why
+    // it renders in a fallback typeface.
+    defaultLogger.warn(
+      `[Compiler] Could not embed local font ${localPath}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return undefined;
+  }
+}
+
+/** `whole` with its `inner` text, which ends `tail` characters before its end, replaced. */
+const replaceInner = (whole: string, inner: string, tail: number, next: string) =>
+  whole.slice(0, whole.length - tail - inner.length) + next + whole.slice(whole.length - tail);
+
+/**
+ * Inline the project fonts that `<style>` `@font-face` sources name as data URIs. Every copy is
+ * charged to the render's budget, so a font named by many rules stops being inlined once the
+ * budget is spent and the rest keep loading it from its file.
+ */
+async function embedLocalFontFaces(
+  html: string,
+  projectDir: string,
+  assetRoot: string | undefined,
+  budget: CompositionExpansionBudget,
+  log: ProducerLogger = defaultLogger,
+): Promise<string> {
+  const dataUriByPath = new Map<string, string | undefined>();
+  const dataUriByAbsolutePath = new Map<string, string | undefined>();
+  for (const { parts: style } of styleBlockMatches(html)) {
+    for (const { parts: face } of fontFaceBlockMatches(style[1])) {
+      for (const { parts } of localFontFaceUrlMatches(face[1])) {
+        const localPath = parts[1];
+        if (!localPath || dataUriByPath.has(localPath)) continue;
+        dataUriByPath.set(
+          localPath,
+          await localFontDataUri(localPath, projectDir, assetRoot, dataUriByAbsolutePath, log),
+        );
       }
     }
   }
-  return result;
+  if (![...dataUriByPath.values()].some(Boolean)) return html;
+
+  let warned = false;
+  const embed = (source: string, localPath: string) => {
+    const dataUri = dataUriByPath.get(localPath);
+    if (!dataUri) return source;
+    const inlined = `url("${dataUri}")`;
+    if (budget.chargeGeneratedIfItFits(inlined.length - source.length)) return inlined;
+    if (!warned) {
+      warned = true;
+      log.warn(
+        `[Compiler] Kept local font ${localPath} file-backed: the page reached its inline size limit`,
+      );
+    }
+    return source;
+  };
+  return replaceMatches(html, styleBlockMatches(html), (style, css) =>
+    replaceInner(
+      style,
+      css,
+      "</style>".length,
+      replaceMatches(css, fontFaceBlockMatches(css), (face, body) =>
+        replaceInner(face, body, 1, replaceMatches(body, localFontFaceUrlMatches(body), embed)),
+      ),
+    ),
+  );
 }
 
 /**
@@ -1712,13 +2238,15 @@ export interface CompileForRenderOptions {
    * mismatch warning). Optional so non-render callers can omit it.
    */
   log?: ProducerLogger;
+  /** Absolute project paths not on disk, readable at these URLs instead. */
+  urlByAbsentLocalPath?: ReadonlyMap<string, string>;
   /**
    * Threaded through to {@link injectDeterministicFontFaces}. When `true`,
-   * any external font fetch failure throws `FontFetchError` instead of
-   * silently falling back to system fonts. Distributed `plan()` sets this
-   * to `true` so font availability is part of the planDir's content-addressed
-   * hash and fetch failures surface as typed non-retryable errors. Default
-   * `false` preserves the in-process behavior.
+   * deterministic font resolution and exhausted transient fetch failures
+   * surface as typed errors instead of silently falling back to system fonts.
+   * Distributed `plan()` sets this to `true` so font availability is part of
+   * the planDir's content-addressed hash. Default `false` preserves the
+   * in-process behavior.
    */
   failClosedFontFetch?: boolean;
   /**
@@ -1728,10 +2256,9 @@ export interface CompileForRenderOptions {
    * prevent host-specific font capture from leaking into the planDir.
    */
   allowSystemFontCapture?: boolean;
-  /**
-   * Optional persistent cache directory for prep-time animated GIF → WebM
-   * transcodes. When omitted, the render's downloadDir is used.
-   */
+  /** Caller cancellation propagated through compile-time font fetches. */
+  abortSignal?: AbortSignal;
+  /** Persistent cache directory for the animated GIF and HEIC prep transcodes; defaults to downloadDir. */
   animatedGifCacheDir?: string;
   /** FFmpeg timeout for animated GIF transcodes. */
   ffmpegProcessTimeout?: number;
@@ -1742,24 +2269,134 @@ export interface CompileForRenderOptions {
    * `window.__hfVariables` injection covers script reads, not var() in CSS.
    */
   variables?: Record<string, unknown>;
+  pageMotionBlur?: "off";
+  /** Trusted local renders only (CLI, Studio): import files markup reaches outside projectDir. */
+  allowOutsideProjectAssets?: boolean;
+  includeOutsideScripts?: boolean;
 }
 
-const GSAP_CDN_BASE = "https://cdn.jsdelivr.net/npm/gsap@3.15.0/dist/";
+/** Renders follow the same `HYPERFRAMES_GSAP_BASE_URL` mirror as Studio preview. */
+function renderGsapDist(): string {
+  try {
+    return gsapCdnDist(undefined, normalizeGsapBaseUrl(process.env.HYPERFRAMES_GSAP_BASE_URL));
+  } catch (cause) {
+    throw new Error(
+      "Invalid HYPERFRAMES_GSAP_BASE_URL: use an absolute HTTPS npm mirror root (plain HTTP only for localhost) without credentials, query, or fragment",
+      { cause },
+    );
+  }
+}
 
-function rewriteUnresolvableGsapToCdn(html: string, projectDir: string): string {
-  return html.replace(
-    /(<script\b[^>]*\bsrc=["'])([^"']*gsap[^"']*\/dist\/([^"']+))(["'][^>]*>)/gi,
-    (full, prefix, src, file, suffix) => {
-      if (/^https?:\/\//i.test(src)) return full;
-      const absPath = resolve(projectDir, src);
-      if (existsSync(absPath)) return full;
-      defaultLogger.info(
-        `[Compiler] Rewriting missing gsap script to CDN: ${src} → ${GSAP_CDN_BASE}${file}`,
-      );
-      return `${prefix}${GSAP_CDN_BASE}${file}${suffix}`;
-    },
+/** `compSrcPath` resolves a sub-composition's script the way the inliner will hoist it. */
+function rewriteUnresolvableGsapToCdn(
+  html: string,
+  projectDir: string,
+  compSrcPath?: string,
+): string {
+  let gsapDist: string | undefined;
+  const exists = (path: string) => {
+    const file = resolve(projectDir, path);
+    return !namesAnotherNetworkRoot(projectDir, file) && existsSync(file);
+  };
+  return replaceGsapDistScripts(html, (full, prefix, src, file, suffix) => {
+    if (/^https?:\/\//i.test(src)) return full;
+    if (exists(compSrcPath ? rewriteAssetPath(compSrcPath, src, exists) : src)) return full;
+    gsapDist ??= renderGsapDist();
+    defaultLogger.debug(`[Compiler] Rewriting missing gsap script: ${src} → ${gsapDist}${file}`);
+    return `${prefix}${gsapDist}${file}${suffix}`;
+  });
+}
+
+/**
+ * Preserve a nested entry document's browser URL base when compilation moves
+ * it to compiled/index.html. Use the same sibling-first/project-root-fallback
+ * rule as mounted sub-compositions so both supported entry modes agree.
+ */
+function rebaseDirectEntryAssetPaths(
+  html: string,
+  projectDir: string,
+  htmlPath: string,
+  budget: CompositionExpansionBudget,
+): string {
+  if (!isPathInside(htmlPath, projectDir)) return html;
+  const entryPath = relative(projectDir, htmlPath).replace(/\\/g, "/");
+  if (!entryPath.includes("/")) return html;
+
+  const { document } = parseHTML(html);
+  const assetExists = projectAssetExists(projectDir);
+  const charge = (bytes: number) => budget.chargeGenerated(entryPath, bytes);
+  rewriteAssetPaths(
+    document.querySelectorAll("[src], [href], [srcset]"),
+    entryPath,
+    (el: Element, attr: string) => el.getAttribute(attr),
+    (el: Element, attr: string, value: string) => el.setAttribute(attr, value),
+    assetExists,
+    charge,
   );
+  rewriteInlineStyleAssetUrls(
+    document.querySelectorAll("[style]"),
+    entryPath,
+    (el: Element) => el.getAttribute("style"),
+    (el: Element, value: string) => el.setAttribute("style", value),
+    assetExists,
+    charge,
+  );
+  for (const style of document.querySelectorAll("style")) {
+    style.textContent = rewriteCssAssetUrls(
+      style.textContent || "",
+      entryPath,
+      assetExists,
+      charge,
+    );
+  }
+  return document.toString();
 }
+
+export const MAX_VARIABLE_MEDIA_SRC_BYTES = 8 * 1024;
+// oxlint-disable-next-line no-control-regex
+const MEDIA_SRC_CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+
+/**
+ * Point each `data-var-src` video/audio at the clip its variable names, so the length and sound read below
+ * are the bound clip's. Media under a per-instance `data-variable-values` host keeps the browser's answer.
+ */
+function bindVariableMediaSources(
+  html: string,
+  variables: Record<string, unknown>,
+  budget: CompositionExpansionBudget,
+  log?: ProducerLogger,
+): string {
+  if (!html.includes("data-var-src")) return html;
+  const { document } = parseHTML(html);
+  const declared: Record<string, unknown> = {};
+  for (const el of document.querySelectorAll("[data-composition-variables]")) {
+    Object.assign(declared, readDeclaredDefaults(el));
+  }
+  const values = { ...declared, ...variables };
+  let changed = false;
+  for (const el of document.querySelectorAll("video[data-var-src], audio[data-var-src]")) {
+    if (el.closest("[data-variable-values]")) continue;
+    const bound = boundMediaSrc(el, values);
+    if (bound === null) continue;
+    const src = bound.trim();
+    if (src.length > MAX_VARIABLE_MEDIA_SRC_BYTES || MEDIA_SRC_CONTROL_CHARS.test(src)) {
+      log?.warn("[Compiler] Refused a variable media source that cannot be a URL", {
+        length: src.length,
+      });
+      continue;
+    }
+    if (el.getAttribute("src") === src) continue;
+    budget.chargeGenerated("variable media sources", src.length);
+    el.setAttribute("src", src);
+    changed = true;
+  }
+  return changed ? document.toString() : html;
+}
+
+const entryFileName = (projectDir: string, htmlPath: string) =>
+  isPathInside(htmlPath, projectDir)
+    ? relative(projectDir, htmlPath).split(sep).join("/")
+    : basename(htmlPath);
 
 /**
  * Compile an HTML composition project into a single self-contained HTML string
@@ -1772,7 +2409,34 @@ export async function compileForRender(
   downloadDir: string,
   options: CompileForRenderOptions = {},
 ): Promise<CompiledComposition> {
-  const rawHtml = rewriteUnresolvableGsapToCdn(readFileSync(htmlPath, "utf-8"), projectDir);
+  const assetRoot = options.allowOutsideProjectAssets ? undefined : projectDir;
+  const outsideFiles: OutsideFilePolicy = { includeScripts: options.includeOutsideScripts };
+  if (isPathInside(htmlPath, projectDir) && escapesAssetRoot(htmlPath, assetRoot)) {
+    throw new Error(`Entry file ${htmlPath} leads outside the project folder`);
+  }
+  if (
+    isPathInside(htmlPath, projectDir) &&
+    runsOutsideMarkupUnasked(projectDir, htmlPath, assetRoot, outsideFiles)
+  ) {
+    throw new Error(`Entry file ${htmlPath} ${OUTSIDE_COMPOSITION_NEEDS_FLAG}`);
+  }
+  if (!COMPOSITION_FILE.test(htmlPath)) {
+    throw new Error(`Entry file ${htmlPath} is not an .html file, so it is refused`);
+  }
+  assertCompositionFileSize(htmlPath, basename(htmlPath));
+  const budget = new CompositionExpansionBudget();
+  const entryHtml = rebaseDirectEntryAssetPaths(
+    readTextFile(htmlPath),
+    projectDir,
+    htmlPath,
+    budget,
+  );
+  const rawHtml = bindVariableMediaSources(
+    normalizeCompositionSrcs(rewriteUnresolvableGsapToCdn(entryHtml, projectDir), projectDir),
+    options.variables ?? {},
+    budget,
+    options.log,
+  );
 
   // Pre-flight: every data-composition-src reference must resolve to a
   // usable file before we spend any time compiling, launching a browser, or
@@ -1780,22 +2444,31 @@ export async function compileForRender(
   // unconditional (not gated behind --strict like lint warnings) — a render
   // that silently drops a scene is strictly worse than one that refuses to
   // start.
-  assertSubCompositionsUsable(rawHtml, projectDir);
+  assertSubCompositionsUsable(rawHtml, projectDir, assetRoot, outsideFiles);
 
+  const probes: SourceProbes = new Map();
   const { html: compiledHtml, unresolvedCompositions } = await compileHtmlFile(
     rawHtml,
     projectDir,
+    projectDir,
     downloadDir,
     options.log,
+    options.urlByAbsentLocalPath,
+    probes,
+    assetRoot,
   );
 
-  // Parse sub-compositions first (extracts media + compiled HTML for each)
-  const {
-    videos: subVideos,
-    audios: subAudios,
-    images: subImages,
-    subCompositions,
-  } = await parseSubCompositions(compiledHtml, projectDir, downloadDir);
+  // Compile each referenced sub-composition so the inliner can hoist it.
+  const { subCompositions } = await parseSubCompositions(
+    compiledHtml,
+    projectDir,
+    downloadDir,
+    undefined,
+    options.urlByAbsentLocalPath,
+    probes,
+    assetRoot,
+    outsideFiles,
+  );
 
   // Ensure the HTML is a full document before inlining sub-compositions.
   // When index.html is a fragment (no <html>/<head>/<body>), linkedom.parseHTML()
@@ -1806,66 +2479,63 @@ export async function compileForRender(
   // Inline sub-compositions into the main HTML so the runtime takes the same
   // synchronous code path as the bundled preview (no async fetch of
   // data-composition-src). This mirrors what htmlBundler.ts does for preview.
-  const inlinedHtml = inlineSubCompositions(
+  const { html: inlinedHtml, variablesByComp } = inlineSubCompositions(
     fullHtml,
     subCompositions,
     projectDir,
     options.variables ?? {},
+    assetRoot,
+    outsideFiles,
+    budget,
   );
 
   // Strip preload="none" from media elements — the renderer needs to load all
   // media upfront for frame capture. Users add this to reduce browser memory in
   // preview, but it causes the headless renderer to never load the media, leading
   // to 45s timeout failures.
-  const sanitizedHtml = inlinedHtml.replace(
-    /(<(?:video|audio)\b[^>]*?)\s+preload\s*=\s*["']none["']/gi,
-    "$1",
-  );
-  const renderModeHints = detectRenderModeHints(sanitizedHtml);
+  const sanitizedHtml = stripPreloadNone(inlinedHtml);
+  const renderModeHints = detectRenderModeHints(sanitizedHtml, options.pageMotionBlur);
   const hasShaderTransitions = detectShaderTransitionUsage(sanitizedHtml);
   // Detected BEFORE inlineExternalScripts: GSAP's own source contains
   // `transformPerspective`, so scanning post-inline HTML would flag every
   // composition that loads GSAP from a CDN.
   const usesThreeDTransforms = detectThreeDTransformUsage(sanitizedHtml);
-  const usesMixBlendMode = detectMixBlendModeUsage(sanitizedHtml);
   const hasAncestorBackgroundImage = detectAncestorBackgroundImage(sanitizedHtml);
 
+  // Remote font stylesheets join the page first, or the font check below cannot see them.
+  const fontSheetHtml = await inlineExternalFontStylesheets(
+    promoteCssImportsToLinkTags(sanitizedHtml),
+    budget,
+  );
   const normalizedFontHtml = normalizeSystemFontPrimaryFamilies(
-    injectTextRenderingRule(
-      coalesceHeadStylesAndBodyScripts(promoteCssImportsToLinkTags(sanitizedHtml)),
-    ),
+    injectTextRenderingRule(coalesceHeadStylesAndBodyScripts(fontSheetHtml)),
   );
 
   const coalescedHtml = await injectDeterministicFontFaces(normalizedFontHtml, {
+    logger: defaultLogger,
     failClosedFontFetch: options.failClosedFontFetch === true,
     allowSystemFontCapture: options.allowSystemFontCapture,
+    projectFontFamilies: projectStylesheetFontFamilies(fontSheetHtml, projectDir),
+    abortSignal: options.abortSignal,
   });
 
-  // Download CDN scripts and inline them AFTER coalescing. This order matters:
-  // coalesceHeadStylesAndBodyScripts merges inline scripts and appends them at
-  // the end of <body>. If we inlined CDN scripts first, the GSAP library would
-  // become an inline script that gets moved after local <script src="script.js">
-  // tags that depend on it, causing "gsap is not defined" errors.
-  const assembledHtml = await inlineExternalScripts(coalescedHtml);
+  // CDN scripts are inlined after coalescing so they stay separate from the merged inline runs.
+  const assembledHtml = await inlineExternalScripts(coalescedHtml, budget);
 
   // Inject studio position seek re-apply script when positions are baked into HTML.
   // GSAP overwrites the `translate` CSS property on every frame seek; this script
   // re-asserts the CSS custom property var() form after each seek so dragged
   // positions survive frame-by-frame rendering without a JSON sidecar.
-  const HF_POSITION_ATTRS = [
-    'data-hf-studio-path-offset="true"',
-    'data-hf-studio-box-size="true"',
-    'data-hf-studio-rotation="true"',
-    'data-hf-studio-motion="',
-  ];
-  const hasPositionEdits = HF_POSITION_ATTRS.some((attr) => assembledHtml.includes(attr));
-  const htmlWithPositionScript = hasPositionEdits
-    ? assembledHtml.replace(
-        /<\/body>/i,
-        `<script>${createStudioPositionSeekReapplyScript()}</script></body>`,
-      )
+  const htmlWithPositionScript = htmlHasStudioPositionEdits(assembledHtml)
+    ? (insertBeforeCloseTag(
+        assembledHtml,
+        "body",
+        `<script>${createStudioPositionSeekReapplyScript()}\n//# sourceURL=hyperframes://position-seek-reapply</script>`,
+      ) ?? assembledHtml)
     : assembledHtml;
-  const htmlWithSdkPositionScript = injectSdkPositionEditsRenderScript(htmlWithPositionScript);
+  const htmlWithDeferredScripts = prepareCompositionScripts(
+    injectSdkPositionEditsRenderScript(htmlWithPositionScript),
+  );
 
   // Download remote <video> and <audio> sources to compiledDir and rewrite the
   // src attributes so the renderer reads from localhost. Remote S3 URLs cause
@@ -1873,7 +2543,7 @@ export async function compileForRender(
   // over the network; any that don't reach readyState >= 2 in time render as
   // blank black frames. Localising them eliminates the race.
   const { html: htmlWithLocalMedia, remoteMediaAssets } = await localizeRemoteMediaSources(
-    htmlWithSdkPositionScript,
+    htmlWithDeferredScripts,
     downloadDir,
   );
 
@@ -1895,30 +2565,63 @@ export async function compileForRender(
   // allow http://localhost:PORT as origin), causing Chrome to silently fall
   // back to the next font in the stack.
   const { html: htmlWithLocalizedFonts, remoteMediaAssets: remoteFontAssets } =
-    await localizeRemoteFontFaces(htmlWithLocalBg, downloadDir);
+    await localizeFontFaceUrls(htmlWithLocalBg, downloadDir);
+
+  // Chrome cannot decode HEIC, and ffprobe reads a tiled one as video streams,
+  // so convert to JPEG before the media-type preflight sees it.
+  const {
+    html: htmlWithJpegs,
+    preparedAssets: preparedHeifAssets,
+    preparedImages: preparedHeifImages,
+  } = await prepareHeifImageInputs(htmlWithLocalizedFonts, {
+    projectDir,
+    downloadDir,
+    cacheDir: options.animatedGifCacheDir,
+    sourceAssets: remoteImageAssets,
+    timeoutMs: options.ffmpegProcessTimeout,
+    allowOutsideFiles: assetRoot === undefined,
+  });
+  if (preparedHeifImages.length > 0) {
+    defaultLogger.debug(`[Compiler] Converted ${preparedHeifImages.length} HEIC image(s) to JPEG`);
+  }
 
   const gifSourceAssets = new Map<string, string>(remoteImageAssets);
   const {
     html: htmlWithPreparedGifs,
     preparedAssets: preparedGifAssets,
     preparedGifs,
-  } = await prepareAnimatedGifInputs(htmlWithLocalizedFonts, {
+  } = await prepareAnimatedGifInputs(htmlWithJpegs, {
     projectDir,
     downloadDir,
     cacheDir: options.animatedGifCacheDir,
     sourceAssets: gifSourceAssets,
     timeoutMs: options.ffmpegProcessTimeout,
+    allowOutsideFiles: assetRoot === undefined,
   });
   if (preparedGifs.length > 0) {
-    defaultLogger.info(`[Compiler] Prepared ${preparedGifs.length} animated GIF input(s) as WebM`);
+    defaultLogger.debug(`[Compiler] Prepared ${preparedGifs.length} animated GIF input(s) as WebM`);
   }
 
-  const embeddedHtml = await embedLocalFontFaces(htmlWithPreparedGifs, projectDir);
+  const embeddedHtml = await embedLocalFontFaces(
+    htmlWithPreparedGifs,
+    projectDir,
+    assetRoot,
+    budget,
+    options.log,
+  );
 
   // Collect assets that resolve outside projectDir (e.g. ../shared-assets/hero.png).
   // These can't be served by the file server, so we map them to paths the
   // orchestrator will copy into the compiled output directory.
-  const { html, externalAssets } = collectExternalAssets(embeddedHtml, projectDir);
+  const { html, externalAssets } = options.allowOutsideProjectAssets
+    ? collectExternalAssets(
+        embeddedHtml,
+        projectDir,
+        options.log,
+        entryFileName(projectDir, htmlPath),
+        { includeScripts: options.includeOutsideScripts },
+      )
+    : { html: embeddedHtml, externalAssets: new Map<string, string>() };
 
   for (const [relPath, absPath] of remoteMediaAssets) {
     externalAssets.set(relPath, absPath);
@@ -1935,44 +2638,57 @@ export async function compileForRender(
   for (const [relPath, absPath] of preparedGifAssets) {
     externalAssets.set(relPath, absPath);
   }
+  for (const [relPath, absPath] of preparedHeifAssets) {
+    externalAssets.set(relPath, absPath);
+  }
 
-  // Parse main HTML elements
-  const mainVideos = parseVideoElements(html);
-  const mainAudios = parseAudioElements(html);
-  const mainImages = parseImageElements(html);
-
-  // Keep inlined sub-composition media authoritative on ID collisions.
-  // inlineSubCompositions() hoists those nodes into the final HTML, so the
-  // producer should follow the same precedence the runtime sees in the merged DOM.
-  const videos = dedupeElementsById([...mainVideos, ...subVideos]);
-  const audios = dedupeElementsById([...mainAudios, ...subAudios]);
-  const images = dedupeElementsById([...mainImages, ...subImages]);
+  // Read the media list off the inlined document rather than merging the
+  // per-file lists. Merging deduplicated by element id, which is only unique
+  // within one composition file: two scenes declaring `<video id="clip">` — or
+  // two bare `<video>`s, both auto-numbered `hf-video-0` — collapsed into one
+  // entry and injected frames onto whichever element came first. See #3340.
+  const { videos, audios, images, droppedMediaIds, gradedCanvas } = collectRenderMedia(html);
+  const masterFxChain = parseMasterFxChain(html);
 
   // Advisory video checks (sparse keyframes, VFR). Fire-and-forget — these spawn
   // ffprobe subprocesses and should not block compilation since they only produce warnings.
+  // The two probes run in sequence rather than in parallel: the keyframe analysis needs
+  // the video stream's own duration to classify a single-keyframe (single-GOP) file.
+  const advised = new Set<string>();
   for (const video of videos) {
     if (isHttpUrl(video.src)) continue;
     const videoPath = resolve(projectDir, video.src);
+    if (
+      advised.has(videoPath) ||
+      namesAnotherNetworkRoot(projectDir, videoPath) ||
+      !existsSync(videoPath) ||
+      escapesAssetRoot(videoPath, assetRoot) ||
+      isPrivateUnderAssetRoots(videoPath, [projectDir, downloadDir])
+    )
+      continue;
+    advised.add(videoPath);
     const reencode = `ffmpeg -i "${video.src}" -c:v libx264 -r 30 -g 30 -keyint_min 30 -movflags +faststart -c:a copy output.mp4`;
-    Promise.all([analyzeKeyframeIntervals(videoPath), extractMediaMetadata(videoPath)])
-      .then(([analysis, metadata]) => {
-        if (analysis.isProblematic) {
-          defaultLogger.warn(
-            `[Compiler] WARNING: Video "${video.id}" has sparse keyframes (max interval: ${analysis.maxIntervalSeconds}s). ` +
-              `This causes seek failures and frame freezing. Re-encode with: ${reencode}`,
-          );
-        }
-        if (metadata.isVFR) {
-          // defaultLogger (stderr), not console.info (stdout) — matches the sibling
-          // warning above; a stdout line here corrupts `check --json` / `validate --json`.
-          defaultLogger.warn(
-            `[Compiler] Video "${video.id}" is variable frame rate (VFR); ` +
-              `the engine will normalize it to CFR before frame extraction. ` +
-              `If rendering feels slow on this video, pre-encode once with: ${reencode}`,
-          );
-        }
-      })
-      .catch(() => {});
+    (async () => {
+      const metadata = await withMediaProbeSlot(() => extractMediaMetadata(videoPath));
+      const analysis = await withMediaProbeSlot(() =>
+        analyzeKeyframeIntervals(videoPath, metadata),
+      );
+      if (analysis.isProblematic) {
+        defaultLogger.warn(
+          `[Compiler] WARNING: Video "${video.id}" has sparse keyframes (max interval: ${analysis.maxIntervalSeconds}s). ` +
+            `Long GOPs can make preview seeking slower; rendering is unaffected. If preview seeking is slow, re-encode with: ${reencode}`,
+        );
+      }
+      if (metadata.isVFR) {
+        // defaultLogger (stderr), not console.info (stdout) — matches the sibling
+        // warning above; a stdout line here corrupts `check --json` / `validate --json`.
+        defaultLogger.warn(
+          `[Compiler] Video "${video.id}" is variable frame rate (VFR); ` +
+            `the engine will normalize it to CFR before frame extraction. ` +
+            `If rendering feels slow on this video, pre-encode once with: ${reencode}`,
+        );
+      }
+    })().catch(() => {});
   }
 
   // Read dimensions from root composition element using DOM parser
@@ -1984,11 +2700,9 @@ export async function compileForRender(
 
   // Static duration (may be 0 if set at runtime by GSAP)
   const staticDuration = rootEl
-    ? parseFloat(
-        rootEl.getAttribute("data-duration") ||
-          rootEl.getAttribute("data-composition-duration") ||
-          "0",
-      )
+    ? (parseStrictFiniteTimingNumber(rootEl.getAttribute("data-duration")) ??
+      parseStrictFiniteTimingNumber(rootEl.getAttribute("data-composition-duration")) ??
+      0)
     : 0;
 
   return {
@@ -1997,7 +2711,11 @@ export async function compileForRender(
     videos,
     audios,
     images,
+    droppedMediaIds,
+    gradedCanvas,
+    ...(masterFxChain ? { masterFxChain } : {}),
     unresolvedCompositions,
+    variablesByComp,
     externalAssets,
     width,
     height,
@@ -2005,7 +2723,6 @@ export async function compileForRender(
     renderModeHints,
     hasShaderTransitions,
     usesThreeDTransforms,
-    usesMixBlendMode,
     hasAncestorBackgroundImage,
   };
 }
@@ -2014,16 +2731,21 @@ export async function compileForRender(
  * Discover media elements from the browser DOM after JavaScript has run.
  * This catches videos/audios whose `src` is set dynamically via JS
  * (e.g. `document.getElementById("pip-video").src = URL`), which the
- * static regex parsers miss because the HTML has `src=""`.
+ * static regex parsers miss because the HTML has `src=""`. Clips are keyed
+ * by `data-hf-render-id` when present — author ids collide across inlined
+ * scenes, and this snapshot is the only identity those empty-src elements get.
  */
 export interface BrowserMediaElement {
   id: string;
-  tagName: "video" | "audio";
+  tagName: "video" | "audio" | "image";
   src: string;
   start: number;
   end: number;
   duration: number;
+  /** True when compilation inferred duration from the fallback source. */
+  durationInferred: boolean;
   mediaStart: number;
+  playbackRate: RateSpec;
   loop: boolean;
   hasAudio: boolean;
   volume: number;
@@ -2040,42 +2762,98 @@ export async function discoverMediaFromBrowser(page: Page): Promise<BrowserMedia
   const elements = await page.evaluate(() => {
     const results: {
       id: string;
-      tagName: string;
+      tagName: "video" | "audio" | "image";
       src: string;
       start: number;
-      end: number;
-      duration: number;
-      mediaStart: number;
+      endRaw: string | null;
+      durationRaw: string | null;
+      intrinsicDuration: number;
+      durationInferred: boolean;
+      playbackStartRaw: string | null;
+      mediaStartRaw: string | null;
+      playbackRateRaw: string | null;
+      automationRaw: string | null;
+      defaultPlaybackRate: number;
       loop: boolean;
       hasAudio: boolean;
       volume: number;
       muted: boolean;
     }[] = [];
 
-    const mediaEls = document.querySelectorAll("video[data-start], audio[data-start]");
+    const autoImageIds = new Map<Element, string>();
+    let autoImageId = 0;
+    document.querySelectorAll("img[src]").forEach((image) => {
+      if (!image.id) autoImageIds.set(image, `hf-img-${autoImageId++}`);
+    });
+
+    const mediaEls = new Set<Element>(
+      document.querySelectorAll("video[data-start], audio[data-start], img[data-var-src]"),
+    );
+    // A variable-bound <picture><source> changes the owning image's currentSrc;
+    // the <img> fallback itself does not necessarily carry data-var-src.
+    document.querySelectorAll("picture source[data-var-src]").forEach((source) => {
+      const image = source.closest("picture")?.querySelector("img");
+      if (image) mediaEls.add(image);
+    });
     mediaEls.forEach((el) => {
-      const htmlEl = el as HTMLVideoElement | HTMLAudioElement;
-      const id = htmlEl.id;
+      const htmlEl = el as HTMLVideoElement | HTMLAudioElement | HTMLImageElement;
+      const isImage = htmlEl.tagName.toLowerCase() === "img";
+      const tagName: "video" | "audio" | "image" = isImage
+        ? "image"
+        : htmlEl.tagName.toLowerCase() === "video"
+          ? "video"
+          : "audio";
+      // Render id is document-unique after inlining; author id is only unique
+      // per composition file. Empty-src media is skipped by the static parse
+      // and lives or dies on this snapshot — keying by author id collapses
+      // colliding scenes onto one clip (residual of #3340).
+      const id =
+        htmlEl.getAttribute("data-hf-render-id") ||
+        htmlEl.id ||
+        (isImage ? autoImageIds.get(htmlEl) : undefined);
       if (!id) return;
 
-      const src = htmlEl.src || htmlEl.getAttribute("src") || "";
+      // currentSrc is authoritative for <video>/<audio><source> and responsive images.
+      const resolvedSrc = htmlEl.currentSrc || htmlEl.src || htmlEl.getAttribute("src") || "";
+      const withoutQueryAndHash = (url: string) => url.replace(/[?#][\s\S]*$/, "");
+      const isPageItself = withoutQueryAndHash(resolvedSrc) === withoutQueryAndHash(location.href);
+      const src = isPageItself ? "" : resolvedSrc;
       const start = parseFloat(htmlEl.getAttribute("data-start") || "0");
-      const end = parseFloat(htmlEl.getAttribute("data-end") || "0");
-      const duration = parseFloat(htmlEl.getAttribute("data-duration") || "0");
-      const mediaStart = parseFloat(htmlEl.getAttribute("data-media-start") || "0");
+      const endRaw = htmlEl.getAttribute("data-end");
+      const durationRaw = htmlEl.getAttribute("data-duration");
+      const durationInferred = htmlEl.hasAttribute("data-hf-inferred-duration");
+      const intrinsicDuration = isImage
+        ? 0
+        : (htmlEl as HTMLVideoElement | HTMLAudioElement).duration;
+      const playbackStartRaw = htmlEl.getAttribute("data-playback-start");
+      const mediaStartRaw = htmlEl.getAttribute("data-media-start");
+      const playbackRateRaw = htmlEl.getAttribute("data-playback-rate");
+      const automationRaw = htmlEl.getAttribute("data-automation");
+      // playbackRate can include the transport speed; defaultPlaybackRate is the clip's own rate.
+      const defaultPlaybackRate = isImage
+        ? 1
+        : (htmlEl as HTMLVideoElement | HTMLAudioElement).defaultPlaybackRate;
       const loop = htmlEl.hasAttribute("loop");
       const hasAudio = htmlEl.getAttribute("data-has-audio") === "true";
       const volume = parseFloat(htmlEl.getAttribute("data-volume") || "1");
-      const muted = htmlEl.hasAttribute("muted") || htmlEl.muted;
+      const muted =
+        !isImage &&
+        (htmlEl.hasAttribute("muted") || (htmlEl as HTMLVideoElement | HTMLAudioElement).muted);
 
       results.push({
         id,
-        tagName: htmlEl.tagName.toLowerCase(),
+        tagName,
         src,
         start,
-        end,
-        duration,
-        mediaStart,
+        endRaw,
+        durationRaw,
+        intrinsicDuration,
+        durationInferred,
+        playbackStartRaw,
+        mediaStartRaw,
+        playbackRateRaw,
+        automationRaw,
+        defaultPlaybackRate,
         loop,
         hasAudio,
         volume,
@@ -2086,7 +2864,40 @@ export async function discoverMediaFromBrowser(page: Page): Promise<BrowserMedia
     return results;
   });
 
-  return elements as BrowserMediaElement[];
+  return elements.map(
+    ({
+      endRaw,
+      durationRaw,
+      intrinsicDuration,
+      playbackStartRaw,
+      mediaStartRaw,
+      playbackRateRaw,
+      automationRaw,
+      defaultPlaybackRate,
+      ...element
+    }) => ({
+      ...element,
+      end: parseStrictFiniteTimingNumber(endRaw) ?? 0,
+      duration:
+        element.durationInferred && Number.isFinite(intrinsicDuration) && intrinsicDuration > 0
+          ? intrinsicDuration
+          : (parseStrictFiniteTimingNumber(durationRaw) ?? 0),
+      mediaStart: readMediaStart({
+        getAttribute(name: string) {
+          if (name === "data-playback-start") return playbackStartRaw;
+          if (name === "data-media-start") return mediaStartRaw;
+          return null;
+        },
+      }),
+      playbackRate: resolveRateSpec(
+        automationRaw,
+        readPlaybackRate(
+          (name) => (name === "data-playback-rate" ? playbackRateRaw : null),
+          defaultPlaybackRate,
+        ),
+      ),
+    }),
+  );
 }
 
 export async function discoverAudioVolumeAutomationFromTimeline(
@@ -2098,9 +2909,74 @@ export async function discoverAudioVolumeAutomationFromTimeline(
   if (audioIds.length === 0 || compositionDuration <= 0) return [];
 
   const sampleStep = 1 / Math.min(60, Math.max(1, sampleFps));
+  const rawWindows = await page.evaluate((ids: string[]) => {
+    return ids.flatMap((id) => {
+      const el =
+        window.__hfMediaEl?.(id) ??
+        document.getElementById(id) ??
+        document.getElementById(id.replace(/-audio$/, ""));
+      if (!(el instanceof HTMLAudioElement) && !(el instanceof HTMLVideoElement)) return [];
+      return [
+        {
+          id,
+          startRaw: el.dataset.start ?? null,
+          endRaw: el.dataset.end ?? null,
+          durationRaw: el.dataset.duration ?? null,
+        },
+      ];
+    });
+  }, audioIds);
+  const clips = rawWindows.map(({ id, startRaw, endRaw, durationRaw }) => {
+    const start = parseStrictFiniteTimingNumber(startRaw) ?? 0;
+    const authoredDuration = parseStrictFiniteTimingNumber(durationRaw);
+    const authoredEnd = parseStrictFiniteTimingNumber(endRaw);
+    const end =
+      authoredDuration != null && authoredDuration > 0
+        ? start + authoredDuration
+        : authoredEnd != null && authoredEnd > start
+          ? authoredEnd
+          : compositionDuration;
+    return { id, start, end };
+  });
   return page.evaluate(
-    ({ ids, duration, step }) => {
+    ({ clips, duration, step, maxGain }) => {
       const results: { id: string; keyframes: { time: number; volume: number }[] }[] = [];
+      const clampGain = (value: number) =>
+        Number.isFinite(value) ? Math.max(0, Math.min(maxGain, value)) : 1;
+      // `HTMLMediaElement.volume` is spec-clamped to [0,1], so a clip authored
+      // above unity — or a GSAP tween seeded from one — reads back as 0 dB and
+      // the whole authored boost is lost from the mix. Shadow the accessor for
+      // the probe so the authored value survives; the native setter still gets
+      // the clamped value. Mirrors `withUnclampedVolume` in
+      // packages/core/src/audioGain.ts, which the preview probe uses; this copy
+      // exists only because the probe body is serialized into the page.
+      //
+      // Guarded because this body is also executed directly by tests that stand
+      // in for a Page, where there is no DOM and no HTMLMediaElement.
+      const volumeDescriptor =
+        typeof HTMLMediaElement === "undefined"
+          ? undefined
+          : Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "volume");
+      const nativeVolumeGet = volumeDescriptor?.get;
+      const nativeVolumeSet = volumeDescriptor?.set;
+      const withUnclampedVolume = <T>(el: HTMLMediaElement, probe: () => T): T => {
+        if (!nativeVolumeGet || !nativeVolumeSet) return probe();
+        let authored = Number(nativeVolumeGet.call(el));
+        Object.defineProperty(el, "volume", {
+          configurable: true,
+          get: () => authored,
+          set: (value: number) => {
+            authored = Number(value);
+            nativeVolumeSet.call(el, Math.max(0, Math.min(1, authored)));
+          },
+        });
+        try {
+          return probe();
+        } finally {
+          delete (el as unknown as Record<"volume", unknown>).volume;
+          nativeVolumeSet.call(el, Math.max(0, Math.min(1, authored)));
+        }
+      };
       const timelines = (window as unknown as { __timelines?: Record<string, unknown> })
         .__timelines;
       if (!timelines) return results;
@@ -2125,46 +3001,56 @@ export async function discoverAudioVolumeAutomationFromTimeline(
         }
       };
 
-      for (const id of ids) {
+      for (const { id, start, end } of clips) {
         const el =
-          document.getElementById(id) ?? document.getElementById(id.replace(/-audio$/, ""));
+          window.__hfMediaEl?.(id) ??
+          document.getElementById(id) ??
+          document.getElementById(id.replace(/-audio$/, ""));
         if (!(el instanceof HTMLAudioElement) && !(el instanceof HTMLVideoElement)) continue;
 
-        const start = Number.parseFloat(el.dataset.start ?? "0") || 0;
-        const endAttr = Number.parseFloat(el.dataset.end ?? "");
-        const durationAttr = Number.parseFloat(el.dataset.duration ?? "");
-        const end =
-          Number.isFinite(durationAttr) && durationAttr > 0
-            ? start + durationAttr
-            : Number.isFinite(endAttr) && endAttr > start
-              ? endAttr
-              : duration;
         const sampleStart = Math.max(0, start);
         const sampleEnd = Math.min(duration, end);
         const initialVolumeAttr = Number.parseFloat(el.dataset.volume ?? "");
-        if (Number.isFinite(initialVolumeAttr)) {
-          el.volume = Math.max(0, Math.min(1, initialVolumeAttr));
-        }
 
-        const keyframes: { time: number; volume: number }[] = [];
-        for (let t = sampleStart; t <= sampleEnd + 0.000001; t += step) {
-          const boundedTime = Math.min(sampleEnd, t);
-          seekTl(boundedTime);
-          const rawVolume = Number(el.volume);
-          if (!Number.isFinite(rawVolume)) continue;
-          const volume = Math.max(0, Math.min(1, rawVolume));
-          const last = keyframes.at(-1);
-          if (!last || Math.abs(last.volume - volume) > 0.0001 || boundedTime === sampleEnd) {
-            keyframes.push({
-              time: Number(boundedTime.toFixed(6)),
-              volume: Number(volume.toFixed(6)),
-            });
+        const keyframes = withUnclampedVolume(el, () => {
+          if (Number.isFinite(initialVolumeAttr)) {
+            el.volume = clampGain(initialVolumeAttr);
           }
-          if (boundedTime === sampleEnd) break;
-        }
+
+          const keyframes: { time: number; volume: number }[] = [];
+          let previousSample: { time: number; volume: number } | undefined;
+          for (let t = sampleStart; t <= sampleEnd + 0.000001; t = Math.min(sampleEnd, t + step)) {
+            seekTl(t);
+            const rawVolume = Number(el.volume);
+            if (!Number.isFinite(rawVolume)) {
+              if (t === sampleEnd) break;
+              continue;
+            }
+            const volume = clampGain(rawVolume);
+            const sample = {
+              time: Number(t.toFixed(6)),
+              volume: Number(volume.toFixed(6)),
+            };
+            const last = keyframes.at(-1);
+            if (!last || Math.abs(last.volume - volume) > 0.0001) {
+              // Retain the preceding real sample when compression omitted a flat
+              // run. Continuous ramps already have that sample as their last
+              // keyframe, so their interpolation remains unchanged.
+              if (last && previousSample && previousSample.time > last.time) {
+                keyframes.push(previousSample);
+              }
+              keyframes.push(sample);
+            } else if (t === sampleEnd && sample.time > last.time) {
+              keyframes.push(sample);
+            }
+            previousSample = sample;
+            if (t === sampleEnd) break;
+          }
+          return keyframes;
+        });
 
         const staticAttr = Number.parseFloat(el.dataset.volume ?? "");
-        const staticVolume = Number.isFinite(staticAttr) ? Math.max(0, Math.min(1, staticAttr)) : 1;
+        const staticVolume = Number.isFinite(staticAttr) ? clampGain(staticAttr) : 1;
         const hasAutomation = keyframes.some(
           (keyframe) => Math.abs(keyframe.volume - staticVolume) > 0.0001,
         );
@@ -2176,7 +3062,7 @@ export async function discoverAudioVolumeAutomationFromTimeline(
       seekTl(0);
       return results;
     },
-    { ids: audioIds, duration: compositionDuration, step: sampleStep },
+    { clips, duration: compositionDuration, step: sampleStep, maxGain: MAX_AUDIO_GAIN },
   );
 }
 
@@ -2227,24 +3113,40 @@ export async function discoverVideoVisibilityFromTimeline(
     const SAMPLE_STEP = 0.1;
     const BINARY_PRECISION = 1 / 60;
 
+    // Seek once per timestep and sample every video — seeking dominates and is
+    // independent of which element we read.
+    const entries: {
+      id: string;
+      sceneEl: Element;
+      firstVisible: number | null;
+      lastVisible: number | null;
+    }[] = [];
     for (const videoEl of videos) {
-      const id = videoEl.id;
+      const id = videoEl.getAttribute?.("data-hf-render-id") || videoEl.id;
       if (!id) continue;
+      entries.push({
+        id,
+        sceneEl: videoEl.closest(".scene") || videoEl,
+        firstVisible: null,
+        lastVisible: null,
+      });
+    }
+    if (entries.length === 0) return results;
 
-      const sceneEl = videoEl.closest(".scene") || videoEl;
-
-      let firstVisible: number | null = null;
-      let lastVisible: number | null = null;
-
-      for (let t = 0; t <= duration; t += SAMPLE_STEP) {
-        seekTl(t);
-        const opacity = parseFloat(window.getComputedStyle(sceneEl).opacity);
+    for (let t = 0; t <= duration; t += SAMPLE_STEP) {
+      seekTl(t);
+      for (const entry of entries) {
+        const opacity = parseFloat(window.getComputedStyle(entry.sceneEl).opacity);
         if (opacity > 0) {
-          if (firstVisible === null) firstVisible = t;
-          lastVisible = t;
+          if (entry.firstVisible === null) entry.firstVisible = t;
+          entry.lastVisible = t;
         }
       }
+    }
 
+    // Per-video boundary refinement (cheap: O(log(step)) seeks each).
+    for (const entry of entries) {
+      const { id, sceneEl, firstVisible, lastVisible } = entry;
       if (firstVisible === null || lastVisible === null) continue;
 
       // Binary search left boundary
@@ -2298,30 +3200,42 @@ export async function resolveCompositionDurations(
   const results = await page.evaluate((compIds: string[]) => {
     const win = window as unknown as { __timelines?: Record<string, { duration(): number }> };
     const timelines = win.__timelines || {};
-    const resolved: { id: string; duration: number; source: string }[] = [];
+    const resolved: {
+      id: string;
+      duration: number;
+      source: string;
+      durationRaw?: string;
+      compositionDurationRaw?: string;
+    }[] = [];
 
     for (const id of compIds) {
       // Try window.__timelines[id].duration() first (GSAP timeline)
       const tl = timelines[id];
-      if (tl && typeof tl.duration === "function") {
-        const dur = tl.duration();
-        if (dur > 0) {
-          resolved.push({ id, duration: dur, source: "__timelines" });
-          continue;
-        }
+      let dur = 0;
+      try {
+        dur = typeof tl?.duration === "function" ? Number(tl.duration()) : 0;
+      } catch {
+        dur = 0;
+      }
+      if (dur > 0) {
+        resolved.push({ id, duration: dur, source: "__timelines" });
+        continue;
       }
 
       // Fallback: check for authored duration on the element itself
       const el = document.getElementById(id);
       if (el) {
-        const compDurAttr =
-          el.getAttribute("data-duration") || el.getAttribute("data-composition-duration");
-        if (compDurAttr) {
-          const dur = parseFloat(compDurAttr);
-          if (dur > 0) {
-            resolved.push({ id, duration: dur, source: "data-duration" });
-            continue;
-          }
+        const durationRaw = el.getAttribute("data-duration");
+        const compositionDurationRaw = el.getAttribute("data-composition-duration");
+        if (durationRaw != null || compositionDurationRaw != null) {
+          resolved.push({
+            id,
+            duration: 0,
+            source: "data-duration",
+            ...(durationRaw != null ? { durationRaw } : {}),
+            ...(compositionDurationRaw != null ? { compositionDurationRaw } : {}),
+          });
+          continue;
         }
       }
 
@@ -2333,8 +3247,12 @@ export async function resolveCompositionDurations(
 
   const resolutions: ResolvedDuration[] = [];
   for (const r of results) {
-    if (r.duration > 0) {
-      resolutions.push({ id: r.id, duration: r.duration });
+    const duration =
+      parseStrictFiniteTimingNumber(r.durationRaw) ??
+      parseStrictFiniteTimingNumber(r.compositionDurationRaw) ??
+      r.duration;
+    if (duration != null && duration > 0) {
+      resolutions.push({ id: r.id, duration });
     }
   }
 
@@ -2350,28 +3268,29 @@ export async function recompileWithResolutions(
   resolutions: ResolvedDuration[],
   projectDir: string,
   downloadDir: string,
+  assetRoot?: string,
+  outsideFiles: OutsideFilePolicy = {},
 ): Promise<CompiledComposition> {
   if (resolutions.length === 0) return compiled;
 
   const html = injectDurations(compiled.html, resolutions);
 
-  // Re-parse sub-compositions with the updated parent bounds
-  const {
-    videos: subVideos,
-    audios: subAudios,
-    images: subImages,
-    subCompositions,
-  } = await parseSubCompositions(html, projectDir, downloadDir);
-
-  const mainVideos = parseVideoElements(html);
-  const mainAudios = parseAudioElements(html);
-  const mainImages = parseImageElements(html);
-
-  // Keep inlined sub-composition media authoritative on ID collisions.
-  const hasSubMedia = subVideos.length > 0 || subAudios.length > 0 || subImages.length > 0;
-  const videos = hasSubMedia ? dedupeElementsById([...mainVideos, ...subVideos]) : compiled.videos;
-  const audios = hasSubMedia ? dedupeElementsById([...mainAudios, ...subAudios]) : compiled.audios;
-  const images = hasSubMedia ? dedupeElementsById([...mainImages, ...subImages]) : compiled.images;
+  // Re-resolve the sub-composition map against the updated HTML, but keep the
+  // media list from the first pass. Resolving a composition's duration stamps a
+  // `data-end` on its host, and re-collecting would newly clamp clips to it —
+  // a retiming, not an identity fix. `compiled.videos` was already collected
+  // from this same inlined document, so it is complete and correctly keyed.
+  const { subCompositions } = await parseSubCompositions(
+    html,
+    projectDir,
+    downloadDir,
+    undefined,
+    undefined,
+    undefined,
+    assetRoot,
+    outsideFiles,
+  );
+  const { videos, audios, images } = compiled;
 
   const remaining = compiled.unresolvedCompositions.filter(
     (c) => !resolutions.some((r) => r.id === c.id),

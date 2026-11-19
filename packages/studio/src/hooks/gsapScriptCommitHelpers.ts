@@ -1,17 +1,24 @@
-import { findUnsafeDomPatchValues } from "@hyperframes/core/studio-api/finite-mutation";
 import type { DomEditSelection } from "../components/editor/domEditingTypes";
 
 export { PROPERTY_DEFAULTS } from "./gsapShared";
+import { idSelector, matchesExactlyOne } from "./gsapShared";
 
+/**
+ * The selector for a NEW tween; a shared-class selector would hit every sibling, so an
+ * element without a unique one gets an `autoId` proposal the server makes unique (`ensure-id`).
+ */
 export function ensureElementAddressable(selection: DomEditSelection): {
   selector: string;
   autoId?: string;
 } {
-  if (selection.id) return { selector: `#${selection.id}` };
-  if (selection.selector) return { selector: selection.selector };
+  if (selection.id) return { selector: idSelector(selection.id) };
 
   const el = selection.element;
   const doc = el.ownerDocument;
+  if (selection.selector && matchesExactlyOne(doc, selection.selector, el)) {
+    return { selector: selection.selector };
+  }
+
   const tag = el.tagName.toLowerCase();
   let id = tag;
   let n = 1;
@@ -19,8 +26,7 @@ export function ensureElementAddressable(selection: DomEditSelection): {
     n += 1;
     id = `${tag}-${n}`;
   }
-  el.setAttribute("id", id);
-  return { selector: `#${id}`, autoId: id };
+  return { selector: idSelector(id), autoId: id };
 }
 
 export class GsapMutationHttpError extends Error {
@@ -68,54 +74,4 @@ export function formatGsapMutationRejectionToast(error: GsapMutationHttpError): 
     )}${formatFieldsSuffix(body.fields)}`;
   }
   return `Couldn't save animation: ${error.message}`;
-}
-
-interface AssignAutoIdParams {
-  projectId: string;
-  targetPath: string;
-  selection: DomEditSelection;
-  autoId: string;
-  showToast?: (message: string, tone?: "error" | "info") => void;
-}
-
-export async function assignGsapTargetAutoIdIfNeeded({
-  projectId,
-  targetPath,
-  selection,
-  autoId,
-  showToast,
-}: AssignAutoIdParams): Promise<boolean> {
-  const patchBody = {
-    target: {
-      id: selection.id,
-      hfId: selection.hfId,
-      selector: selection.selector,
-      selectorIndex: selection.selectorIndex,
-    },
-    operations: [{ type: "html-attribute", property: "id", value: autoId }],
-  };
-  const unsafePatchFields = findUnsafeDomPatchValues(patchBody);
-  if (unsafePatchFields.length > 0) {
-    showToast?.("Couldn't assign element id because the patch contains invalid values", "error");
-    return false;
-  }
-  const res = await fetch(
-    `/api/projects/${encodeURIComponent(projectId)}/file-mutations/patch-element/${encodeURIComponent(targetPath)}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(patchBody),
-    },
-  );
-  if (!res.ok) {
-    showToast?.(
-      formatGsapMutationRejectionToast(
-        new GsapMutationHttpError(res.status, await readJsonResponseBody(res)),
-      ),
-      "error",
-    );
-    return false;
-  }
-  const data = (await res.json()) as { changed?: boolean };
-  return data.changed === true;
 }

@@ -2,8 +2,10 @@ import { Window } from "happy-dom";
 import { describe, expect, it } from "vitest";
 import {
   applyManualOffsetDragCommit,
+  resumeGsapTimelines,
   applyManualOffsetDragDraft,
   applyManualOffsetDragMatrix,
+  applyManualOffsetNudgeDraft,
   createManualOffsetDragMember,
   endManualOffsetDragMembers,
   invertManualOffsetDragMatrix,
@@ -11,7 +13,9 @@ import {
   resolveManualOffsetForPointerDelta,
   type ManualOffsetDragMatrix,
 } from "./manualOffsetDrag";
+import { UNREADABLE_TRANSLATE } from "./plainTranslate";
 import { STUDIO_OFFSET_X_PROP, STUDIO_OFFSET_Y_PROP } from "./manualEdits";
+import { computeDraggedGsapPosition } from "../../hooks/draggedGsapPosition";
 
 function expectMatrixClose(actual: ManualOffsetDragMatrix, expected: ManualOffsetDragMatrix): void {
   expect(actual.a).toBeCloseTo(expected.a, 6);
@@ -88,8 +92,43 @@ describe("measureManualOffsetDragScreenToOffsetMatrix", () => {
     expect(element.style.getPropertyValue("translate")).toBe("");
   });
 
-  it("measures movement in parent viewport pixels when the element is inside a scaled iframe", () => {
+  /**
+   * The element that has never been offset is the common case, and it used to skip
+   * the measurement and assume the canvas zoom was the whole story. Any transform
+   * above the element makes that assumption wrong: the mirrored parent here sends a
+   * rightward drag left, so the overlay followed the pointer while the element went
+   * the other way, and only on drop did the overlay jump to where the element really
+   * was. The fixture mirrors x and scales both axes by 1.2, as a `rotationY: 180`
+   * card at `scale: 1.2` does.
+   */
+  it("measures a mirrored parent even when the element carries no offset yet", () => {
     const window = new Window();
+    const element = window.document.createElement("div");
+    window.document.body.append(element);
+
+    element.getBoundingClientRect = () => {
+      const offsetX = Number.parseFloat(element.style.getPropertyValue(STUDIO_OFFSET_X_PROP)) || 0;
+      const offsetY = Number.parseFloat(element.style.getPropertyValue(STUDIO_OFFSET_Y_PROP)) || 0;
+      return new window.DOMRect(100 - 1.2 * offsetX, 200 + 1.2 * offsetY, 40, 20);
+    };
+
+    const measured = measureManualOffsetDragScreenToOffsetMatrix(element, { x: 0, y: 0 });
+    if (!measured.ok) throw new Error(measured.reason);
+
+    // Dragging one screen px right must move the element one screen px right, which
+    // on a mirrored parent means writing a NEGATIVE offset.
+    const offset = resolveManualOffsetForPointerDelta({
+      initialOffset: { x: 0, y: 0 },
+      screenToOffset: measured.matrix,
+      dx: 60,
+      dy: 60,
+    });
+    expect(offset.x).toBeCloseTo(-50, 6);
+    expect(offset.y).toBeCloseTo(50, 6);
+  });
+
+  it("measures movement in parent viewport pixels when the element is inside a scaled iframe", () => {
+    const window = new Window({ settings: { enableIframePageLoading: true } });
     const iframe = window.document.createElement("iframe");
     window.document.body.append(iframe);
     const iframeWindow = iframe.contentWindow;
@@ -133,7 +172,12 @@ describe("measureManualOffsetDragScreenToOffsetMatrix", () => {
     expect(nextOffset).toEqual({ x: 100, y: 50 });
   });
 
-  it("returns identity matrix for non-path-offset elements with zero initial offset", () => {
+  // Carrying no path offset used to be taken as permission to assume the response
+  // instead of measuring it. It is not a signal about the transforms above the
+  // element, so it no longer changes the answer: an element that does not move is
+  // unmeasurable either way, and the caller falls back rather than being handed a
+  // matrix that was never checked.
+  it("does not treat a missing path offset as a measurable response", () => {
     const window = new Window();
     const element = window.document.createElement("div");
     window.document.body.append(element);
@@ -141,10 +185,7 @@ describe("measureManualOffsetDragScreenToOffsetMatrix", () => {
 
     const measured = measureManualOffsetDragScreenToOffsetMatrix(element, { x: 0, y: 0 });
 
-    expect(measured.ok).toBe(true);
-    if (measured.ok) {
-      expectMatrixClose(measured.matrix, { a: 1, b: 0, c: 0, d: 1 });
-    }
+    expect(measured.ok).toBe(false);
   });
 
   it("rejects path-offset elements whose movement response cannot be measured", () => {
@@ -157,6 +198,56 @@ describe("measureManualOffsetDragScreenToOffsetMatrix", () => {
     const measured = measureManualOffsetDragScreenToOffsetMatrix(element, { x: 0, y: 0 });
 
     expect(measured.ok).toBe(false);
+  });
+});
+
+/**
+ * A group drag is rigid: every member is handed the SAME pointer delta and must
+ * travel the same distance on screen, or the group visibly comes apart mid-drag.
+ * Members do not share a mapping though — each measures its own, because each can
+ * sit under different ancestor transforms. A member whose movement cannot be
+ * measured falls back to a guess, and this pins what that guess costs the group.
+ */
+describe("group drag stays rigid", () => {
+  function member(key: string, response: number, measurable: boolean) {
+    const window = new Window();
+    const element = window.document.createElement("div");
+    window.document.body.append(element);
+    element.getBoundingClientRect = () => {
+      const ox = Number.parseFloat(element.style.getPropertyValue(STUDIO_OFFSET_X_PROP)) || 0;
+      const oy = Number.parseFloat(element.style.getPropertyValue(STUDIO_OFFSET_Y_PROP)) || 0;
+      const move = measurable ? response : 0;
+      return new window.DOMRect(100 + move * ox, 200 + move * oy, 40, 20);
+    };
+    const result = createManualOffsetDragMember({
+      key,
+      selection: { element } as never,
+      element,
+      rect: { left: 100, top: 200, width: 40, height: 20, editScaleX: 1, editScaleY: 1 },
+    });
+    if (!result.ok) throw new Error(result.reason);
+    return { member: result.member, response };
+  }
+
+  /** Screen distance this member travels for a pointer delta of `d`. */
+  function screenTravel(entry: ReturnType<typeof member>, d: number): number {
+    const offset = resolveManualOffsetForPointerDelta({
+      initialOffset: entry.member.initialOffset,
+      screenToOffset: entry.member.screenToOffset,
+      dx: d,
+      dy: 0,
+    });
+    return offset.x * entry.response;
+  }
+
+  it("moves every measurable member the same distance for one pointer delta", () => {
+    // Two members under different ancestor scales: one 1:1, one inside a half-scale
+    // parent. Different offsets, identical screen travel — that is what rigid means.
+    const a = member("a", 1, true);
+    const b = member("b", 0.5, true);
+
+    expect(screenTravel(a, 60)).toBeCloseTo(60, 6);
+    expect(screenTravel(b, 60)).toBeCloseTo(60, 6);
   });
 });
 
@@ -359,4 +450,269 @@ describe("GSAP-element drag — dot-a flies regressions", () => {
     // ...and the position survives in the GSAP transform (no stale var to compose).
     expect(element.style.getPropertyValue("transform")).toMatch(/translate\(/);
   });
+});
+
+describe("a drag that starts while an earlier gesture is still saving", () => {
+  it("keeps the timelines paused until the later drag ends", () => {
+    const { element, member } = makeGsapDot();
+    let paused = false;
+    const timeline = {
+      pause: () => (paused = true),
+      paused: (v?: boolean) => (paused = v ?? paused),
+    };
+    (element.ownerDocument.defaultView as unknown as { __timelines: unknown }).__timelines = {
+      main: timeline,
+    };
+    const earlier = member();
+    applyManualOffsetDragCommit(earlier, -50, 0);
+    const later = member();
+
+    endManualOffsetDragMembers([earlier]);
+
+    expect(paused).toBe(true);
+    endManualOffsetDragMembers([later]);
+    expect(paused).toBe(false);
+  });
+});
+
+describe("sub-pixel drags", () => {
+  it("draft and commit both land the exact fractional position", () => {
+    const { element, sets, member } = makeGsapDot();
+    const m = member();
+    applyManualOffsetDragDraft(m, 10.25, -3.5);
+    const draft = sets.at(-1)!;
+    expect(draft).toEqual({ x: m.baseGsap.x + 10.25, y: m.baseGsap.y - 3.5 });
+    const offset = applyManualOffsetDragCommit(m, 10.25, -3.5);
+    const { newX, newY } = computeDraggedGsapPosition(element, offset, m.baseGsap);
+    expect({ x: newX, y: newY }).toEqual(draft);
+  });
+});
+
+describe("a stylesheet translate after a committed GSAP drag", () => {
+  function draggedTitle(css: string, oldOffsetChannel = false, withGsap = true) {
+    const window = new Window();
+    const style = window.document.createElement("style");
+    style.textContent = css;
+    window.document.head.append(style);
+    const element = window.document.createElement("h1");
+    element.id = "title";
+    if (oldOffsetChannel) {
+      element.setAttribute("data-hf-studio-path-offset", "true");
+      element.style.setProperty(STUDIO_OFFSET_X_PROP, "30px");
+      element.style.setProperty(STUDIO_OFFSET_Y_PROP, "0px");
+      element.style.translate = `var(${STUDIO_OFFSET_X_PROP}, 0px) var(${STUDIO_OFFSET_Y_PROP}, 0px)`;
+    }
+    window.document.body.append(element);
+    element.getBoundingClientRect = () => new window.DOMRect(10, 20, 100, 50);
+    (window as unknown as { gsap: unknown }).gsap = withGsap && {
+      set: (el: HTMLElement, vars: { x?: number; y?: number }) =>
+        el.style.setProperty("transform", `translate(${vars.x ?? 0}px, ${vars.y ?? 0}px)`),
+      getProperty: () => 0,
+    };
+    const result = createManualOffsetDragMember({
+      key: "title",
+      selection: { element } as never,
+      element,
+      rect: { left: 10, top: 20, width: 100, height: 50, editScaleX: 1, editScaleY: 1 },
+    });
+    if (!result.ok) throw new Error("member not created");
+    applyManualOffsetDragCommit(result.member, 40, 30);
+    if (withGsap) expect(element.style.getPropertyValue("translate")).toBe("none");
+    endManualOffsetDragMembers([result.member]);
+    return element;
+  }
+
+  it("stays masked, so it is not applied on top of the committed transform", () => {
+    expect(
+      draggedTitle("#title { translate: 0 -200px; }").style.getPropertyValue("translate"),
+    ).toBe("none");
+  });
+
+  it("stays masked for an element still on the old offset channel", () => {
+    const element = draggedTitle("#title { translate: 0 -200px; }", true);
+    expect(element.hasAttribute("data-hf-studio-path-offset")).toBe(false);
+    expect(element.style.getPropertyValue("translate")).toBe("none");
+  });
+
+  it("is not masked when GSAP does not own the position", () => {
+    const element = draggedTitle("#title { translate: 0 -200px; }", true, false);
+    expect(element.style.getPropertyValue("translate")).toContain(STUDIO_OFFSET_X_PROP);
+  });
+
+  it("is not left behind when nothing sits under the draft's mask", () => {
+    expect(draggedTitle("").style.getPropertyValue("translate")).toBe("");
+  });
+});
+
+describe("resumeGsapTimelines", () => {
+  it("unpauses exactly the timelines the drag start paused, then re-seeks the player", () => {
+    const window = new Window();
+    const element = window.document.createElement("div");
+    element.setAttribute("data-hf-drag-paused-timelines", "figma-demo-unlock,figma-demo-stagger");
+    window.document.body.append(element);
+
+    const pausedState: Record<string, boolean> = {
+      "figma-demo-unlock": true,
+      "figma-demo-stagger": true,
+      main: true,
+    };
+    const makeTl = (id: string) => ({
+      paused: (value?: boolean) => {
+        if (value !== undefined) pausedState[id] = value;
+        return pausedState[id]!;
+      },
+    });
+    const seeks: number[] = [];
+    const win = element.ownerDocument.defaultView as unknown as {
+      __timelines?: Record<string, unknown>;
+      __player?: { seek: (t: number) => void; getTime: () => number };
+    };
+    win.__timelines = {
+      "figma-demo-unlock": makeTl("figma-demo-unlock"),
+      "figma-demo-stagger": makeTl("figma-demo-stagger"),
+      main: makeTl("main"),
+    };
+    win.__player = { seek: (t: number) => seeks.push(t), getTime: () => 3.5 };
+
+    resumeGsapTimelines(element);
+
+    expect(pausedState["figma-demo-unlock"]).toBe(false);
+    expect(pausedState["figma-demo-stagger"]).toBe(false);
+    // main was NOT paused by the drag — leave its state alone
+    expect(pausedState["main"]).toBe(true);
+    expect(seeks).toEqual([3.5]);
+    expect(element.hasAttribute("data-hf-drag-paused-timelines")).toBe(false);
+  });
+
+  it("is a no-op without the paused-timelines attribute", () => {
+    const window = new Window();
+    const element = window.document.createElement("div");
+    window.document.body.append(element);
+    expect(() => resumeGsapTimelines(element)).not.toThrow();
+  });
+});
+
+describe("a move of an element GSAP does not position", () => {
+  function plainBox(options: { gsapLoaded?: boolean } = {}) {
+    const window = new Window();
+    const element = window.document.createElement("div");
+    window.document.body.append(element);
+    element.style.setProperty("translate", "40px 30px");
+    // A rect that never moves: the probe falls back to the 1:1 preview-scale mapping.
+    element.getBoundingClientRect = () => new window.DOMRect(10, 20, 100, 50);
+    const gsapCalls: string[] = [];
+    if (options.gsapLoaded) {
+      Object.assign(window, {
+        gsap: { set: () => gsapCalls.push("set"), getProperty: () => gsapCalls.push("read") },
+      });
+    }
+    const member = (gesture: "drag" | "nudge" = "drag") => {
+      const result = createManualOffsetDragMember({
+        key: "box",
+        selection: { element } as never,
+        element,
+        rect: { left: 10, top: 20, width: 100, height: 50, editScaleX: 1, editScaleY: 1 },
+        gesture,
+      });
+      if (!result.ok) throw new Error(result.reason);
+      return result.member;
+    };
+    return { window, element, gsapCalls, member };
+  }
+
+  it("refuses a translate it can't read instead of guessing, and leaves the element alone", () => {
+    const { element } = plainBox();
+    element.style.setProperty("translate", "abs(10% - 50px) 0px");
+    const result = createManualOffsetDragMember({
+      key: "box",
+      selection: { element } as never,
+      element,
+      rect: { left: 10, top: 20, width: 100, height: 50, editScaleX: 1, editScaleY: 1 },
+      gesture: "drag",
+    });
+    expect(result.ok).toBe(false);
+    expect(result.ok ? "" : result.reason).toBe(UNREADABLE_TRANSLATE);
+    expect(element.style.getPropertyValue("translate")).toBe("abs(10% - 50px) 0px");
+  });
+
+  it("drafts and drops the element's own translate in plain px, never touching GSAP", () => {
+    const { element, gsapCalls, member } = plainBox({ gsapLoaded: true });
+    const m = member();
+    expect(m.plainTranslate).toBe(true);
+    applyManualOffsetDragDraft(m, 90.25, 60);
+    expect(element.style.getPropertyValue("translate")).toBe("130.25px 90px");
+    expect(applyManualOffsetDragCommit(m, 90.25, 60)).toEqual({ x: 130.25, y: 90 });
+    endManualOffsetDragMembers([m]);
+    expect(element.style.getPropertyValue("translate")).toBe("130.25px 90px");
+    expect(gsapCalls).toEqual([]);
+    expect(element.hasAttribute("data-hf-drag-gsap-base-x")).toBe(false);
+  });
+
+  it("starts a second move where the first dropped, while the first save is still in flight", () => {
+    const { member } = plainBox();
+    const first = member();
+    applyManualOffsetDragCommit(first, 90, 60);
+    const second = member();
+    expect(second.initialOffset).toEqual({ x: 130, y: 90 });
+    expect(applyManualOffsetDragCommit(second, 40, 0)).toEqual({ x: 170, y: 90 });
+  });
+
+  it("nudges from the element's translate", () => {
+    const { member } = plainBox();
+    expect(applyManualOffsetNudgeDraft(member("nudge"), { x: 5, y: -1 })).toEqual({ x: 45, y: 29 });
+  });
+
+  it("keeps the GSAP writer once GSAP renders the element's transform", () => {
+    const { element, member } = plainBox({ gsapLoaded: true });
+    Object.assign(element, { _gsap: { renderTransform: () => {} } });
+    expect(member().plainTranslate).toBe(false);
+  });
+
+  it("keeps the GSAP writer for an element a timeline hold positions", () => {
+    const { window, element, member } = plainBox();
+    const hold = { targets: () => [element], vars: { x: 40 }, duration: () => 0 };
+    Object.assign(window, { __timelines: { main: { getChildren: () => [hold] } } });
+    expect(member().plainTranslate).toBe(false);
+  });
+});
+
+describe("a resize's anchor member", () => {
+  function anchorMember(tweenVars?: Record<string, number>) {
+    const window = new Window();
+    const element = window.document.createElement("div");
+    element.id = "box";
+    window.document.body.append(element);
+    const tweens = tweenVars ? [{ vars: tweenVars, targets: () => [element] }] : [];
+    Object.assign(window, { __timelines: { main: { getChildren: () => tweens } } });
+    element.getBoundingClientRect = () => {
+      const [x = 0, y = 0] = element.style
+        .getPropertyValue("translate")
+        .split(" ")
+        .map((v) => Number.parseFloat(v));
+      return new window.DOMRect(10 + (x || 0), 20 + (y || 0), 100, 50);
+    };
+    const result = createManualOffsetDragMember({
+      key: "box",
+      selection: { element } as never,
+      element,
+      rect: { left: 10, top: 20, width: 100, height: 50, editScaleX: 1, editScaleY: 1 },
+      gesture: "resize",
+    });
+    if (!result.ok) throw new Error("member");
+    return result.member;
+  }
+
+  it("keeps the centre with the element's own plain translate when GSAP does not own the box", () => {
+    const member = anchorMember();
+    expect(member.plainTranslate).toBe(true);
+    applyManualOffsetDragDraft(member, -10.25, 3.5);
+    expect(member.element.style.getPropertyValue("translate")).toBe("-10.25px 3.5px");
+  });
+
+  it.each(["width", "maxWidth", "minHeight", "flexBasis", "scale", "scaleX"])(
+    "leaves a box whose %s GSAP tweens, which the CSS box writer also sets, to the GSAP writer",
+    (channel) => {
+      expect(anchorMember({ [channel]: 300 }).plainTranslate).toBe(false);
+    },
+  );
 });

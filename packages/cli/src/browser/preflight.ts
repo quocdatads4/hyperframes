@@ -1,21 +1,25 @@
-import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { platform } from "node:os";
-import { findBrowser, type BrowserResult } from "./manager.js";
+import { buildChromeLaunchEnv } from "@hyperframes/core/chrome-env";
+import { findFfBinary } from "@hyperframes/parsers/ff-binaries";
+import { ensureBrowser, findBrowser, type BrowserResult } from "./manager.js";
+import { describeBrowserInstall, type BrowserInstallFacts } from "./installFacts.js";
 import {
   FFMPEG_PATH_ENV,
   FFPROBE_PATH_ENV,
-  findFFmpeg,
-  findFFprobe,
+  FIRST_LAUNCH_TIMEOUT_MS,
   getFFmpegInstallHint,
 } from "./ffmpeg.js";
 import {
   chromeDepsInstallCommand,
   detectLinuxDistro,
   distroLabel,
-  probeChromeSharedLibs,
+  parseLddMissingLibs,
 } from "./linuxDeps.js";
 import { getFreeDiskMb } from "../telemetry/system.js";
+import { runCancellableProcess } from "../utils/cancellableProcess.js";
+import { normalizeErrorMessage } from "../utils/errorMessage.js";
+import { processReadArgs } from "../utils/windowsProcesses.js";
 
 export type EnvironmentCheckLevel = "ok" | "warn" | "error";
 
@@ -25,8 +29,11 @@ export interface EnvironmentCheckOutcome {
   detail: string;
   level: EnvironmentCheckLevel;
   title?: string;
+  code?: string;
   hint?: string;
   path?: string;
+  /** Major version parsed from the tool's own `-version`/`--version` output, when available. */
+  versionMajor?: number;
 }
 
 export interface EnvironmentCheckResult {
@@ -34,6 +41,9 @@ export interface EnvironmentCheckResult {
   ffmpegPath?: string;
   ffprobePath?: string;
   browser?: BrowserResult;
+  browserInstall?: BrowserInstallFacts;
+  ffmpegVersionMajor?: number;
+  browserVersionMajor?: number;
 }
 
 export interface EnvironmentCheckOptions {
@@ -43,11 +53,18 @@ export interface EnvironmentCheckOptions {
   includeBrowser?: boolean;
   includeDisk?: boolean;
   includeWindowsUnc?: boolean;
+  signal?: AbortSignal;
 }
 
 export function parseToolVersion(raw: string): string {
-  const m = raw.match(/(ffmpeg|ffprobe)\s+version\s+([\d][\d.\-\w]*)/i);
+  const m = raw.match(/(ffmpeg|ffprobe)\s+version\s+(n?\d[\d.\-\w]*)/i);
   return m ? `${m[1]} ${m[2]}` : raw.trim();
+}
+
+/** First `X.Y`-shaped number in a version banner, allowing the "n" of release-branch ffmpeg builds (n8.0.1). */
+export function extractMajorVersion(raw: string): number | undefined {
+  const m = raw.match(/\bn?(\d+)\.\d+/);
+  return m?.[1] ? Number(m[1]) : undefined;
 }
 
 function configuredMissingDetail(envName: string): string | undefined {
@@ -56,19 +73,46 @@ function configuredMissingDetail(envName: string): string | undefined {
   return `Configured path does not exist: ${envName}="${configured}"`;
 }
 
-type ToolVersionResult = { ok: true; detail: string } | { ok: false; detail: string };
+type ToolVersionResult =
+  | { ok: true; detail: string; majorVersion?: number }
+  | { ok: false; detail: string };
 
-function readToolVersion(binaryPath: string): ToolVersionResult {
+// fallow-ignore-next-line complexity
+async function readToolVersion(
+  binaryPath: string,
+  signal?: AbortSignal,
+): Promise<ToolVersionResult> {
   try {
-    const raw =
-      execFileSync(binaryPath, ["-version"], { encoding: "utf-8", timeout: 5000 }).split("\n")[0] ??
-      "";
+    const output = (
+      await runCancellableProcess(binaryPath, ["-version"], {
+        signal,
+        timeoutMs: FIRST_LAUNCH_TIMEOUT_MS,
+      })
+    ).stdout;
+    const raw = output.split("\n")[0] ?? "";
     const version = parseToolVersion(raw);
-    return { ok: true, detail: version ? `${version} at ${binaryPath}` : binaryPath };
+    return {
+      ok: true,
+      detail: version ? `${version} at ${binaryPath}` : binaryPath,
+      majorVersion: extractMajorVersion(raw),
+    };
   } catch (error) {
-    const status =
-      typeof error === "object" && error !== null && "status" in error ? error.status : undefined;
-    const exitDetail = typeof status === "number" ? ` (exit code ${status})` : "";
+    if (signal?.aborted) signal.throwIfAborted();
+    const field = (name: string) =>
+      typeof error === "object" && error !== null && name in error
+        ? (error as Record<string, unknown>)[name]
+        : undefined;
+    const status = field("status");
+    const code = field("code");
+    const killedBy = field("signal");
+    const exitDetail =
+      typeof status === "number"
+        ? ` (exit code ${status})`
+        : typeof code === "string"
+          ? ` (${code})`
+          : typeof killedBy === "string"
+            ? ` (signal ${killedBy})`
+            : "";
     return {
       ok: false,
       detail: `Failed to run "${binaryPath}" -version${exitDetail}.`,
@@ -76,7 +120,7 @@ function readToolVersion(binaryPath: string): ToolVersionResult {
   }
 }
 
-function checkFFmpeg(): EnvironmentCheckOutcome {
+async function checkFFmpeg(signal?: AbortSignal): Promise<EnvironmentCheckOutcome> {
   const missingConfigured = configuredMissingDetail(FFMPEG_PATH_ENV);
   if (missingConfigured) {
     return {
@@ -84,14 +128,15 @@ function checkFFmpeg(): EnvironmentCheckOutcome {
       ok: false,
       level: "error",
       title: "FFmpeg not found",
+      code: "ffmpeg_not_found",
       detail: missingConfigured,
       hint: getFFmpegInstallHint(),
     };
   }
 
-  const path = findFFmpeg();
+  const path = findFfBinary("ffmpeg", { configuredMustExist: true });
   if (path) {
-    const version = readToolVersion(path);
+    const version = await readToolVersion(path, signal);
     if (!version.ok) {
       return {
         name: "FFmpeg",
@@ -99,11 +144,21 @@ function checkFFmpeg(): EnvironmentCheckOutcome {
         level: "error",
         title: "FFmpeg cannot start",
         detail: version.detail,
-        hint: "Install a working 64-bit FFmpeg build with all required runtime DLLs.",
+        hint:
+          process.platform === "win32"
+            ? "Install a working 64-bit FFmpeg build with all required runtime DLLs."
+            : getFFmpegInstallHint(),
         path,
       };
     }
-    return { name: "FFmpeg", ok: true, level: "ok", detail: version.detail, path };
+    return {
+      name: "FFmpeg",
+      ok: true,
+      level: "ok",
+      detail: version.detail,
+      path,
+      versionMajor: version.majorVersion,
+    };
   }
 
   return {
@@ -111,12 +166,15 @@ function checkFFmpeg(): EnvironmentCheckOutcome {
     ok: false,
     level: "error",
     title: "FFmpeg not found",
-    detail: "FFmpeg is required to encode video. The render cannot proceed without it.",
+    code: "ffmpeg_not_found",
+    // Second sentence dropped: "the render cannot proceed" is already said by
+    // the error this accompanies, and in Studio by the disabled Export button.
+    detail: "FFmpeg is required to encode video.",
     hint: getFFmpegInstallHint(),
   };
 }
 
-function checkFFprobe(): EnvironmentCheckOutcome {
+async function checkFFprobe(signal?: AbortSignal): Promise<EnvironmentCheckOutcome> {
   const missingConfigured = configuredMissingDetail(FFPROBE_PATH_ENV);
   if (missingConfigured) {
     return {
@@ -124,14 +182,15 @@ function checkFFprobe(): EnvironmentCheckOutcome {
       ok: false,
       level: "error",
       title: "FFprobe not found",
+      code: "ffprobe_not_found",
       detail: missingConfigured,
       hint: getFFmpegInstallHint(),
     };
   }
 
-  const path = findFFprobe();
+  const path = findFfBinary("ffprobe", { configuredMustExist: true });
   if (path) {
-    const version = readToolVersion(path);
+    const version = await readToolVersion(path, signal);
     return { name: "FFprobe", ok: true, level: "ok", detail: version.detail, path };
   }
 
@@ -140,6 +199,7 @@ function checkFFprobe(): EnvironmentCheckOutcome {
     ok: false,
     level: "error",
     title: "FFprobe not found",
+    code: "ffprobe_not_found",
     detail:
       "FFprobe is required to probe media assets. It ships with FFmpeg but was not found on PATH.",
     hint: getFFmpegInstallHint(),
@@ -155,12 +215,37 @@ function checkFFprobe(): EnvironmentCheckOutcome {
  * `Failed to launch the browser process` mid-render. No-op off Linux and when
  * `ldd` can't run (probe inconclusive).
  */
-function chromeSharedLibOutcome(
+// fallow-ignore-next-line complexity
+async function chromeSharedLibOutcome(
   executablePath: string,
   found: EnvironmentCheckOutcome,
-): EnvironmentCheckOutcome {
+  signal?: AbortSignal,
+): Promise<EnvironmentCheckOutcome> {
   if (process.platform !== "linux") return found;
-  const probe = probeChromeSharedLibs(executablePath);
+  let probe;
+  if (!existsSync(executablePath)) {
+    probe = { ok: true, missing: [], probeUnavailable: true };
+  } else {
+    try {
+      const result = await runCancellableProcess("ldd", [executablePath], {
+        signal,
+        timeoutMs: 5000,
+      });
+      probe = parseLddMissingLibs(result.stdout);
+    } catch (error) {
+      if (signal?.aborted) signal.throwIfAborted();
+      const stdout =
+        typeof error === "object" && error !== null && "stdout" in error
+          ? String(error.stdout ?? "")
+          : "";
+      const killed =
+        typeof error === "object" && error !== null && "killed" in error && error.killed === true;
+      probe =
+        stdout && !killed
+          ? parseLddMissingLibs(stdout)
+          : { ok: true, missing: [], probeUnavailable: true };
+    }
+  }
   if (probe.probeUnavailable || probe.ok) return found;
 
   const distro = detectLinuxDistro();
@@ -175,22 +260,97 @@ function chromeSharedLibOutcome(
   };
 }
 
-async function checkChrome(browserPath?: string): Promise<EnvironmentCheckOutcome> {
+function chromeLaunchFailureDetails(error: unknown): string {
+  if (typeof error !== "object" || error === null) return "";
+  const status = "status" in error ? error.status : undefined;
+  const signal = "signal" in error ? error.signal : undefined;
+  const code = "code" in error ? error.code : undefined;
+  return [
+    typeof status === "number" ? `exit code ${status}` : "",
+    typeof signal === "string" ? `signal ${signal}` : "",
+    typeof code === "string" ? code : "",
+  ]
+    .filter(Boolean)
+    .join(", ");
+}
+
+// Windows chrome.exe prints nothing for --version and can exit 21 while rendering fine: read the file's version.
+async function windowsChromeVersionMajor(
+  executablePath: string,
+  signal?: AbortSignal,
+): Promise<number | undefined> {
+  try {
+    const { stdout } = await runCancellableProcess(
+      "powershell.exe",
+      processReadArgs("version", executablePath),
+      { signal, timeoutMs: 10_000, maxBufferBytes: 4 * 1024 },
+    );
+    return extractMajorVersion(stdout);
+  } catch {
+    if (signal?.aborted) signal.throwIfAborted();
+    return undefined;
+  }
+}
+
+async function chromeLaunchOutcome(
+  executablePath: string,
+  found: EnvironmentCheckOutcome,
+  signal?: AbortSignal,
+): Promise<EnvironmentCheckOutcome> {
+  const libraries = await chromeSharedLibOutcome(executablePath, found, signal);
+  if (!libraries.ok) return libraries;
+  if (process.platform === "win32") {
+    return { ...found, versionMajor: await windowsChromeVersionMajor(executablePath, signal) };
+  }
+  try {
+    const { stdout } = await runCancellableProcess(executablePath, ["--version"], {
+      env: buildChromeLaunchEnv(),
+      signal,
+      timeoutMs: FIRST_LAUNCH_TIMEOUT_MS,
+      maxBufferBytes: 64 * 1024,
+    });
+    return { ...found, versionMajor: extractMajorVersion(stdout) };
+  } catch (error) {
+    if (signal?.aborted) signal.throwIfAborted();
+    const details = chromeLaunchFailureDetails(error);
+    return {
+      name: "Chrome",
+      ok: false,
+      level: "error",
+      title: "Chrome cannot start",
+      detail: `Failed to run "${executablePath}" --version${details ? ` (${details})` : ""}.`,
+      hint:
+        "Select a working Chrome/Chromium binary for this OS and architecture with " +
+        "HYPERFRAMES_BROWSER_PATH, or reinstall with: npx hyperframes browser ensure --force",
+      path: executablePath,
+    };
+  }
+}
+
+async function checkChrome(
+  browserPath?: string,
+  signal?: AbortSignal,
+): Promise<EnvironmentCheckOutcome> {
   if (browserPath) {
     if (existsSync(browserPath)) {
-      return chromeSharedLibOutcome(browserPath, {
-        name: "Chrome",
-        ok: true,
-        level: "ok",
-        detail: `explicit: ${browserPath}`,
-        path: browserPath,
-      });
+      return chromeLaunchOutcome(
+        browserPath,
+        {
+          name: "Chrome",
+          ok: true,
+          level: "ok",
+          detail: `explicit: ${browserPath}`,
+          path: browserPath,
+        },
+        signal,
+      );
     }
     return {
       name: "Chrome",
       ok: false,
       level: "error",
       title: "Chrome not found",
+      code: "chrome_not_found",
       detail: `Chrome binary not found at "${browserPath}".`,
       hint: "Run: npx hyperframes browser ensure",
     };
@@ -202,19 +362,28 @@ async function checkChrome(browserPath?: string): Promise<EnvironmentCheckOutcom
   // failure as "Chrome not found" rather than letting it crash the caller
   // (notably `doctor`, which is documented to exit 0 even when checks fail).
   let info: Awaited<ReturnType<typeof findBrowser>>;
+  let failure: string | undefined;
   try {
-    info = await findBrowser();
-  } catch {
+    info = signal
+      ? await ensureBrowser({ preferManagedChrome: true, signal })
+      : await findBrowser();
+  } catch (error) {
+    if (signal?.aborted) signal.throwIfAborted();
     info = undefined;
+    failure = normalizeErrorMessage(error);
   }
   if (info) {
-    return chromeSharedLibOutcome(info.executablePath, {
-      name: "Chrome",
-      ok: true,
-      level: "ok",
-      detail: `${info.source}: ${info.executablePath}`,
-      path: info.executablePath,
-    });
+    return chromeLaunchOutcome(
+      info.executablePath,
+      {
+        name: "Chrome",
+        ok: true,
+        level: "ok",
+        detail: `${info.source}: ${info.executablePath}`,
+        path: info.executablePath,
+      },
+      signal,
+    );
   }
 
   return {
@@ -222,9 +391,22 @@ async function checkChrome(browserPath?: string): Promise<EnvironmentCheckOutcom
     ok: false,
     level: "error",
     title: "Chrome not found",
-    detail: "Chrome Headless Shell is required for local rendering.",
+    code: "chrome_not_found",
+    detail: failure ?? "Chrome Headless Shell is required for local rendering.",
     hint: "Run: npx hyperframes browser ensure",
   };
+}
+
+/** Resolves the render browser the way `hyperframes render` does; a refusal carries the check's own message. */
+export async function resolveRenderBrowser(signal?: AbortSignal): Promise<BrowserResult> {
+  const { outcomes, browser } = await runEnvironmentChecks({ includeBrowser: true, signal });
+  if (browser) return browser;
+  const chrome = outcomes.find((outcome) => outcome.name === "Chrome");
+  const headline = [chrome?.title, chrome?.detail].filter(Boolean).join(": ");
+  throw new Error(
+    [headline, chrome?.hint].filter(Boolean).join(" ") ||
+      "Chrome Headless Shell could not be resolved for rendering.",
+  );
 }
 
 export function checkDisk(
@@ -267,15 +449,16 @@ export async function runEnvironmentChecks(
 ): Promise<EnvironmentCheckResult> {
   const outcomes: EnvironmentCheckOutcome[] = [];
 
-  const ffmpeg = checkFFmpeg();
+  const ffmpeg = await checkFFmpeg(options.signal);
   outcomes.push(ffmpeg);
 
-  const ffprobe = checkFFprobe();
+  const ffprobe = await checkFFprobe(options.signal);
   outcomes.push(ffprobe);
 
   let browser: BrowserResult | undefined;
+  let browserVersionMajor: number | undefined;
   if (options.includeBrowser) {
-    const chrome = await checkChrome(options.browserPath);
+    const chrome = await checkChrome(options.browserPath, options.signal);
     outcomes.push(chrome);
     if (chrome.ok && chrome.path) {
       browser = {
@@ -283,6 +466,7 @@ export async function runEnvironmentChecks(
         source: options.browserPath ? "env" : "cache",
       };
     }
+    browserVersionMajor = chrome.versionMajor;
   }
 
   if (options.includeDisk) {
@@ -299,6 +483,8 @@ export async function runEnvironmentChecks(
     outcomes,
     ...(ffmpeg.ok && ffmpeg.path ? { ffmpegPath: ffmpeg.path } : {}),
     ...(ffprobe.path ? { ffprobePath: ffprobe.path } : {}),
-    ...(browser ? { browser } : {}),
+    ...(browser ? { browser, browserInstall: describeBrowserInstall(browser.executablePath) } : {}),
+    ...(ffmpeg.versionMajor != null ? { ffmpegVersionMajor: ffmpeg.versionMajor } : {}),
+    ...(browserVersionMajor != null ? { browserVersionMajor } : {}),
   };
 }

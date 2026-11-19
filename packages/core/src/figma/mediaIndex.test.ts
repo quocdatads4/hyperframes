@@ -61,6 +61,24 @@ const FIGMA_ROW = {
 const JUNK_ROW = { note: "not a media record" };
 const ALL_ROWS = [MEDIA_USE_ROW, IMAGE_ROW, ICON_ROW, FIGMA_ROW, JUNK_ROW];
 
+// The media-use generator itself, resolved from THIS file (cwd varies per test runner) and
+// handed over as a file:// URL so the specifier is valid on windows too.
+const genUrl = pathToFileURL(
+  join(
+    fileURLToPath(new URL(".", import.meta.url)),
+    "..",
+    "..",
+    "..",
+    "..",
+    "packages",
+    "cli",
+    "src",
+    "media-use",
+    "lib",
+    "index-gen.mjs",
+  ),
+).href;
+
 describe("regenerateIndex", () => {
   it("renders every writer's rows (media-use + figma) into one table", () => {
     const p = project();
@@ -77,23 +95,6 @@ describe("regenerateIndex", () => {
     // Covers duration, width×height, icon+transparent, no-dims, and junk-row
     // selection — the full set of branches both generators format.
     const ours = generateIndexContent(ALL_ROWS as Record<string, unknown>[]);
-    // Run the actual media-use generator on identical input. Resolve the
-    // script relative to THIS file (cwd varies per test runner) and hand it
-    // over as a file:// URL so the specifier is valid on windows too.
-    const genUrl = pathToFileURL(
-      join(
-        fileURLToPath(new URL(".", import.meta.url)),
-        "..",
-        "..",
-        "..",
-        "..",
-        "skills",
-        "media-use",
-        "scripts",
-        "lib",
-        "index-gen.mjs",
-      ),
-    ).href;
     const script = `
       import { generateIndexContent } from ${JSON.stringify(genUrl)};
       const rows = ${JSON.stringify(ALL_ROWS)};
@@ -103,5 +104,73 @@ describe("regenerateIndex", () => {
       encoding: "utf8",
     });
     expect(ours).toBe(theirs);
+  });
+
+  it("lists only a path's newest record, the same rows media-use's writer picks", () => {
+    const p = project();
+    const regenerated = { ...MEDIA_USE_ROW, description: "calm underscore" };
+    for (const row of [MEDIA_USE_ROW, FIGMA_ROW, regenerated]) {
+      appendFileSync(manifestPath(p), JSON.stringify(row) + "\n");
+    }
+    const ours = regenerateIndex(p);
+    const script = `
+      import { regenerateIndex } from ${JSON.stringify(genUrl)};
+      process.stdout.write(regenerateIndex(${JSON.stringify(p)}));
+    `;
+    const theirs = execFileSync("node", ["--input-type=module", "-e", script], {
+      encoding: "utf8",
+    });
+    expect(ours).toContain("calm underscore");
+    expect(ours).not.toContain("upbeat tech launch");
+    expect(ours).toBe(theirs);
+  });
+});
+
+describe("generateIndexContent with line breaks and control characters in a row", () => {
+  const BROKEN_ROWS = [
+    { ...IMAGE_ROW, id: "image_009\r\n", description: "first line\nsecond line\r\n  third" },
+    { ...ICON_ROW, path: ".media/images/\nicon.svg", description: "\n" },
+    {
+      ...IMAGE_ROW,
+      id: "image_010",
+      description: "a\u2028b\u2029c\u0085d\u000be\u000cf",
+    },
+    {
+      ...IMAGE_ROW,
+      id: "image_011\u0000",
+      description: "red\u001b[31m\u0007 bell\u007f\u009b\ttab",
+    },
+  ];
+
+  it("keeps each row on one line", () => {
+    const lines = generateIndexContent(BROKEN_ROWS)
+      .trimEnd()
+      .split(/\r\n|[\n\r\v\f\u0085\u2028\u2029]/);
+    // Title, blank line, column heading, then one line per row.
+    expect(lines).toHaveLength(3 + BROKEN_ROWS.length);
+    expect(lines[3]).toContain("first line second line third");
+    expect(lines[5]).toContain("a b c d e f");
+  });
+
+  it("shows other control characters as visible escapes and keeps tabs", () => {
+    const content = generateIndexContent(BROKEN_ROWS);
+    const controls = [...content].filter((ch) => {
+      const code = ch.charCodeAt(0);
+      return (code < 0x20 && code !== 0x09 && code !== 0x0a) || (code >= 0x7f && code <= 0x9f);
+    });
+    expect(controls).toEqual([]);
+    expect(content).toContain("image_011\\x00");
+    expect(content).toContain("red\\x1b[31m\\x07 bell\\x7f\\x9b\ttab");
+  });
+
+  it("matches media-use's index-gen output byte-for-byte", () => {
+    const script = `
+      import { generateIndexContent } from ${JSON.stringify(genUrl)};
+      process.stdout.write(generateIndexContent(${JSON.stringify(BROKEN_ROWS)}));
+    `;
+    const theirs = execFileSync("node", ["--input-type=module", "-e", script], {
+      encoding: "utf8",
+    });
+    expect(generateIndexContent(BROKEN_ROWS)).toBe(theirs);
   });
 });

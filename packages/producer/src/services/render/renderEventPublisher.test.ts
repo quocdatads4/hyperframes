@@ -1,9 +1,13 @@
 // fallow-ignore-file code-duplication
 import { describe, expect, it, vi } from "vitest";
 import {
+  RenderCancelledError,
   RenderQualityError,
   applyRenderWarningPolicy,
   createRenderJob,
+  stopPrepSessionOnScriptFailure,
+  surfaceScriptFailure,
+  withScriptFailureStop,
 } from "../renderOrchestrator.js";
 import { updateJobStatus } from "./shared.js";
 import { OrderedRenderEventPublisher, publishRenderFailure } from "./renderEventPublisher.js";
@@ -31,6 +35,38 @@ describe("OrderedRenderEventPublisher", () => {
       { progress: 25, message: "second" },
       { progress: 100, message: "done" },
     ]);
+  });
+
+  it("deep-clones typed warning arrays across the progress sink boundary", async () => {
+    const deliveredReasons: string[][] = [];
+    const publisher = new OrderedRenderEventPublisher(
+      async (snapshot) => {
+        const reasons = snapshot.warnings[0]?.details?.failureReasons;
+        if (reasons) {
+          deliveredReasons.push([...reasons]);
+          reasons.push("sink_mutation");
+        }
+      },
+      { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
+    );
+    const job = createRenderJob({ fps: 30, quality: "high" });
+    job.warnings.push({
+      code: "audio_processing_failed",
+      message: "audio failed",
+      stage: "capture-readiness",
+      details: {
+        mediaType: "audio",
+        failureReasons: ["ffmpeg_timeout"],
+        failureStages: ["prepare"],
+      },
+    });
+
+    publisher.publish(job, "warning");
+    job.warnings[0]!.details!.failureReasons!.push("source_mutation");
+    await publisher.flush();
+
+    expect(deliveredReasons).toEqual([["ffmpeg_timeout"]]);
+    expect(job.warnings[0]?.details?.failureReasons).toEqual(["ffmpeg_timeout", "source_mutation"]);
   });
 
   it("contains sink rejection and still delivers the terminal event", async () => {
@@ -94,6 +130,35 @@ describe("OrderedRenderEventPublisher", () => {
   });
 });
 
+describe("RenderQualityError", () => {
+  it("includes the warning message that identifies the failing audio element", () => {
+    const error = new RenderQualityError([
+      {
+        code: "audio_processing_failed",
+        message: "Audio processing failed for element bgm-bed: Automation is not valid JSON",
+        stage: "capture-readiness",
+      },
+    ]);
+
+    expect(error.message).toContain(
+      "audio_processing_failed: Audio processing failed for element bgm-bed: Automation is not valid JSON",
+    );
+  });
+
+  it("redacts URL query secrets from warning messages", () => {
+    const error = new RenderQualityError([
+      {
+        code: "audio_processing_failed",
+        message: "Audio processing failed for https://cdn.example.com/track.wav?token=secret",
+        stage: "capture-readiness",
+      },
+    ]);
+
+    expect(error.message).toContain("https://cdn.example.com/track.wav?…");
+    expect(error.message).not.toContain("secret");
+  });
+});
+
 describe("updateJobStatus", () => {
   it("keeps one bounded monotonic integer-percent representation", () => {
     const job = createRenderJob({ fps: 30, quality: "high" });
@@ -129,6 +194,38 @@ describe("updateJobStatus", () => {
     expect(job.warnings).toHaveLength(1);
   });
 
+  it("lets a prep session stop on a script failure without telling the job, and a worker decide", () => {
+    const job = createRenderJob({ fps: 30, quality: "high" });
+    const log = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+    const base = { width: 16, height: 16, fps: { num: 30, den: 1 } };
+    const failed = { code: "sub_timeline_script_failure" as const, message: "a script threw" };
+    const prep = stopPrepSessionOnScriptFailure(base);
+    expect(() => prep.onSubTimelineScriptFailure?.([failed])).toThrow("preparation session");
+    expect(job.warnings ?? []).toEqual([]);
+    const worker = withScriptFailureStop(base, job, log);
+    expect(() => worker.onSubTimelineScriptFailure?.([failed])).toThrow(RenderQualityError);
+    expect(job.warnings?.map((warning) => warning.code)).toEqual(["sub_timeline_script_failure"]);
+  });
+
+  it("hands a script failure back as the top-level RenderQualityError, whatever wrapped it on the way up", () => {
+    const job = createRenderJob({ fps: 30, quality: "high" });
+    const log = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+    const wrapped = new Error("[Parallel] Capture failed: Worker 1: Render blocked", {
+      cause: new Error("worker"),
+    });
+    expect(surfaceScriptFailure(wrapped, job)).toBe(wrapped);
+    const base = { width: 16, height: 16, fps: { num: 30, den: 1 } };
+    const failed = { code: "sub_timeline_script_failure" as const, message: "a script threw" };
+    expect(() =>
+      withScriptFailureStop(base, job, log).onSubTimelineScriptFailure?.([failed]),
+    ).toThrow(RenderQualityError);
+    const surfaced = surfaceScriptFailure(wrapped, job);
+    expect(surfaced).toBeInstanceOf(RenderQualityError);
+    expect(surfaceScriptFailure(surfaced, job)).toBe(surfaced);
+    const cancelled = new RenderCancelledError("user_cancelled");
+    expect(surfaceScriptFailure(cancelled, job)).toBe(cancelled);
+  });
+
   it("blocks audio processing failures when strictness is omitted", () => {
     const job = createRenderJob({ fps: 30, quality: "high" });
     const log = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
@@ -146,6 +243,110 @@ describe("updateJobStatus", () => {
       ),
     ).toThrow(RenderQualityError);
     expect(job.config.strictness).toBe("best-effort");
+    expect(job.warnings).toHaveLength(1);
+    expect(log.warn).toHaveBeenCalledWith(
+      "Render completed capture with correctness warnings",
+      expect.objectContaining({ warningRetryable: undefined }),
+    );
+  });
+
+  it("logs bounded audio failure taxonomy without requiring raw stderr", () => {
+    const job = createRenderJob({ fps: 30, quality: "high" });
+    const log = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+    expect(() =>
+      applyRenderWarningPolicy(
+        job,
+        [
+          {
+            code: "audio_processing_failed",
+            message: "raw diagnostic stays on the warning object",
+            details: {
+              mediaType: "audio",
+              failureReasons: ["ffmpeg_timeout"],
+              failureStages: ["prepare"],
+              failureOwner: "system",
+              retryable: true,
+            },
+          },
+        ],
+        log,
+      ),
+    ).toThrow(RenderQualityError);
+    expect(log.warn).toHaveBeenCalledWith(
+      "Render completed capture with correctness warnings",
+      expect.objectContaining({
+        warningCodes: ["audio_processing_failed"],
+        warningReasons: ["ffmpeg_timeout"],
+        warningStages: ["prepare"],
+        warningOwners: ["system"],
+        warningRetryable: true,
+      }),
+    );
+  });
+
+  it("only logs an aggregate warning as retryable when every typed warning is retryable", () => {
+    const job = createRenderJob({ fps: 30, quality: "high" });
+    const log = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+    expect(() =>
+      applyRenderWarningPolicy(
+        job,
+        [
+          {
+            code: "audio_processing_failed",
+            message: "temporary audio failure",
+            details: { mediaType: "audio", retryable: true },
+          },
+          {
+            code: "media_load_failed",
+            message: "terminal media failure",
+            details: { mediaType: "video", retryable: false },
+          },
+        ],
+        log,
+      ),
+    ).toThrow(RenderQualityError);
+    expect(log.warn).toHaveBeenCalledWith(
+      "Render completed capture with correctness warnings",
+      expect.objectContaining({ warningRetryable: false }),
+    );
+  });
+
+  it("blocks sub-timeline script failures in best-effort mode (#3352)", () => {
+    const job = createRenderJob({ fps: 30, quality: "high" });
+    const log = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+    expect(() =>
+      applyRenderWarningPolicy(
+        job,
+        [
+          {
+            code: "sub_timeline_script_failure",
+            message: "A sub-composition script threw during execution",
+            details: {
+              timeoutMs: 45_000,
+              sources: ["runtime-error:decision-tree-123"],
+            },
+          },
+        ],
+        log,
+      ),
+    ).toThrow(RenderQualityError);
+    expect(job.warnings).toHaveLength(1);
+  });
+
+  it("allows sub-timeline readiness timeout in best-effort mode", () => {
+    const job = createRenderJob({ fps: 30, quality: "high" });
+    const log = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+    applyRenderWarningPolicy(
+      job,
+      [
+        {
+          code: "sub_timeline_readiness_timeout",
+          message: "Sub-composition timelines did not become ready within 45000ms",
+          details: { timeoutMs: 45_000 },
+        },
+      ],
+      log,
+    );
     expect(job.warnings).toHaveLength(1);
   });
 

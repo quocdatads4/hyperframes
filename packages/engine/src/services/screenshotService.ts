@@ -7,14 +7,18 @@
 
 // fallow-ignore-file code-duplication
 import { type Page } from "puppeteer-core";
+import { withVideoFrameSources, type VideoFrameUpdate } from "./videoFrameTransport.js";
 import { type CaptureOptions } from "../types.js";
 import {
   HF_COLOR_GRADING_CANVAS_ID_PREFIX,
+  MEDIA_RENDER_ID_ATTR,
   MEDIA_VISUAL_STYLE_PROPERTIES,
+  RENDER_FRAME_ID_PREFIX,
+  RENDER_FRAME_ID_SUFFIX,
+  renderFrameIdForRenderId,
 } from "@hyperframes/core";
 
 export const cdpSessionCache = new WeakMap<Page, import("puppeteer-core").CDPSession>();
-const COLOR_GRADING_SOURCE_HIDDEN_ATTR = "data-hf-color-grading-source-hidden";
 
 export async function getCdpSession(page: Page): Promise<import("puppeteer-core").CDPSession> {
   let client = cdpSessionCache.get(page);
@@ -103,11 +107,15 @@ export async function probeBeginFrameLiveness(
  * Requires chrome-headless-shell with --enable-begin-frame-control and
  * --deterministic-mode flags.
  */
-// Cache the last valid screenshot buffer per page for hasDamage=false frames.
-// When Chrome reports no visual change, we reuse the previous frame rather than
-// attempting Page.captureScreenshot (which times out in beginFrame mode since
-// the compositor is paused).
+// The last buffer beginFrameCapture returned per page. A screenshot BeginFrame always
+// reports damage, so a frame is reused only when a screenshot-less BeginFrame right after
+// the seek reports none. Any BeginFrame sent elsewhere moves the display past this buffer:
+// call forgetBeginFrameCapture first.
 const lastFrameCache = new WeakMap<Page, Buffer>();
+
+export function forgetBeginFrameCapture(page: Page): void {
+  lastFrameCache.delete(page);
+}
 
 const PENDING_FRAME_RETRIES = 5;
 
@@ -127,7 +135,7 @@ async function sendBeginFrame(
       }
       if (isPending) {
         throw new Error(
-          `[BeginFrame] Frame still pending after ${PENDING_FRAME_RETRIES} retries — CPU overloaded by parallel renders. ` +
+          `[BeginFrame] Frame still pending after ${PENDING_FRAME_RETRIES} retries: CPU overloaded by parallel renders. ` +
             `Reduce concurrent renders or use --docker for isolation.`,
         );
       }
@@ -151,14 +159,29 @@ export async function beginFrameCapture(
     optimizeForSpeed: true,
   } as const;
 
-  const result = await sendBeginFrame(client, { frameTimeTicks, interval, screenshot });
+  // With a cached buffer, a screenshot-less BeginFrame first draws the seek and reports
+  // whether it changed anything. The screenshot after it is not displayed: a displayed
+  // screenshot frame leaves damage the next probe would report, and a settle frame to
+  // absorb it would draw page changes that nothing captures.
+  const cached = lastFrameCache.get(page);
+  let screenshotTicks = frameTimeTicks;
+  if (cached) {
+    const probe = await sendBeginFrame(client, { frameTimeTicks, interval });
+    if (!probe.hasDamage) return { buffer: cached, hasDamage: false };
+    screenshotTicks = frameTimeTicks + interval / 2;
+  }
+  const result = await sendBeginFrame(client, {
+    frameTimeTicks: screenshotTicks,
+    interval,
+    screenshot,
+    noDisplayUpdates: cached !== undefined,
+  });
 
   let buffer: Buffer;
   if (result.screenshotData) {
     buffer = Buffer.from(result.screenshotData, "base64");
     lastFrameCache.set(page, buffer);
   } else {
-    const cached = lastFrameCache.get(page);
     if (cached) {
       buffer = cached;
     } else {
@@ -275,43 +298,46 @@ export async function captureScreenshotWithAlpha(
 }
 
 /**
- * Set the page background to transparent once for a dedicated HDR DOM session.
- *
- * Call this once after session initialization. Then use captureAlphaPng() per
- * frame instead of captureScreenshotWithAlpha() to skip the per-frame CDP
- * background override round-trips.
- *
- * Only use on sessions that are exclusively dedicated to transparent capture
- * (e.g., the HDR two-pass DOM layer session) — the background will stay
- * transparent for the lifetime of the session.
- *
- * NOTE on the injected stylesheet: `Emulation.setDefaultBackgroundColorOverride`
- * only replaces the *default* page background. Compositions almost always set
- * `body { background: ... }` and `#root { background: ... }`, which paint over
- * the override and ruin alpha capture for layered HDR compositing — the
- * composition root's full-frame background paints across the entire viewport
- * and wipes out HDR content captured beneath it.
- *
- * We force `html`, `body`, and any element marked as a composition root
- * (`[data-composition-id]`) to transparent. In HDR layered compositing the HDR
- * video itself is the backdrop, so DOM layers must only contribute their
- * foreground UI pixels — never a page-spanning solid backdrop.
+ * Make the page transparent for alpha capture, then use captureAlphaPng() per frame. html/body always clear;
+ * [data-composition-id] roots (nested too) keep their background unless clearCompositionRoot (HDR layered pass).
+ * A repeat call rewrites the rule, so the last call wins.
  */
+/** Whether frames must carry alpha. PNG alone does not imply it: motion blur captures opaque output as PNG. */
+export function capturesAlpha(options: Pick<CaptureOptions, "format" | "transparent">): boolean {
+  return options.transparent ?? options.format === "png";
+}
+
 const TRANSPARENT_BG_STYLE_ID = "__hf_transparent_bg__";
 
-export async function initTransparentBackground(page: Page): Promise<void> {
+export async function initTransparentBackground(
+  page: Page,
+  {
+    clearCompositionRoot = false,
+    hideElementIds = [],
+  }: { clearCompositionRoot?: boolean; hideElementIds?: readonly string[] } = {},
+): Promise<void> {
   const client = await getCdpSession(page);
   await client.send("Emulation.setDefaultBackgroundColorOverride", {
     color: { r: 0, g: 0, b: 0, a: 0 },
   });
-  await page.evaluate((styleId: string) => {
-    if (document.getElementById(styleId)) return;
-    const style = document.createElement("style");
-    style.id = styleId;
-    style.textContent =
-      "html,body,[data-composition-id]{background:transparent !important;background-color:transparent !important;background-image:none !important;}";
-    document.head.appendChild(style);
-  }, TRANSPARENT_BG_STYLE_ID);
+  await page.evaluate(
+    (styleId: string, clearCompositionRoot: boolean, hideIds: string[]) => {
+      const selector = clearCompositionRoot ? "html,body,[data-composition-id]" : "html,body";
+      let style = document.getElementById(styleId);
+      if (!style) {
+        style = document.createElement("style");
+        style.id = styleId;
+        document.head.appendChild(style);
+      }
+      const hidden = hideIds.map((id) => `#${CSS.escape(id)}`).join(",");
+      style.textContent =
+        `${selector}{background:transparent !important;background-color:transparent !important;background-image:none !important;}` +
+        (hidden ? `${hidden}{visibility:hidden !important;}` : "");
+    },
+    TRANSPARENT_BG_STYLE_ID,
+    clearCompositionRoot,
+    [...hideElementIds],
+  );
 }
 
 /**
@@ -404,6 +430,9 @@ export async function applyDomLayerMask(
     (args: {
       show: string[];
       hide: string[];
+      renderIdAttr: string;
+      renderFramePrefix: string;
+      renderFrameSuffix: string;
       styleId: string;
       hiddenAttr: string;
       prevVisibilityAttr: string;
@@ -412,6 +441,11 @@ export async function applyDomLayerMask(
     }) => {
       const existing = document.getElementById(args.styleId);
       if (existing) existing.remove();
+
+      // Affixes come from core's renderFrameSibling, so the runtime readers and
+      // this lookup cannot drift apart on the id format.
+      const renderFrameId = (id: string) =>
+        `${args.renderFramePrefix}${id}${args.renderFrameSuffix}`;
 
       const restoreMaskedElements = () => {
         const masked = document.querySelectorAll(`[${args.hiddenAttr}="1"]`);
@@ -465,11 +499,21 @@ export async function applyDomLayerMask(
 
       const showSelectors: string[] = [];
       for (const id of args.show) {
-        const el = document.getElementById(id);
+        const el = window.__hfMediaEl?.(id) ?? document.getElementById(id);
         if (el) rememberHiddenTimedDescendants(el);
-        const escaped = CSS.escape(id);
-        showSelectors.push(`#${escaped}`, `#${escaped} *`);
-        const renderEscaped = CSS.escape(`__render_frame_${id}__`);
+        // Address the element by its render id when it has one. `#id` must not
+        // be used as an extra fallback here: an id is duplicated exactly when
+        // two compositions share it, so `#id` would also unhide the other
+        // scene's element — the collision this render id exists to resolve.
+        if (el?.hasAttribute(args.renderIdAttr)) {
+          const attrEscaped = id.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+          const byRenderId = `[${args.renderIdAttr}="${attrEscaped}"]`;
+          showSelectors.push(byRenderId, `${byRenderId} *`);
+        } else {
+          const escaped = CSS.escape(id);
+          showSelectors.push(`#${escaped}`, `#${escaped} *`);
+        }
+        const renderEscaped = CSS.escape(renderFrameId(id));
         showSelectors.push(`#${renderEscaped}`, `#${renderEscaped} *`);
         const colorGradingEscaped = CSS.escape(`${args.canvasIdPrefix}${id}`);
         showSelectors.push(`#${colorGradingEscaped}`, `#${colorGradingEscaped} *`);
@@ -491,11 +535,11 @@ export async function applyDomLayerMask(
       }
 
       for (const id of args.hide) {
-        const el = document.getElementById(id);
-        if (el) {
+        const el = window.__hfMediaEl?.(id) ?? document.getElementById(id);
+        if (el instanceof HTMLElement) {
           rememberAndHideElement(el);
         }
-        const img = document.getElementById(`__render_frame_${id}__`);
+        const img = document.getElementById(renderFrameId(id));
         if (img) {
           rememberAndHideElement(img);
         }
@@ -508,6 +552,9 @@ export async function applyDomLayerMask(
     {
       show: showIds,
       hide: extraHideIds,
+      renderIdAttr: MEDIA_RENDER_ID_ATTR,
+      renderFramePrefix: RENDER_FRAME_ID_PREFIX,
+      renderFrameSuffix: RENDER_FRAME_ID_SUFFIX,
       styleId: DOM_LAYER_MASK_STYLE_ID,
       hiddenAttr: DOM_LAYER_MASK_HIDDEN_ATTR,
       prevVisibilityAttr: DOM_LAYER_MASK_PREV_VISIBILITY_ATTR,
@@ -589,21 +636,29 @@ export async function removeDomLayerMask(page: Page, _extraHideIds: string[]): P
  * callers that don't run through `initializeSession`.
  */
 export async function ensureRenderFrameSiblings(page: Page): Promise<void> {
-  await page.evaluate(() => {
-    for (const video of Array.from(
-      document.querySelectorAll<HTMLVideoElement>("video[data-start]"),
-    )) {
-      const next = video.nextElementSibling;
-      if (next !== null && next.classList.contains("__render_frame__")) continue;
-      const img = document.createElement("img");
-      img.classList.add("__render_frame__");
-      img.id = `__render_frame_${video.id}__`;
-      img.style.pointerEvents = "none";
-      img.style.position = "absolute";
-      img.style.visibility = "hidden";
-      video.parentNode?.insertBefore(img, video.nextSibling);
-    }
-  });
+  await page.evaluate(
+    (prefix: string, suffix: string) => {
+      for (const video of Array.from(
+        document.querySelectorAll<HTMLVideoElement>("video[data-start]"),
+      )) {
+        const next = video.nextElementSibling;
+        if (next !== null && next.classList.contains("__render_frame__")) continue;
+        const img = document.createElement("img");
+        img.classList.add("__render_frame__");
+        // Derive from the render id, not `video.id` — two scenes can share an
+        // element id, and two siblings sharing an id would collide in turn.
+        // `||`, not `??`: `__hfMediaId` returns "" for an element with neither
+        // id, and core's reader treats that as "no id" rather than a key.
+        img.id = `${prefix}${window.__hfMediaId?.(video) || video.id}${suffix}`;
+        img.style.pointerEvents = "none";
+        img.style.position = "absolute";
+        img.style.visibility = "hidden";
+        video.parentNode?.insertBefore(img, video.nextSibling);
+      }
+    },
+    RENDER_FRAME_ID_PREFIX,
+    RENDER_FRAME_ID_SUFFIX,
+  );
 }
 
 /**
@@ -613,21 +668,40 @@ export async function ensureRenderFrameSiblings(page: Page): Promise<void> {
  * cache entry for a frame that never reached the page, which would otherwise
  * short-circuit the next inject at the same frameIndex and leave the host's
  * first visible frame blank.
+ *
+ * `restyleIds` keep their current picture and only re-copy the video's style.
  */
 export async function injectVideoFramesBatch(
   page: Page,
   updates: Array<{ videoId: string; dataUri: string }>,
+  restyleIds: readonly string[] = [],
 ): Promise<string[]> {
-  if (updates.length === 0) return [];
+  if (updates.length === 0 && restyleIds.length === 0) return [];
+  return withVideoFrameSources(page, updates, (resolved) =>
+    injectResolvedVideoFramesBatch(page, resolved, restyleIds),
+  );
+}
+
+async function injectResolvedVideoFramesBatch(
+  page: Page,
+  updates: VideoFrameUpdate[],
+  restyleIds: readonly string[],
+): Promise<string[]> {
+  // Build the sibling id with core's function rather than a template here,
+  // so the id the readers look up has exactly one definition.
+  const items: Array<Partial<VideoFrameUpdate> & { videoId: string; frameId: string }> = [
+    ...updates,
+    ...restyleIds.map((videoId) => ({ videoId })),
+  ].map((item) => ({ ...item, frameId: renderFrameIdForRenderId(item.videoId) }));
   return await page.evaluate(
     // fallow-ignore-next-line complexity
     async (
-      items: Array<{ videoId: string; dataUri: string }>,
+      items: Array<Partial<VideoFrameUpdate> & { videoId: string; frameId: string }>,
       visualProperties: string[],
-      colorGradingSourceHiddenAttr: string,
     ) => {
       const injectedIds: string[] = [];
       const pendingDecodes: Array<Promise<void>> = [];
+      const imagesToPublish: HTMLImageElement[] = [];
       const replacementLayoutProperties = new Set([
         "width",
         "height",
@@ -677,11 +751,14 @@ export async function injectVideoFramesBatch(
         return false;
       };
       for (const item of items) {
-        const video = document.getElementById(item.videoId) as HTMLVideoElement | null;
+        const video = (window.__hfMediaEl?.(item.videoId) ??
+          document.getElementById(item.videoId)) as HTMLVideoElement | null;
         if (!video) continue;
 
         let img = video.nextElementSibling as HTMLImageElement | null;
         const hasImg = img !== null && img.classList.contains("__render_frame__");
+        const restyleOnly = item.dataUri === undefined;
+        if (restyleOnly && !hasImg) continue;
 
         if (isVisualAncestorHidden(video)) {
           // Don't paint a frame over a hidden host — if an existing replacement
@@ -704,16 +781,21 @@ export async function injectVideoFramesBatch(
         // `opacity: 0`), so its computed opacity is preserved across seeks
         // and accurately reflects the user's intent on every frame.
         const opacityParsed = parseFloat(computedStyle.opacity);
-        const computedOpacity = video.hasAttribute(colorGradingSourceHiddenAttr)
-          ? 1
-          : Number.isNaN(opacityParsed)
-            ? 1
-            : opacityParsed;
+        const computedOpacity = Number.isNaN(opacityParsed) ? 1 : opacityParsed;
+
+        // Measure first: an in-flow bordered <img> sibling would shrink the video's flex box.
+        const videoRect = video.getBoundingClientRect();
+        const videoBox = {
+          left: Number.isFinite(video.offsetLeft) ? video.offsetLeft : 0,
+          top: Number.isFinite(video.offsetTop) ? video.offsetTop : 0,
+          width: video.offsetWidth > 0 ? video.offsetWidth : videoRect.width,
+          height: video.offsetHeight > 0 ? video.offsetHeight : videoRect.height,
+        };
 
         if (isNewImage) {
           img = document.createElement("img");
           img.classList.add("__render_frame__");
-          img.id = `__render_frame_${item.videoId}__`;
+          img.id = item.frameId;
           img.style.pointerEvents = "none";
           video.parentNode?.insertBefore(img, video.nextSibling);
         }
@@ -745,55 +827,61 @@ export async function injectVideoFramesBatch(
         // instead of flowing below it. With position:relative, both elements
         // stack vertically — the <img> lands below the video and gets clipped
         // by any overflow:hidden ancestor (e.g., border-radius wrappers).
-        //
-        // Apply this after visual style copying so the measured used box is
-        // the final authority for replacement frame geometry.
-        {
-          const videoRect = video.getBoundingClientRect();
-          const offsetLeft = Number.isFinite(video.offsetLeft) ? video.offsetLeft : 0;
-          const offsetTop = Number.isFinite(video.offsetTop) ? video.offsetTop : 0;
-          const offsetWidth = video.offsetWidth > 0 ? video.offsetWidth : videoRect.width;
-          const offsetHeight = video.offsetHeight > 0 ? video.offsetHeight : videoRect.height;
-          img.style.position = "absolute";
-          img.style.inset = "auto";
-          img.style.left = `${offsetLeft}px`;
-          img.style.top = `${offsetTop}px`;
-          img.style.right = "auto";
-          img.style.bottom = "auto";
-          img.style.width = `${offsetWidth}px`;
-          img.style.height = `${offsetHeight}px`;
-        }
+        img.style.position = "absolute";
+        img.style.inset = "auto";
+        img.style.left = `${videoBox.left}px`;
+        img.style.top = `${videoBox.top}px`;
+        img.style.right = "auto";
+        img.style.bottom = "auto";
+        img.style.width = `${videoBox.width}px`;
+        img.style.height = `${videoBox.height}px`;
+        // `videoBox` is a border-box even when the video is content-box.
+        img.style.boxSizing = "border-box";
         img.style.objectFit = computedStyle.objectFit;
         img.style.objectPosition = computedStyle.objectPosition;
         img.style.zIndex = computedStyle.zIndex;
 
+        // Publish after full decode so raster cannot race it with a reduced JPEG decode.
+        img.style.setProperty("visibility", "hidden", "important");
         img.decoding = "sync";
-        if (img.getAttribute("src") !== item.dataUri) {
+        if (item.dataUri !== undefined && img.getAttribute("src") !== item.dataUri) {
+          if (item.crossOrigin) img.crossOrigin = item.crossOrigin;
+          else img.removeAttribute("crossorigin");
           img.src = item.dataUri;
+          const source =
+            item.sourceLabel ?? (item.dataUri.startsWith("data:") ? "inline frame" : item.dataUri);
           pendingDecodes.push(
-            img
-              .decode()
-              .catch(() => undefined)
-              .then(() => undefined),
+            img.decode().catch((error: unknown) => {
+              throw new Error(
+                `Video frame for "${item.videoId}" failed to load (${source}): ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              );
+            }),
           );
         }
         img.style.opacity = String(computedOpacity);
-        img.style.visibility = "visible";
+        imagesToPublish.push(img);
         // Hide the native <video> with visibility only — never clobber inline
         // opacity, so subsequent reads (and queryElementStacking) see the real
         // GSAP-controlled value.
         video.style.setProperty("visibility", "hidden", "important");
         video.style.setProperty("pointer-events", "none", "important");
-        injectedIds.push(item.videoId);
+        if (!restyleOnly) injectedIds.push(item.videoId);
       }
       if (pendingDecodes.length > 0) {
         await Promise.all(pendingDecodes);
       }
+      for (const img of imagesToPublish) img.style.visibility = "visible";
+      if (imagesToPublish.length > 0) {
+        const redraw = (window as Window & { __hf?: { colorGrading?: { redraw?: () => void } } })
+          .__hf?.colorGrading?.redraw;
+        redraw?.();
+      }
       return injectedIds;
     },
-    updates,
+    items,
     [...MEDIA_VISUAL_STYLE_PROPERTIES],
-    COLOR_GRADING_SOURCE_HIDDEN_ATTR,
   );
 }
 
@@ -803,7 +891,7 @@ export async function syncVideoFrameVisibility(
 ): Promise<void> {
   await page.evaluate(
     // fallow-ignore-next-line complexity
-    (ids: string[], colorGradingSourceHiddenAttr: string) => {
+    (ids: string[]) => {
       // Mirror the ancestor-visibility guard from `injectVideoFramesBatch`.
       // See that copy for the full rationale on why `visibility: hidden` is
       // narrowed to sub-composition hosts only — keep these two functions in
@@ -825,6 +913,13 @@ export async function syncVideoFrameVisibility(
         return false;
       };
       const active = new Set(ids);
+      const setColorGradingVisibility = (
+        window as Window & {
+          __hf?: {
+            colorGrading?: { setSourceVisibility?: (target: Element, visible: boolean) => boolean };
+          };
+        }
+      ).__hf?.colorGrading?.setSourceVisibility;
       const videos = Array.from(
         document.querySelectorAll("video[data-start]"),
       ) as HTMLVideoElement[];
@@ -832,7 +927,8 @@ export async function syncVideoFrameVisibility(
         const img = video.nextElementSibling as HTMLElement | null;
         const hasImg = img && img.classList.contains("__render_frame__");
         const ancestorHidden = isVisualAncestorHidden(video);
-        if (active.has(video.id) && !ancestorHidden) {
+        const visible = active.has(window.__hfMediaId?.(video) || video.id) && !ancestorHidden;
+        if (visible) {
           // Active video: show injected <img>, hide native <video>.
           // Do NOT clobber inline opacity here — GSAP-controlled opacity must
           // survive until injectVideoFramesBatch reads it via getComputedStyle.
@@ -840,10 +936,7 @@ export async function syncVideoFrameVisibility(
           // its computed opacity.
           video.style.setProperty("visibility", "hidden", "important");
           video.style.setProperty("pointer-events", "none", "important");
-          if (hasImg) {
-            if (video.hasAttribute(colorGradingSourceHiddenAttr)) img.style.opacity = "1";
-            img.style.visibility = "visible";
-          }
+          if (hasImg) img.style.visibility = "visible";
         } else {
           // Inactive (or ancestor-hidden) video: hide both. Use visibility only
           // (never opacity) so we never clobber GSAP-controlled inline opacity.
@@ -852,16 +945,15 @@ export async function syncVideoFrameVisibility(
           // cannot revive a stale frame when the sub-comp host lands in the
           // active layer's `show` set — same mask-defense reasoning as the
           // `isVisualAncestorHidden` branch in `injectVideoFramesBatch`.
-          video.style.removeProperty("display");
           video.style.setProperty("visibility", "hidden", "important");
           video.style.setProperty("pointer-events", "none", "important");
           if (hasImg) {
             img.style.setProperty("visibility", "hidden", "important");
           }
         }
+        setColorGradingVisibility?.(video, visible);
       }
     },
     activeVideoIds,
-    COLOR_GRADING_SOURCE_HIDDEN_ATTR,
   );
 }

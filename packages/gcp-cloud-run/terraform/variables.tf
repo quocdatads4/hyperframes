@@ -13,6 +13,15 @@ variable "project_name" {
   type        = string
   description = "Name prefix applied to the service / workflow / bucket / service accounts."
   default     = "hyperframes"
+
+  validation {
+    condition = (
+      length(var.project_name) >= 3 &&
+      length(var.project_name) <= 23 &&
+      can(regex("^[a-z][a-z0-9-]*[a-z0-9]$", var.project_name))
+    )
+    error_message = "project_name must be 3-23 lowercase letters, digits, or hyphens, begin with a letter, and end with a letter or digit so derived service-account IDs remain valid."
+  }
 }
 
 variable "image" {
@@ -36,6 +45,12 @@ variable "request_timeout_seconds" {
   type        = number
   description = "Per-request timeout. Cloud Run hard cap is 3600s; a single chunk should finish well inside this."
   default     = 3600
+}
+
+variable "restrict_page_network" {
+  type        = bool
+  description = "Hold render pages to public addresses: loopback, private, link-local and IPv6 hosts are refused, and ffmpeg https inputs may open only https. Set false only when every composition is trusted and needs VPC-only or private-DNS hosts."
+  default     = true
 }
 
 variable "min_instances" {

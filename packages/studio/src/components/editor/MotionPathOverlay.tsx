@@ -1,30 +1,39 @@
+import { scopedElementKey } from "../../hooks/gsapKeyframeCacheHelpers";
 import { memo, useEffect, useRef, useState, type RefObject } from "react";
 import type { DomEditSelection } from "./domEditing";
 import { useDomEditContext } from "../../contexts/DomEditContext";
+import { useStudioShellContextOptional } from "../../contexts/StudioContext";
+import { useGsapInteractionFailureTelemetry } from "../../hooks/useGsapInteractionFailureTelemetry";
 import { usePlayerStore } from "../../player/store/playerStore";
+import { useLivePreviewIframe } from "../../player/store/previewIframeStore";
 import { parkPlayheadOnKeyframe } from "../../hooks/gsapDragCommit";
-import { commitWholePropertyOffset } from "../../hooks/gsapWholePropertyOffsetCommit";
-import { nearestPointOnPath, type MotionNodeRef } from "./motionPathGeometry";
+import {
+  nearestPointOnPath,
+  nodeCentre,
+  type MotionNodeRef,
+  type MotionPathHome,
+} from "./motionPathGeometry";
 import { editableAnimationId, selectorFor } from "./motionPathSelection";
-import { ACCENT, MotionPathNode } from "./MotionPathNode";
+import { controlForNode, controlUnder, pressControl } from "./motionPathLayerNode";
+import { readGsapPositionFromIframe } from "../../hooks/gsapPositionDetection";
+import { isHtmlElement } from "@hyperframes/core/runtime/dom-realm";
+import { ACCENT, MotionPathLine, MotionPathNode } from "./MotionPathNode";
 import {
   KeyframeDiamondContextMenu,
   type KeyframeDiamondContextMenuState,
 } from "../../player/components/KeyframeDiamondContextMenu";
+import type { TimelineKeyframeTarget } from "../../player/components/timelineKeyframeIdentity";
 import {
   commitAddKeyframe,
   commitAddWaypoint,
   commitCreatePath,
-  commitNode,
+  commitNodeDrop,
   commitRemoveWaypoint,
+  nodeDropLabel,
 } from "./motionPathCommit";
-import {
-  elementHome,
-  hasMotionPathPlugin,
-  isPreviewHtmlElement,
-  transformWDivisor,
-  useMotionPathData,
-} from "./useMotionPathData";
+import { elementHome, transformWDivisor } from "@hyperframes/core/runtime/editing-port";
+import { hasMotionPathPlugin, sealedMotionPathHome, useMotionPathData } from "./useMotionPathData";
+import { previewFrameOpaque } from "../../player/lib/previewChannel";
 
 interface MotionPathOverlayProps {
   iframeRef: RefObject<HTMLIFrameElement | null>;
@@ -45,11 +54,25 @@ type DragState = {
   ref: MotionNodeRef;
 };
 
+/**
+ * Tween-% for a stop inserted at fraction `t` along the segment between two
+ * nodes. null when either end is not a keyframe (arc waypoints carry no %).
+ */
+function interpolatedKeyframePct(
+  a: MotionNodeRef | undefined,
+  b: MotionNodeRef | undefined,
+  t: number,
+): number | null {
+  if (a?.type !== "keyframe" || b?.type !== "keyframe") return null;
+  return Math.round((a.pct + (b.pct - a.pct) * t) * 1000) / 1000;
+}
+
 const NODE_PX = 6; // node radius in screen pixels (kept constant across zoom)
 // Click-vs-drag cutoff in SCREEN pixels. Below this the pointer-up is a click
 // (select the keyframe); at or above it the gesture commits a move. Screen-space
 // (not composition px) so it behaves identically at any zoom.
 const DRAG_THRESHOLD_PX = 3;
+const noToast = () => {};
 
 /**
  * Draws the selected element's GSAP motion path over the canvas — a dashed
@@ -75,19 +98,36 @@ export const MotionPathOverlay = memo(function MotionPathOverlay({
     handleGsapRemoveAllKeyframes,
     handleGsapMoveKeyframeToPlayhead,
   } = useDomEditContext();
+  const shell = useStudioShellContextOptional();
+  const reportFailure = useGsapInteractionFailureTelemetry(
+    shell?.activeCompPath ?? null,
+    shell?.showToast ?? noToast,
+  );
   const { rect, geometry, geometryResolved, visibleInPreview, home, pScale } = useMotionPathData(
     iframeRef,
     selectorFor(selection),
   );
   const [draft, setDraft] = useState<Draft | null>(null);
   const [ghost, setGhost] = useState<{ x: number; y: number; segIndex: number } | null>(null);
+  const [lineCursor, setLineCursor] = useState("copy");
   const [hoverNode, setHoverNode] = useState<number | null>(null);
-  // Right-click context menu on a keyframe node — same delete actions as the
-  // timeline keyframe diamond.
-  const [kfMenu, setKfMenu] = useState<KeyframeDiamondContextMenuState | null>(null);
+  // Right-click context menu on a path node — same delete actions as the
+  // timeline keyframe diamond. The node it was opened on rides along, because
+  // which entries apply depends on whether it is a keyframe or a waypoint.
+  const [kfMenu, setKfMenu] = useState<{
+    state: KeyframeDiamondContextMenuState;
+    ref: MotionNodeRef;
+  } | null>(null);
   // The keyframe % selected by clicking its node — highlighted, and the next drag
   // modifies it rather than adding a keyframe.
   const activeKeyframePct = usePlayerStore((s) => s.activeKeyframePct);
+  const timelineElement = usePlayerStore((state) => {
+    if (!selection) return undefined;
+    const sourceScopedId = scopedElementKey(selection);
+    return state.elements.find(
+      (element) => (element.key ?? element.id) === sourceScopedId || element.id === selection.id,
+    );
+  });
   // Set-destination mode is armed from the preview toolbar (replaces the old
   // double-click-on-canvas UX). See createMode effects below.
   const armed = usePlayerStore((s) => s.motionPathArmed);
@@ -100,7 +140,11 @@ export const MotionPathOverlay = memo(function MotionPathOverlay({
   // just in render, after the early returns) so the park-timer cleanup can key on
   // it: a pending park seek belongs to the OLD animation, so firing it after the
   // active animation changed would jump the playhead onto a stale keyframe.
-  const animId = editableAnimationId(selectedGsapAnimations ?? [], geometry?.kind ?? "linear");
+  const animId = editableAnimationId(
+    selectedGsapAnimations ?? [],
+    geometry?.kind ?? "linear",
+    selection,
+  );
   // Clear the debounced park timer on unmount AND whenever the active animation id
   // changes — not unmount-only, or a queued seek from the previous selection still
   // fires against the new one.
@@ -112,7 +156,11 @@ export const MotionPathOverlay = memo(function MotionPathOverlay({
   const createMode = geometryResolved && !geometry && Boolean(selection?.element) && !isPlaying;
   const createSelector = createMode ? selectorFor(selection) : null;
   const compW = compositionSize?.width ?? null;
-  const canCreate = createMode && hasMotionPathPlugin(iframeRef.current);
+  // No one-element selector means the path could only be authored onto the
+  // element's class siblings, so the toolbar toggle stays hidden instead of
+  // arming a press that the effect below would silently drop.
+  const livePreviewIframe = useLivePreviewIframe();
+  const canCreate = createMode && !!createSelector && hasMotionPathPlugin(livePreviewIframe);
 
   // Publish whether the selected element can take a path so the preview toolbar
   // shows its "set destination" toggle. Drops to false when this overlay unmounts
@@ -154,20 +202,28 @@ export const MotionPathOverlay = memo(function MotionPathOverlay({
       }
       // Resolve the element LIVE from the current iframe document — the selected
       // node may be detached after a soft-reload, which would skew home.
-      const live = frame.contentDocument?.querySelector(createSelector);
-      if (!isPreviewHtmlElement(live, frame)) return;
+      const sealed = previewFrameOpaque(frame);
+      const live = sealed ? null : frame.contentDocument?.querySelector(createSelector);
+      if (!isHtmlElement(live) && !(sealed && home)) return;
       e.stopPropagation();
       e.preventDefault();
       const sc = r.width / compW;
-      const elHome = elementHome(live);
+      const t = Math.round(usePlayerStore.getState().currentTime * 100) / 100;
       // De-magnify: the click lands on the projected (1/m44-magnified) path, so
       // divide the home-relative offset by the perspective factor to recover the
       // stored composition offset (inverse of the `* pScale` applied at draw).
-      const ps = 1 / transformWDivisor(live);
-      const px = Math.round(((e.clientX - r.left) / sc - elHome.x) / ps);
-      const py = Math.round(((e.clientY - r.top) / sc - elHome.y) / ps);
-      const t = Math.round(usePlayerStore.getState().currentTime * 100) / 100;
-      void commitCreatePath(createSelector, t, px, py, commitMutation);
+      const place = (elHome: MotionPathHome, ps: number) => {
+        const px = Math.round(((e.clientX - r.left) / sc - elHome.x) / ps);
+        const py = Math.round(((e.clientY - r.top) / sc - elHome.y) / ps);
+        void commitCreatePath(createSelector, t, px, py, commitMutation);
+      };
+      if (isHtmlElement(live)) place(elementHome(live), 1 / transformWDivisor(live));
+      else {
+        // A frame that cannot answer at the click falls back to the polled home, which may be a seek behind.
+        void sealedMotionPathHome(frame, createSelector).then((read) =>
+          place(read?.home ?? home!, read?.home ? read.perspective : pScale),
+        );
+      }
       setMotionPathArmed(false);
     };
     surface.addEventListener("pointerdown", onDown, true);
@@ -175,7 +231,7 @@ export const MotionPathOverlay = memo(function MotionPathOverlay({
       surface.removeEventListener("pointerdown", onDown, true);
       surface.style.cursor = prevCursor;
     };
-  }, [armed, createSelector, compW, iframeRef, commitMutation, setMotionPathArmed]);
+  }, [armed, createSelector, compW, iframeRef, commitMutation, setMotionPathArmed, home, pScale]);
 
   if (!rect || rect.width <= 0 || !compositionSize || compositionSize.width <= 0) return null;
   // Hide the whole overlay (path + create hint) when the element isn't painted —
@@ -245,12 +301,12 @@ export const MotionPathOverlay = memo(function MotionPathOverlay({
   // pivot (transform-origin), so it stays put; only the offsets foreshorten. 2D
   // elements have pScale = 1 (no change). Inverse (de-magnify) applied wherever a
   // pointer position is mapped back to a stored offset (create + node drag).
-  const abs = nodes.map((n) => ({
-    ...n,
-    ax: home.x + n.x * pScale,
-    ay: home.y + n.y * pScale,
-  }));
+  const abs = nodes.map((n) => {
+    const c = nodeCentre(n, home, pScale);
+    return { ...n, ax: c.x, ay: c.y };
+  });
   const points = abs.map((p) => `${p.ax},${p.ay}`).join(" ");
+  const startAt = geometry.start && nodeCentre(geometry.start, home, pScale);
   // Map a VIEWPORT pointer to composition space. Use the iframe's LIVE viewport
   // rect, not `rect` — `rect.left/top` are stored pan-surface-relative (for the
   // absolute-positioned SVG), so subtracting them from a viewport clientX/Y would
@@ -273,6 +329,8 @@ export const MotionPathOverlay = memo(function MotionPathOverlay({
     if (!interactive) return;
     if (e.button !== 0) return;
     e.stopPropagation();
+    const live = readGsapPositionFromIframe(iframeRef.current, selectorFor(selection) ?? "");
+    if (pressControl(e, controlForNode(e, abs[index]!, live))) return;
     (e.target as Element).setPointerCapture(e.pointerId);
     dragRef.current = {
       index,
@@ -335,33 +393,19 @@ export const MotionPathOverlay = memo(function MotionPathOverlay({
     // high zoom) would commit an identical value — a no-op undo entry. Skip the
     // commit, but don't treat it as a click either (the user did drag).
     if (x === Math.round(d.initX) && y === Math.round(d.initY)) return;
-    // With auto-keyframe off (#1808), dragging a keyframe's node on the motion
-    // path (the common way to nudge a KEYFRAMED element's position on canvas,
-    // since the element renders exactly at its current keyframe) shifts the
-    // whole path instead of moving just that one keyframe.
     const anim =
       d.ref.type === "keyframe" ? selectedGsapAnimations?.find((a) => a.id === animId) : undefined;
-    if (
-      d.ref.type === "keyframe" &&
-      anim &&
-      selection &&
-      !usePlayerStore.getState().autoKeyframeEnabled
-    ) {
-      void commitWholePropertyOffset(
-        selection,
-        anim,
-        { x, y },
-        d.ref.pct,
-        iframeRef.current,
-        { commitMutation: (_sel, mutation, options) => commitMutation(mutation, options) },
-        "Move animation path",
-      );
-    } else {
-      void commitNode(d.ref, x, y, animId, commitMutation);
-    }
-    // Park the playhead on the edited keyframe's time so the element previews AT
-    // that keyframe. Without it, a playhead sitting before the tween renders the
-    // element's base pose — the edit (correct on the path) looks like it vanished.
+    const label = nodeDropLabel(d.ref);
+    commitNodeDrop({
+      ref: d.ref,
+      at: { x, y },
+      animId,
+      anim,
+      selection,
+      iframe: iframeRef.current,
+      commitMutation,
+    }).catch((error: unknown) => reportFailure(error, selection, "drag", label));
+    // Park on the edited keyframe, or a playhead before the tween hides the edit.
     if (d.ref.type === "keyframe" && anim) {
       parkPlayheadOnKeyframe(anim, d.ref.pct);
     }
@@ -369,15 +413,21 @@ export const MotionPathOverlay = memo(function MotionPathOverlay({
 
   // Ghost "add" affordance: project the cursor onto the path; click inserts.
   const onPathHover = (e: React.PointerEvent) => {
+    const control = controlUnder(e);
+    setLineCursor(control ? getComputedStyle(control).cursor : "copy");
     const c = clientToComp(e);
     const np = nearestPointOnPath(
       c.x,
       c.y,
       abs.map((p) => ({ x: p.ax, y: p.ay })),
     );
-    setGhost(np ? { x: np.x, y: np.y, segIndex: np.segIndex } : null);
+    setGhost(np && !control ? { x: np.x, y: np.y, segIndex: np.segIndex } : null);
   };
   const onPathDown = (e: React.PointerEvent) => {
+    if (pressControl(e, controlUnder(e))) {
+      e.stopPropagation();
+      return;
+    }
     if (!animId) return;
     // Compute the insertion point from the event directly so a click works
     // without (or faster than) a preceding hover.
@@ -388,20 +438,18 @@ export const MotionPathOverlay = memo(function MotionPathOverlay({
       abs.map((p) => ({ x: p.ax, y: p.ay })),
     );
     if (!np) return;
-    const x = Math.round(np.x - home.x);
-    const y = Math.round(np.y - home.y);
+    const [a, b] = [abs[np.segIndex]!, abs[np.segIndex + 1]!];
+    const x = Math.round(a.x + np.t * (b.x - a.x));
+    const y = Math.round(a.y + np.t * (b.y - a.y));
     if (geometry.kind === "arc") {
       e.stopPropagation();
       void commitAddWaypoint(animId, np.segIndex + 1, x, y, commitMutation);
     } else {
       // Linear keyframe path: interpolate the new stop's tween-% from the two
-      // keyframes bounding the clicked segment (np.t = fraction along it), then
-      // insert it. Lands ON the current line, so the dot doesn't jump — drag it
-      // after to bend the path.
-      const a = abs[np.segIndex]?.ref;
-      const b = abs[np.segIndex + 1]?.ref;
-      if (a?.type !== "keyframe" || b?.type !== "keyframe") return;
-      const pct = Math.round((a.pct + (b.pct - a.pct) * np.t) * 1000) / 1000;
+      // keyframes bounding the clicked segment, then insert it. Lands ON the
+      // current line, so the dot doesn't jump — drag it after to bend the path.
+      const pct = interpolatedKeyframePct(abs[np.segIndex]?.ref, abs[np.segIndex + 1]?.ref, np.t);
+      if (pct === null) return;
       e.stopPropagation();
       void commitAddKeyframe(animId, pct, x, y, commitMutation);
     }
@@ -415,20 +463,45 @@ export const MotionPathOverlay = memo(function MotionPathOverlay({
   };
 
   const elementId = selection?.id ?? null;
-  // Right-click a keyframe node → the timeline's keyframe context menu (delete
-  // this keyframe / delete all), so motion-path keyframes are removable in place.
+  // Right-click any path node → the timeline's keyframe menu. Waypoints too, or the
+  // browser's own context menu opens over the editor.
   const onNodeContextMenu = (e: React.MouseEvent, ref: MotionNodeRef) => {
-    if (ref.type !== "keyframe" || !animId || !elementId) return;
+    if (!animId || !elementId || !timelineElement) return;
     e.preventDefault();
     e.stopPropagation();
     setKfMenu({
-      x: e.clientX,
-      y: e.clientY,
-      elementId,
-      percentage: ref.pct,
-      tweenPercentage: ref.pct,
+      ref,
+      state: {
+        x: e.clientX,
+        y: e.clientY,
+        element: timelineElement,
+        elementId,
+        // A waypoint carries no percentage of its own: one tween-level ease owns
+        // every segment, and its index is the identity the delete acts on. The
+        // menu never reads this for a waypoint, because the only entry that
+        // would (Move to Playhead) is hidden below.
+        percentage: ref.type === "keyframe" ? ref.pct : 0,
+        tweenPercentage: ref.type === "keyframe" ? ref.pct : 0,
+      },
     });
   };
+  const menuRef = kfMenu?.ref;
+  // Deleting one node: by tween-% for a keyframe, by path index for a waypoint.
+  // A waypoint delete is offered on the same condition as the hover x badge,
+  // because removeMotionPathPointInScript refuses to drop an arc below two
+  // anchors and the entry would silently do nothing.
+  const onMenuDelete =
+    menuRef === undefined || !animId
+      ? undefined
+      : menuRef.type === "keyframe"
+        ? (_elId: string, keyframe: TimelineKeyframeTarget) => {
+            handleGsapRemoveKeyframe(animId, keyframe.percentage);
+          }
+        : removable
+          ? () => {
+              void commitRemoveWaypoint(animId, menuRef.index, commitMutation);
+            }
+          : undefined;
 
   return (
     <>
@@ -455,39 +528,13 @@ export const MotionPathOverlay = memo(function MotionPathOverlay({
             stroke="transparent"
             strokeWidth={14 / scale}
             className="pointer-events-auto"
-            style={{ cursor: "copy" }}
+            style={{ cursor: lineCursor }}
             onPointerMove={onPathHover}
             onPointerLeave={() => setGhost(null)}
             onPointerDown={onPathDown}
           />
         )}
-        <polyline
-          points={points}
-          fill="none"
-          style={{ stroke: ACCENT }}
-          strokeWidth={1.5}
-          strokeDasharray="5 5"
-          strokeLinejoin="round"
-          strokeLinecap="round"
-          vectorEffect="non-scaling-stroke"
-          opacity={0.85}
-        />
-        {ghost && (
-          <rect
-            x={ghost.x - nodeR * 0.707}
-            y={ghost.y - nodeR * 0.707}
-            width={nodeR * 1.414}
-            height={nodeR * 1.414}
-            rx={nodeR * 0.24}
-            transform={`rotate(45 ${ghost.x} ${ghost.y})`}
-            fill="none"
-            strokeWidth={1.5}
-            strokeDasharray="2 2"
-            vectorEffect="non-scaling-stroke"
-            className="pointer-events-none"
-            style={{ stroke: ACCENT }}
-          />
-        )}
+        <MotionPathLine points={points} start={startAt} ghost={ghost} r={nodeR} />
         {abs.map((p, i) => (
           <MotionPathNode
             key={i}
@@ -510,11 +557,18 @@ export const MotionPathOverlay = memo(function MotionPathOverlay({
       </svg>
       {kfMenu && (
         <KeyframeDiamondContextMenu
-          state={kfMenu}
+          state={kfMenu.state}
           onClose={() => setKfMenu(null)}
-          onDelete={(_elId, pct) => animId && handleGsapRemoveKeyframe(animId, pct)}
+          onDelete={onMenuDelete}
           onDeleteAll={() => animId && handleGsapRemoveAllKeyframes(animId)}
-          onMoveToPlayhead={(_elId, pct) => animId && handleGsapMoveKeyframeToPlayhead(animId, pct)}
+          // Retiming needs a percentage of this node's own, which a waypoint
+          // does not have.
+          onMoveToPlayhead={
+            kfMenu.ref.type === "keyframe"
+              ? (_element, keyframe) =>
+                  animId && handleGsapMoveKeyframeToPlayhead(animId, keyframe.percentage)
+              : undefined
+          }
         />
       )}
     </>

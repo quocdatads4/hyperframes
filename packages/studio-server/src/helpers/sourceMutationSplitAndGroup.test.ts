@@ -1,7 +1,11 @@
+// fallow-ignore-file code-duplication
 import { parseHTML } from "linkedom";
 import { describe, expect, it } from "vitest";
+import { readMediaOffsetSeconds } from "@hyperframes/parsers/media-duration";
 import {
+  removeElementFromHtml,
   splitElementInHtml,
+  relinkSplitHalvesInHtml,
   unwrapElementsFromHtml,
   wrapElementsInHtml,
 } from "./sourceMutation.js";
@@ -20,6 +24,32 @@ describe("splitElementInHtml — hfId clone isolation", () => {
   });
 });
 
+// A second split at the same playhead: the first one wrote the left half's end rounded to the millisecond (2.346 for a
+// playhead at 2.3456), so the same cut lands a fraction inside that edge and its sliver rounded to data-duration="0".
+describe("splitElementInHtml — a cut at an existing edge", () => {
+  const clip = (start: number, duration: number) =>
+    `<html><body><div data-composition-id="root"><div id="a" class="clip" data-start="${start}" data-duration="${duration}"></div></div></body></html>`;
+  const durations = (html: string) =>
+    [...parseHTML(html).document.querySelectorAll(".clip")].map((el) =>
+      Number(el.getAttribute("data-duration")),
+    );
+
+  it("leaves the file as it was when the cut is within the split margin of either edge", () => {
+    for (const at of [2.3456, 2.346, 1, 1.0004, 2.33]) {
+      const source = clip(1, 1.346);
+      const result = splitElementInHtml(source, { id: "a" }, at, "a-split");
+      expect(result.matched, `a cut at ${at}`).toBe(false);
+      expect(result.html, `a cut at ${at}`).toBe(source);
+    }
+  });
+
+  it("still cuts at the margin itself, and no half it writes is ever zero long", () => {
+    const result = splitElementInHtml(clip(1, 1.346), { id: "a" }, 1.03, "a-split");
+    expect(result.matched).toBe(true);
+    expect(durations(result.html)).toEqual([0.03, 1.316]);
+  });
+});
+
 describe("splitElementInHtml", () => {
   const source = `<!DOCTYPE html><html><head><style>#box { position: absolute; top: 100px; background: red; }</style></head><body><div data-composition-id="root"><div id="box" class="clip" data-start="1" data-duration="6">Hello</div></div></body></html>`;
 
@@ -30,6 +60,20 @@ describe("splitElementInHtml", () => {
     expect(result.html).toContain('id="box-split"');
     expect(result.html).toContain('data-start="3"');
     expect(result.html).toContain('data-duration="4"');
+  });
+
+  it("pins both halves to the caller-supplied track so an unauthored clip's split half can't drift to a new row", () => {
+    // #box has no data-track-index/data-layer — this is the common, unauthored
+    // case that relies on the runtime's positional-index fallback. Without an
+    // explicit stamp, splitting only the clone changes DOM sibling order and
+    // the runtime resolves the clone to a different fallback track.
+    const result = splitElementInHtml(source, { id: "box" }, 3, "box-split", {
+      start: 1,
+      duration: 6,
+      track: 2,
+    });
+    expect(result.matched).toBe(true);
+    expect(result.html.match(/data-track-index="2"/g)).toHaveLength(2);
   });
 
   it("canonicalizes legacy timing attributes on both split halves", () => {
@@ -70,7 +114,7 @@ describe("splitElementInHtml", () => {
     expect(result.html).toMatch(/id="box-split"[^>]*class="clip"/);
   });
 
-  it("gives a split composition host a unique composition id", () => {
+  it("keeps every half of a split composition mount on the root it mounts", () => {
     const composition = source.replace(
       'id="box" class="clip"',
       'id="box" class="clip" data-composition-id="headline" data-composition-src="headline.html"',
@@ -80,13 +124,28 @@ describe("splitElementInHtml", () => {
     const second = splitElementInHtml(first.html, { id: "box-split" }, 4, "box-split-2");
 
     const { document } = parseHTML(second.html);
-    const compositionIds = Array.from(
-      document.querySelectorAll("[data-composition-id]"),
-      (element) => element.getAttribute("data-composition-id"),
+    const mounts = Array.from(document.querySelectorAll("[data-composition-src]"));
+    expect(mounts.map((element) => element.getAttribute("data-composition-id"))).toEqual([
+      "headline",
+      "headline",
+      "headline",
+    ]);
+    expect(new Set(mounts.map((element) => element.id)).size).toBe(3);
+  });
+
+  it("keeps a split inline-template mount on its template", () => {
+    const composition = source
+      .replace('id="box" class="clip"', 'id="box" class="clip" data-composition-id="headline"')
+      .replace(
+        "</body>",
+        '<template id="headline-template"><div data-composition-id="headline"></div></template></body>',
+      );
+
+    const result = splitElementInHtml(composition, { id: "box" }, 3, "box-split");
+
+    expect(result.html).toMatch(
+      /id="box-split"[^>]*data-composition-id="headline"|data-composition-id="headline"[^>]*id="box-split"/,
     );
-    expect(compositionIds).toHaveLength(4);
-    expect(new Set(compositionIds)).toHaveLength(4);
-    expect(compositionIds).toEqual(expect.arrayContaining(["root", "headline", "headline-split"]));
   });
 
   it("returns matched false for out-of-range split time", () => {
@@ -123,18 +182,143 @@ describe("splitElementInHtml", () => {
     expect(result.html).toMatch(/id="box-split"[^>]*data-playback-start="2"/);
   });
 
+  it.each(["audio", "video"])(
+    "seeds the second %s half with a media in-point when the source starts at zero",
+    (tag) => {
+      const mediaSource = `<!DOCTYPE html><html><body><div data-composition-id="root"><${tag} id="media" class="clip" src="asset.mp4" data-start="1" data-duration="6"></${tag}></div></body></html>`;
+
+      const result = splitElementInHtml(mediaSource, { id: "media" }, 3, "media-split");
+      const { document } = parseHTML(result.html);
+
+      expect(result.matched).toBe(true);
+      expect(document.getElementById("media")?.getAttribute("data-media-start")).toBe("0");
+      expect(document.getElementById("media-split")?.getAttribute("data-media-start")).toBe("2");
+    },
+  );
+
+  it("advances a zero-based media in-point by playback rate", () => {
+    const mediaSource = `<!DOCTYPE html><html><body><div data-composition-id="root"><video id="media" class="clip" src="asset.mp4" data-start="1" data-duration="6" data-playback-rate="2"></video></div></body></html>`;
+
+    const result = splitElementInHtml(mediaSource, { id: "media" }, 3, "media-split");
+    const { document } = parseHTML(result.html);
+
+    expect(document.getElementById("media-split")?.getAttribute("data-media-start")).toBe("4");
+  });
+
+  it("leaves the first half's authored in-point exactly as written", () => {
+    const mediaSource = `<!DOCTYPE html><html><body><div data-composition-id="root"><video id="media" class="clip" src="asset.mp4" data-start="1" data-duration="6" data-media-start="3.296375" data-playback-rate="0.25"></video></div></body></html>`;
+
+    const result = splitElementInHtml(mediaSource, { id: "media" }, 3, "media-split");
+    const { document } = parseHTML(result.html);
+
+    expect(document.getElementById("media")?.getAttribute("data-media-start")).toBe("3.296375");
+  });
+
+  it.each([
+    ['data-playback-start="-1" data-media-start="2"', "data-playback-start", 2, 4],
+    ['data-playback-start="abc" data-media-start="2"', "data-playback-start", 2, 4],
+    ['data-media-start="-1"', "data-media-start", 0, 2],
+    ['data-media-start="junk"', "data-media-start", 0, 2],
+    ['data-media-start="1.5s"', "data-media-start", 0, 2],
+  ])("splits %s where playback reads it", (inPoint, attr, left, right) => {
+    const mediaSource = `<!DOCTYPE html><html><body><div data-composition-id="root"><video id="media" class="clip" src="asset.mp4" data-start="0" data-duration="6" ${inPoint}></video></div></body></html>`;
+
+    const { document } = parseHTML(splitElementInHtml(mediaSource, { id: "media" }, 2, "b").html);
+    const playbackReads = (id: string) =>
+      readMediaOffsetSeconds((name) => document.getElementById(id)?.getAttribute(name));
+
+    expect([playbackReads("media"), playbackReads("b")]).toEqual([left, right]);
+    expect(document.getElementById("b")?.getAttribute(attr)).toBe(String(right));
+  });
+
+  it("does not add a media in-point to non-media elements", () => {
+    const result = splitElementInHtml(source, { id: "box" }, 3, "box-split");
+
+    expect(result.html).not.toContain("data-media-start");
+    expect(result.html).not.toContain("data-playback-start");
+  });
+
+  it.each(['data-composition-src="scene.html"', 'data-composition-id="scene"'])(
+    "stamps an in-point on both halves of a sub-composition host (%s)",
+    (host) => {
+      const hostSource = source.replace('id="box"', `id="box" ${host}`);
+      const { document } = parseHTML(
+        splitElementInHtml(hostSource, { id: "box" }, 3, "box-split").html,
+      );
+
+      expect(document.getElementById("box")?.getAttribute("data-playback-start")).toBe("0");
+      expect(document.getElementById("box-split")?.getAttribute("data-playback-start")).toBe("2");
+    },
+  );
+
   it("stamps a legacy composition offset and advances the second half by playback rate", () => {
-    const result = splitElementInHtml(source, { id: "box" }, 3, "box-split", {
+    const hostSource = source.replace('id="box"', 'id="box" data-composition-src="scene.html"');
+    const result = splitElementInHtml(hostSource, { id: "box" }, 3, "box-split", {
       start: 1,
       duration: 6,
       playbackStart: 1.5,
       playbackRate: 2,
-      stampPlaybackStart: true,
     });
 
     const { document } = parseHTML(result.html);
     expect(document.getElementById("box")?.getAttribute("data-playback-start")).toBe("1.5");
     expect(document.getElementById("box-split")?.getAttribute("data-playback-start")).toBe("5.5");
+  });
+
+  it("splits the timed video inside an untimed wrapper and leaves both wrappers untimed", () => {
+    const wrapped = `<!DOCTYPE html><html><head><style>#v { object-fit: cover; }</style></head><body><div data-composition-id="root"><div id="wrap" class="frame"><video id="v" class="clip" src="a.mp4" data-start="1" data-duration="6"></video></div></div></body></html>`;
+    // The requested wrapper id is the media's natural split id: both must still come out unique.
+    const result = splitElementInHtml(wrapped, { id: "wrap" }, 3, "v-split", {
+      start: 1,
+      duration: 6,
+    });
+    const { document } = parseHTML(result.html);
+    const wrappers = [...document.querySelectorAll("div.frame")];
+    const [first, second] = [...document.querySelectorAll("video")];
+
+    expect(result.matched).toBe(true);
+    expect(wrappers).toHaveLength(2);
+    for (const wrapper of wrappers) {
+      expect(wrapper.hasAttribute("data-start")).toBe(false);
+      expect(wrapper.hasAttribute("data-duration")).toBe(false);
+    }
+    expect(first?.id).toBe("v");
+    expect(second?.id).toBeTruthy();
+    const ids = [...document.querySelectorAll("[id]")].map((node) => node.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(result.html).toContain(`#${second?.id} {`);
+    expect(first?.getAttribute("data-duration")).toBe("2");
+    expect(second?.getAttribute("data-start")).toBe("3");
+    expect(second?.getAttribute("data-duration")).toBe("4");
+    expect(second?.getAttribute("data-media-start")).toBe("2");
+  });
+
+  it.each(['data-start="1"', 'data-duration="6"', 'data-composition-id="scene"'])(
+    "cuts a wrapper with %s itself, not the video inside it",
+    (wrapperAttrs) => {
+      const wrapped = `<!DOCTYPE html><html><body><div data-composition-id="root"><div id="wrap" ${wrapperAttrs}><video id="v" src="a.mp4" data-start="1" data-duration="6"></video></div></div></body></html>`;
+      const result = splitElementInHtml(wrapped, { id: "wrap" }, 3, "wrap-split", {
+        start: 1,
+        duration: 6,
+      });
+      const { document } = parseHTML(result.html);
+
+      expect(document.getElementById("wrap-split")?.hasAttribute("data-start")).toBe(true);
+      expect(document.getElementById("v")?.getAttribute("data-duration")).toBe("6");
+    },
+  );
+
+  it("keeps cutting a GSAP scene on its own window when it holds a shorter timed video", () => {
+    const scene = `<!DOCTYPE html><html><body><div data-composition-id="root"><div id="card"><video id="v" src="a.mp4" data-start="2" data-duration="3"></video></div></div></body></html>`;
+    const result = splitElementInHtml(scene, { id: "card" }, 7, "card-split", {
+      start: 0,
+      duration: 10,
+    });
+    const { document } = parseHTML(result.html);
+
+    expect(result.matched).toBe(true);
+    expect(document.getElementById("card")?.getAttribute("data-duration")).toBe("7");
+    expect(document.getElementById("card-split")?.getAttribute("data-start")).toBe("7");
   });
 });
 
@@ -167,6 +351,32 @@ describe("wrapElementsInHtml / unwrapElementsFromHtml", () => {
     return element;
   }
 
+  it.each([
+    ["Group 1", "group-1"],
+    [" --HELLO___World!! ", "hello-world"],
+    ["a---b---c", "a-b-c"],
+    ["--123--", "123"],
+    ["", "group"],
+    [" --- ", "group"],
+    ["你好", "group"],
+    ["-".repeat(100_000) + "Title" + "-".repeat(100_000), "title"],
+  ])("preserves normalized group IDs and collision suffixes (case %#)", (name, id) => {
+    const source = FIXTURE.replace(
+      "</body>",
+      `<div id="${id}"></div><div id="${id}-2"></div></body>`,
+    );
+    const result = wrapElementsInHtml(source, TARGETS, name, BBOX, REBASES);
+    expect(result.matched).toBe(true);
+    const { document } = parseHTML(result.html);
+    const group = document.getElementById(`${id}-3`);
+    expect(group?.getAttribute("data-hf-group")).toBe(name);
+    expect(Array.from(group?.children ?? []).map((child) => child.id)).toEqual([
+      "title",
+      "logo",
+      "badge",
+    ]);
+  });
+
   it("wraps members in a data-hf-group div, preserving order and rebasing left/top", () => {
     const { html, matched, groupId } = wrapElementsInHtml(
       FIXTURE,
@@ -197,6 +407,19 @@ describe("wrapElementsInHtml / unwrapElementsFromHtml", () => {
     );
   });
 
+  it("stamps each member's resolved track so grouping an unauthored clip can't drift it to a new row", () => {
+    const rebasesWithTrack = [
+      { target: { id: "title" }, left: 0, top: 50, track: 1 },
+      { target: { id: "logo" }, left: 40, top: 150, track: 3 },
+      { target: { id: "badge" }, left: 140, top: 0 },
+    ];
+    const { html } = wrapElementsInHtml(FIXTURE, TARGETS, "Group 1", BBOX, rebasesWithTrack);
+    const { document } = parseHTML(html);
+    expect(requireElement(document, "#title").getAttribute("data-track-index")).toBe("1");
+    expect(requireElement(document, "#logo").getAttribute("data-track-index")).toBe("3");
+    expect(requireElement(document, "#badge").hasAttribute("data-track-index")).toBe(false);
+  });
+
   it("round-trips: unwrap restores original structure and coordinates", () => {
     const wrapped = wrapElementsInHtml(FIXTURE, TARGETS, "Group 1", BBOX, REBASES).html;
     const { html, unwrapped } = unwrapElementsFromHtml(wrapped, {
@@ -223,6 +446,23 @@ describe("wrapElementsInHtml / unwrapElementsFromHtml", () => {
     expect(requireElement(document, "#badge").getAttribute("style")).toContain(
       "--hf-studio-offset: 12px",
     );
+  });
+
+  it("stamps each child's resolved track on ungroup so it can't drift to a new row when it moves back out of the wrapper", () => {
+    const wrapped = wrapElementsInHtml(FIXTURE, TARGETS, "Group 1", BBOX, REBASES).html;
+    const childTracks = [
+      { target: { id: "title" }, track: 1 },
+      { target: { id: "logo" }, track: 3 },
+    ];
+    const { html } = unwrapElementsFromHtml(
+      wrapped,
+      { selector: '[data-hf-group="Group 1"]' },
+      childTracks,
+    );
+    const { document } = parseHTML(html);
+    expect(requireElement(document, "#title").getAttribute("data-track-index")).toBe("1");
+    expect(requireElement(document, "#logo").getAttribute("data-track-index")).toBe("3");
+    expect(requireElement(document, "#badge").hasAttribute("data-track-index")).toBe(false);
   });
 
   it("rejects members that do not share a single parent", () => {
@@ -265,5 +505,134 @@ describe("wrapElementsInHtml / unwrapElementsFromHtml", () => {
     const result = unwrapElementsFromHtml(html, { id: "plain" });
     expect(result.unwrapped).toBe(false);
     expect(result.html).toBe(html);
+  });
+});
+
+describe("relinkSplitHalvesInHtml", () => {
+  it("makes each half of a split linked pair its own pair", () => {
+    const source =
+      '<div data-composition-id="c"><video id="v" src="t.mp4" muted data-link="lk-1" data-start="0" data-duration="4"></video><audio id="a" src="t.mp4" data-link="lk-1" data-start="0" data-duration="4"></audio></div>';
+    const first = splitElementInHtml(source, { id: "v" }, 2, "v-split");
+    const second = splitElementInHtml(first.html, { id: "a" }, 2, "a-split");
+    const html = relinkSplitHalvesInHtml(second.html, ["v-split", "a-split"]);
+    const link = (id: string) => new RegExp(`id="${id}"[^>]*data-link="([^"]+)"`).exec(html)?.[1];
+    expect(link("v")).toBe("lk-1");
+    expect(link("a")).toBe("lk-1");
+    expect(link("v-split")).toBe("lk-2");
+    expect(link("a-split")).toBe("lk-2");
+  });
+
+  it("gives an unlinked pair's right halves their own sync origin", () => {
+    const source =
+      '<div data-composition-id="c"><video id="v" src="t.mp4" muted data-sync-origin="lk-1" data-start="0" data-duration="4"></video><audio id="a" src="t.mp4" data-sync-origin="lk-1" data-start="0" data-duration="4"></audio></div>';
+    const first = splitElementInHtml(source, { id: "v" }, 2, "v-split");
+    const second = splitElementInHtml(first.html, { id: "a" }, 2, "a-split");
+    const html = relinkSplitHalvesInHtml(second.html, ["v-split", "a-split"]);
+    const origin = (id: string) =>
+      new RegExp(`id="${id}"[^>]*data-sync-origin="([^"]+)"`).exec(html)?.[1];
+    expect(origin("v")).toBe("lk-1");
+    expect(origin("v-split")).not.toBe("lk-1");
+    expect(origin("v-split")).toBe(origin("a-split"));
+  });
+
+  it("leaves unlinked splits byte-identical", () => {
+    const source = '<div><img id="i" data-start="0" data-duration="4"></div>';
+    expect(relinkSplitHalvesInHtml(source, ["i"])).toBe(source);
+  });
+});
+
+describe("splitElementInHtml — id CSS rules across repeated cuts", () => {
+  it("keeps one rule set per live id when a clip is cut again and again", () => {
+    let html =
+      "<html><head><style>#a{opacity:.5;width:10px}#a:hover,#a.on{opacity:1}.clip:not(#a-cut){filter:blur(2px)}</style></head><body>" +
+      '<div id="root" data-composition-id="m"><video id="a" src="a.mp4" data-start="0" data-duration="60" ' +
+      'data-track-index="0"></video></div></body></html>';
+    for (let i = 0; i < 5; i++) {
+      const tail = splitElementInHtml(html, { id: "a" }, 20 + i, `a-${i + 2}`);
+      const middle = splitElementInHtml(tail.html, { id: "a" }, 10 + i, "a-cut");
+      html = removeElementFromHtml(middle.html, { id: "a-cut" });
+    }
+    const css = /<style>([\s\S]*?)<\/style>/.exec(html)?.[1] ?? "";
+    // two rules per live id, none left by the removed cut piece
+    const live = html.match(/<video\b/g)?.length ?? 0;
+    expect(css.match(/\{/g)).toHaveLength(live * 2 + 1);
+    expect(css).not.toContain("#a-cut{");
+    expect(css).toContain(".clip:not(#a-cut){filter:blur(2px)}");
+  });
+});
+
+// A clip that starts after another ("b", "b + 1") has no start of its own in the file: where it plays is where b
+// ends, which only the studio's resolved range knows. Read as 0, a cut inside the clip's real time was refused, and
+// a cut before it was accepted and rewrote the clip to start at 0.
+describe("splitElementInHtml — a start that names another clip", () => {
+  const after = (start: string) =>
+    `<html><body><div data-composition-id="root"><div id="b" class="clip" data-start="0" data-duration="3"></div><div id="a" class="clip" data-start="${start}" data-duration="4"></div></div></body></html>`;
+  const halves = (html: string) =>
+    ["a", "a-split"].map((id) => {
+      const el = parseHTML(html).document.getElementById(id);
+      return [el?.getAttribute("data-start"), el?.getAttribute("data-duration")];
+    });
+
+  it("cuts at the time the studio gives and keeps both halves tied to the clip they follow", () => {
+    const { html, matched } = splitElementInHtml(after("b"), { id: "a" }, 5, "a-split", {
+      start: 3,
+      duration: 4,
+    });
+    expect(matched).toBe(true);
+    expect(halves(html)).toEqual([
+      ["b", "2"],
+      ["b + 2", "2"],
+    ]);
+  });
+
+  it("keeps an offset: the second half starts the first half's length further after the clip", () => {
+    const { html, matched } = splitElementInHtml(after("b + 1"), { id: "a" }, 5, "a-split", {
+      start: 4,
+      duration: 4,
+    });
+    expect(matched).toBe(true);
+    expect(halves(html)).toEqual([
+      ["b + 1", "1"],
+      ["b + 2", "3"],
+    ]);
+  });
+
+  it("leaves the file as it was for a cut before the clip's real start, instead of rewriting it to start at 0", () => {
+    const source = after("b");
+    const result = splitElementInHtml(source, { id: "a" }, 2, "a-split", { start: 3, duration: 4 });
+    expect(result).toEqual({
+      html: source,
+      matched: false,
+      newId: null,
+      refusal: "outside-clip",
+    });
+  });
+
+  it("refuses when it cannot know where the clip plays", () => {
+    const source = after("b");
+    expect(splitElementInHtml(source, { id: "a" }, 5, "a-split")).toEqual({
+      html: source,
+      matched: false,
+      newId: null,
+      refusal: "reference-without-range",
+    });
+  });
+});
+
+describe("splitElementInHtml — a cut the file's own timing does not allow", () => {
+  const clip = `<html><body><div data-composition-id="root"><div id="a" class="clip" data-start="2" data-duration="4"></div></div></body></html>`;
+  const untouched = { html: clip, matched: false, newId: null, refusal: "outside-clip" };
+
+  it.each([
+    ["exactly at the clip's start", 2, { start: 2, duration: 4 }],
+    ["past the clip's end", 7, { start: 2, duration: 4 }],
+    // The file is the truth: a studio that thinks the clip starts at 5 is out of date, and its cut at 6 is not cut.
+    [
+      "where the studio thinks the clip is but the file says otherwise",
+      6,
+      { start: 5, duration: 4 },
+    ],
+  ])("leaves the file as it was for a cut %s", (_name, at, range) => {
+    expect(splitElementInHtml(clip, { id: "a" }, at, "a-split", range)).toEqual(untouched);
   });
 });

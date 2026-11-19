@@ -8,7 +8,6 @@
 type ElementGsapWindow = Window & {
   gsap?: {
     set?: (target: Element, vars: Record<string, number>) => void;
-    getProperty?: (target: Element, prop: string) => unknown;
   };
 };
 
@@ -24,8 +23,27 @@ export function setElementGsapPosition(element: HTMLElement, x: number, y: numbe
   return true;
 }
 
-/** The element's GSAP numeric property, or null when unreadable. */
-export function readElementGsapNumber(element: HTMLElement, prop: string): number | null {
-  const value = Number(gsapOf(element)?.getProperty?.(element, prop));
-  return Number.isFinite(value) ? value : null;
+/**
+ * Set the element's GSAP scale. Returns false when no runtime is reachable.
+ *
+ * Used to make the element show a scale that has been committed but not yet
+ * re-rendered by the timeline, so measuring it afterwards reports where the
+ * commit actually puts it rather than where it happened to be mid-flight.
+ */
+export function setElementGsapScale(element: HTMLElement, x: number, y: number): boolean {
+  const gsap = gsapOf(element);
+  if (!gsap?.set) return false;
+  gsap.set(element, { scaleX: x, scaleY: y });
+  return true;
 }
+
+/** Set the element's GSAP width/height. Returns false when no runtime is reachable. */
+export function setElementGsapSize(element: HTMLElement, width: number, height: number): boolean {
+  const gsap = gsapOf(element);
+  if (!gsap?.set) return false;
+  gsap.set(element, { width, height });
+  return true;
+}
+
+/** The targets CSSPlugin styles: not plain objects (the runtime's filler) or XML-namespace elements. */
+export { elementTargets } from "@hyperframes/core/runtime/soft-reload";

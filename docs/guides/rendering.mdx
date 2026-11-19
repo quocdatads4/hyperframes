@@ -1,444 +1,430 @@
 ---
-title: Rendering
-description: "Render compositions to MP4, MOV, WebM, GIF, or PNG sequences locally or in Docker."
+title: "Render from the command line"
+description: "Check a project and render MP4, MOV, WebM, GIF, or PNG output."
 ---
 
-Render your Hyperframes [compositions](/concepts/compositions) to MP4, MOV, WebM, GIF, or PNG sequences with the [CLI](/packages/cli). The rendering pipeline is frame-by-frame and seek-driven — see [Deterministic Rendering](/concepts/determinism) for how this works under the hood.
+import { DocsVideo } from "/snippets/docs-video.jsx";
 
-## Getting Started
+The browser editor is the simplest place to export a project. Use the command line when an agent, script, CI job, or advanced delivery workflow needs to control the render.
 
-<Steps>
-  <Step title="Verify your environment">
-    Run the diagnostics command to check for required dependencies:
+<DocsVideo
+  title="One command turns the project into an MP4"
+  src="https://static.heygen.ai/hyperframes-oss/docs/images/showcase/render-loop-demo-v2.mp4"
+  poster="https://static.heygen.ai/hyperframes-oss/docs/images/showcase/render-loop-demo-v2.jpg"
+/>
 
-    ```bash Terminal
-    npx hyperframes doctor
-    ```
+The whole loop: the project, the render command, progress, and the finished file
+playing. The flags shown are the ones people actually reach for — format,
+resolution, frame rate, quality.
 
-    Expected output:
+## Export a GIF from Studio
 
-    ```
-    ✓ Node.js    v22.x
-    ✓ FFmpeg      7.x
-    ✓ FFprobe     7.x
-    ✓ Chrome      (bundled)
-    ✓ Docker      available
-    ```
-  </Step>
-  <Step title="Preview your composition">
-    Before rendering, preview your composition in the browser to verify it looks correct:
+Open the **Renders** panel, choose **GIF**, set the loop count, and click **Export**.
+Use `0` to loop forever or an integer from `1` to `65535` for a finite loop count.
+GIF exports have no audio and are capped at 30 fps; the 60 fps option is disabled
+while GIF is selected. Finished GIFs preview in the render list and can be
+opened, downloaded, or deleted there.
 
-    ```bash Terminal
-    npx hyperframes preview
-    ```
-  </Step>
-  <Step title="Render to MP4">
-    Run the render command from your project directory:
+## Render a normal video
 
-    ```bash Terminal
-    npx hyperframes render --output output.mp4
-    ```
-
-    Expected output:
-
-    ```
-    ⠋ Rendering composition "root" (30fps, standard quality)
-    ✓ Captured 240 frames in 8.2s
-    ✓ Encoded to output.mp4 (8.0s, 1920x1080, 4.2MB)
-    ```
-  </Step>
-</Steps>
-
-## Rendering Modes
-
-<Tabs>
-  <Tab title="Local Mode">
-    ### Local Mode (default)
-
-    Uses Puppeteer (bundled Chromium) and your system's FFmpeg. Fast for iteration during development.
-
-    **Requires:** FFmpeg installed on your system. See [Troubleshooting](/guides/troubleshooting) if FFmpeg is not found.
-
-    ```bash Terminal
-    npx hyperframes render --output output.mp4
-    ```
-
-    **Pros:**
-    - Fast startup, no container overhead
-    - Can use your system GPU for Chrome/WebGL capture by default
-    - Can use your system GPU for hardware-accelerated encoding (with `--gpu`)
-    - Best for iterative development
-
-    **Cons:**
-    - Output may vary across platforms due to font and Chrome version differences
-    - Not suitable for CI/CD pipelines that require reproducibility
-  </Tab>
-  <Tab title="Docker Mode">
-    ### Docker Mode
-
-    [Deterministic](/concepts/determinism) output with an exact Chrome version and font set. Use this for production renders and CI pipelines.
-
-    **Requires:** Docker installed and running.
-
-    ```bash Terminal
-    npx hyperframes render --docker --output output.mp4
-    ```
-
-    **Pros:**
-    - Identical output on every platform — same Chrome, same fonts, same FFmpeg
-    - The same pipeline used in production
-    - Ideal for CI/CD and automated workflows
-
-    **Cons:**
-    - Slower startup due to container initialization
-    - Browser capture stays on the deterministic software-GL path
-    - GPU encoding requires Docker host GPU passthrough and is not cross-platform on Docker Desktop
-
-    <Note>
-      Docker mode uses `chrome-headless-shell` with [BeginFrame](/concepts/determinism#how-it-works) control for frame-perfect, deterministic capture.
-    </Note>
-  </Tab>
-</Tabs>
-
-## When to Use Each Mode
-
-| Scenario | Recommended Mode |
-|----------|-----------------|
-| Local development and iteration | Local |
-| CI/CD pipeline | Docker |
-| Sharing renders with a team | Docker |
-| Quick preview export | Local |
-| AI agent-driven rendering | Docker |
-| Benchmarking performance | Local |
-
-## Options
-
-| Flag | Values | Default | Description |
-|------|--------|---------|-------------|
-| `--output` | path | `renders/<name>.mp4` | Output file path |
-| `--format` | mp4, mov, webm, gif, png-sequence | mp4 | Output format (see [Transparent Video](#transparent-video) below) |
-| `--fps` | 1-240 or rational (e.g. `30000/1001`) | 30 | Frames per second |
-| `--gif-loop` | 0-65535 | 0 | GIF loop count. `0` loops forever |
-| `--quality` | draft, standard, high | standard | Encoding quality preset |
-| `--crf` | 0–51 | — | Override CRF (lower = higher quality). Cannot combine with `--video-bitrate` |
-| `--video-bitrate` | e.g. `10M`, `5000k` | — | Target bitrate encoding. Cannot combine with `--crf` |
-| `--video-frame-format` | auto, jpg, png | auto | Source video frame extraction format. Use `png` for UI recordings, screen captures, and color-sensitive source videos |
-| `--workers` | 1-24 or `auto` | auto | Parallel render workers (see [Workers](#workers) below) |
-| `--max-concurrent-renders` | 1-10 | 2 | Max simultaneous renders via the producer server (see [Concurrent Renders](#concurrent-renders) below) |
-| `--batch` | path | — | JSON array of variable rows (or `{ "rows": [...] }`), rendering one output per row |
-| `--batch-concurrency` | integer | 1 | Maximum batch rows to render at once |
-| `--batch-fail-fast` | — | off | Stop launching new batch rows after the first row failure |
-| `--gpu` | — | off | GPU encoding (NVENC, VideoToolbox, AMF, VAAPI, QSV) |
-| `--browser-gpu` / `--no-browser-gpu` | — | on locally, off in Docker | Use or opt out of host GPU acceleration for local Chrome/WebGL capture |
-| `--hdr` | — | off | Force HDR output even if no HDR sources are detected (MP4 only). See [HDR Rendering](/guides/hdr) |
-| `--sdr` | — | off | Force SDR output even if HDR sources are detected |
-| `--docker` | — | off | Use Docker for [deterministic rendering](/concepts/determinism) |
-| `--quiet` | — | off | Suppress verbose output |
-
-## Quality and Encoding
-
-The `--quality` flag selects a preset that controls the H.264 CRF (Constant Rate Factor) and encoder speed:
-
-| Preset | CRF | x264 Preset | Best For |
-|--------|-----|-------------|----------|
-| `draft` | 28 | ultrafast | Quick previews, iteration |
-| `standard` | 18 | medium | General use — visually lossless at 1080p |
-| `high` | 15 | slow | Final delivery, near-lossless quality |
-
-For finer control, use `--crf` or `--video-bitrate` to override the preset:
+From the project folder:
 
 ```bash
-# Near-lossless quality (CRF 15 = very high quality, large file)
-npx hyperframes render --crf 15 --output pristine.mp4
-
-# Target a specific bitrate (useful for size-constrained delivery)
-npx hyperframes render --video-bitrate 10M --output controlled.mp4
+npx hyperframes render --output final.mp4
 ```
 
-**Tip**: The default `standard` preset (CRF 18) is visually lossless at 1080p — most people cannot distinguish it from the source. Use `--quality draft` for faster iteration, or `--quality high` / `--crf 10` when file size is no concern.
+If you omit `--output`, HyperFrames writes the result under `renders/`.
 
-## Input Video Codecs
+The normal workflow is:
 
-Video assets referenced by a composition (a `<video src="...">` clip) are decoded by FFmpeg, not by the browser: the pipeline pre-extracts every input video into frame images and injects them during capture, so the render never depends on what the capture browser can play. Any codec your FFmpeg build decodes works as an input, including:
-
-- H.264 / AVC
-- **HEVC / H.265, 8-bit and 10-bit** (`hvc1` and `hev1`): common for storage-optimized asset libraries; renders identically on macOS and Linux, no hardware decoder required
-- VP8 / VP9 and ProRes 4444 (with alpha; see [Transparent Video](#transparent-video))
-- HDR sources (HLG / PQ) are tone-mapped for SDR renders; see the [HDR guide](/guides/hdr)
-
-The one caveat is **live preview**: `preview`, `play`, Studio, and published player pages play the file in a real browser, so playback there depends on that browser's codec support. Chrome (107+), Edge, and Safari hardware-decode HEVC on most modern machines; Firefox does not. Preview handles this automatically: on first use, it transcodes the asset into a cached H.264 proxy (stored under `.transcode-cache/`, safe to delete) and serves that for playback, while render always uses the original file. `check` and `snapshot` prepare the same proxies before opening their browser phase. Publishing bakes the proxies into the published archive so static player pages work too. Opt out per command with `--no-proxy`, or project-wide by setting `media.autoProxy` to `false` in `hyperframes.json`.
-
-`hyperframes lint` emits an info-level `hevc_preview_codec` note when a composition references an HEVC video, naming the affected asset(s).
-
-## Animated GIF
-
-Use GIF when the output needs to autoplay inline in GitHub PRs, READMEs, issue reports, and docs pages:
-
-```bash Terminal
-npx hyperframes render --format gif --fps 15 --gif-loop 0 --output demo.gif
+```bash
+npx hyperframes lint
+npx hyperframes check
+npx hyperframes render --output final.mp4
 ```
 
-GIF output uses a two-pass FFmpeg palette encode (`palettegen` with diff statistics, then `paletteuse` with Sierra dithering) for better gradients and text edges than a single-pass conversion. GIFs are still much larger than MP4/WebM at the same dimensions, so prefer short compositions. GIF renders are capped at 30fps; pass `--fps 15` for smaller files.
+`lint` checks the project structure. `check` opens the project in a browser and looks for runtime, layout, motion, media, and contrast problems.
 
-GIF does not carry audio and only has 1-bit transparency. For transparent overlays, use `--format webm`, `--format mov`, or `--format png-sequence` instead.
+## Choose a format
 
-For UI recordings, screen captures, or other source videos where saturated interface colors matter, pass `--video-frame-format png` to extract source video layers as PNG before browser capture. The default `auto` mode preserves the historical behavior: alpha-capable sources use PNG, opaque sources use JPG.
+| Format       | Use it for                                                 |
+| ------------ | ---------------------------------------------------------- |
+| MP4          | Normal sharing, publishing, and delivery                   |
+| MOV          | ProRes workflows and transparent editing intermediates     |
+| WebM         | Web delivery and transparent overlays                      |
+| GIF          | Short previews in issues, pull requests, and documentation |
+| PNG sequence | Frame-by-frame handoff to compositing software             |
+| HLS          | VOD streaming from a playlist directory                    |
 
-## GPU Acceleration
+Examples:
 
-Hyperframes has two separate GPU acceleration surfaces:
+```bash
+# Transparent web overlay
+npx hyperframes render --format webm --output overlay.webm
 
-- `--gpu` uses a hardware video encoder in FFmpeg when one is available. Supported backends include VideoToolbox on macOS, NVENC on NVIDIA systems, AMD AMF on Windows, VAAPI on Linux, and Intel QSV on supported Windows/Linux hosts.
-- Browser GPU uses the host GPU for local Chrome/WebGL capture. It is enabled automatically for local renders and disabled in Docker. Use `--no-browser-gpu` to opt out.
+# ProRes editing file
+npx hyperframes render --format mov --output master.mov
 
-```bash Terminal
-# Add hardware FFmpeg encoding to the default local browser-GPU render
-npx hyperframes render --gpu --output encoded-fast.mp4
+# Short looping preview
+npx hyperframes render --format gif --fps 15 --output preview.gif
 
-# Opt out of hardware Chrome/WebGL capture
-npx hyperframes render --no-browser-gpu --output software-browser.mp4
+# RGBA frames in a directory
+npx hyperframes render --format png-sequence --output frames
 
-# Use browser GPU plus hardware FFmpeg encoding
-npx hyperframes render --gpu --output gpu.mp4
+# HLS VOD stream in a directory
+npx hyperframes render --format hls --output stream
 ```
 
-Browser GPU capture is local-mode only. It maps to platform-native Chrome GPU backends: Metal on macOS, D3D11 on Windows, and EGL on Linux. Use `--no-browser-gpu` or Docker mode when exact cross-machine reproducibility matters more than local render speed.
+GIF has no audio and limited transparency. Prefer MP4 or WebM for normal playback.
 
-## Workers
+### Transparent video
 
-Each render worker launches a **separate Chrome browser process** to capture frames in parallel. More workers can speed up rendering, but each one consumes ~256 MB of RAM and significant CPU.
+Use WebM for a transparent web overlay or MOV for a ProRes 4444 editing
+intermediate. Leave the composition background unpainted wherever the output
+must remain transparent; an opaque `html`, `body`, or full-frame background
+will be encoded as visible pixels.
 
-### Default behavior
-
-By default, Hyperframes uses **CPU cores minus 2** (reserving headroom for FFmpeg encoding and your other applications):
-
-| Machine | CPU cores | Default workers |
-|---------|-----------|----------------|
-| MacBook Air (M1) | 8 | 6 |
-| MacBook Pro (M3) | 12 | 10 |
-| 4-core laptop | 4 | 2 |
-| 2-core VM | 2 | 1 |
-
-Each worker spawns its own Chrome process (~256 MB RAM), so the per-worker overhead is significant. The maximum is 24 workers (hard ceiling).
-
-### Choosing a worker count
-
-```bash Terminal
-# Explicit worker count
-npx hyperframes render --workers 1 --output output.mp4
-
-# Let Hyperframes pick based on your CPU
-npx hyperframes render --workers auto --output output.mp4
-
-# Maximum parallelism (use with caution on laptops)
-npx hyperframes render --workers 24 --output output.mp4
-```
-
-<Tip>
-  Start with the default. If renders feel slow and your system has headroom (check Activity Monitor / `htop`), try increasing `--workers`. If you see high memory pressure or fan noise, reduce it.
-</Tip>
-
-### When to use 1 worker
-
-- Short compositions (under 2 seconds / 60 frames) — parallelism overhead exceeds the benefit
-- Low-memory machines (4 GB or less)
-- Running renders alongside other heavy processes (video editing, large builds)
-
-### When to increase workers
-
-- Long compositions (30+ seconds) on a machine with 8+ cores and 16+ GB RAM
-- Dedicated render machines or CI runners
-- Docker mode on a well-provisioned host
-
-## Batch Rendering
-
-Batch rendering runs the same composition once per variables row:
-
-```json rows.json
-[
-  { "name": "Alice", "headline": "Welcome, Alice" },
-  { "name": "Bob", "headline": "Welcome, Bob" }
-]
-```
-
-```bash Terminal
-npx hyperframes render --batch rows.json --output "renders/{name}.mp4" --strict-variables
-```
-
-`--output` is a template. Use `{index}` or any scalar key from the row to make each path unique. Hyperframes preflights the full batch before rendering: malformed rows, missing placeholders, duplicate output paths, and strict variable mismatches fail before the first video starts. A `manifest.json` file is written next to the outputs with per-row status, output path, render time, duration when available, and error details.
-
-Rows continue after failures by default so a bad data row does not discard the rest of the batch. Add `--batch-fail-fast` to stop launching new rows after the first failure, or `--json` to stream machine-readable progress events while the manifest is updated.
-
-## Concurrent Renders
-
-When multiple render requests hit the producer server simultaneously (common with AI agents), each render spawns its own set of Chrome worker processes. Too many concurrent renders can exhaust CPU and cause failures.
-
-The producer server uses a **request-level semaphore** to queue renders. Only `maxConcurrentRenders` renders execute at a time — additional requests wait in a FIFO queue until a slot opens.
-
-### Configuration
-
-```bash Terminal
-# CLI flag
-npx hyperframes render --max-concurrent-renders 2 --output output.mp4
-
-# Environment variable (for the producer server)
-PRODUCER_MAX_CONCURRENT_RENDERS=2
-```
-
-The default is **2** concurrent renders, which works well on 8-core machines where each render uses 2-3 workers.
-
-### Queue status
-
-The producer server exposes a `GET /render/queue` endpoint that returns the current state:
-
-```json
-{
-  "maxConcurrentRenders": 2,
-  "activeRenders": 1,
-  "queuedRenders": 3
-}
-```
-
-AI agents can poll this endpoint to decide whether to submit a render or wait.
-
-### SSE queue events
-
-When using the streaming endpoint (`POST /render/stream`), queued requests receive a `queued` event before rendering begins:
-
-```json
-{"type": "queued", "requestId": "...", "position": 2}
-```
-
-This lets agents report "waiting in queue" to users rather than appearing stuck.
-
-### Choosing a concurrency limit
-
-| Machine | CPU cores | Recommended limit |
-|---------|-----------|------------------|
-| 4-core VM | 4 | 1 |
-| 8-core workstation | 8 | 2 |
-| 16-core server | 16 | 3-4 |
-| 32-core render box | 32 | 5-6 |
-
-<Tip>
-  When in doubt, use 1. Renders will queue up and execute sequentially, but each one gets full CPU and finishes as fast as possible. This is better than 3 renders fighting for CPU and all finishing slowly — or failing.
-</Tip>
-
-## Transparent Video
-
-Hyperframes supports rendering with a transparent background — useful for overlays, lower thirds, subscribe cards, and any element you want to composite over other footage in a video editor.
-
-### Recommended format: MOV (ProRes 4444)
-
-```bash Terminal
+```bash
+npx hyperframes render --format webm --output overlay.webm
 npx hyperframes render --format mov --output overlay.mov
 ```
 
-**MOV with ProRes 4444** is the industry standard for transparent video. It works in all major video editors:
+MP4 is the normal opaque delivery format. After rendering transparency, inspect
+the file over a contrasting background rather than trusting a player that
+always shows black behind alpha.
 
-- CapCut
-- Final Cut Pro
-- Adobe Premiere Pro
-- DaVinci Resolve
-- After Effects
+For VP9 WebM, `ffprobe` reporting `pix_fmt=yuv420p` does not by itself mean
+transparency was lost. FFmpeg's default VP9 decoder can also produce an opaque
+image from a file that contains alpha. To inspect a frame, explicitly select
+the alpha-aware decoder **before** the input:
+
+```bash
+ffmpeg -c:v libvpx-vp9 -i overlay.webm -frames:v 1 -pix_fmt rgba overlay-frame.png
+```
+
+View the PNG over a checkerboard or contrasting background. If it is still
+opaque, compare it with the composition's PNG-sequence output to check whether
+transparency was already missing before video encoding.
+
+### HLS streaming output
+
+`--format hls` writes an HLS VOD stream into the output **directory**:
+`master.m3u8`, `video.m3u8` and `video_NNNNN.ts`, plus `audio.m3u8` and
+`audio_NNNNN.ts` when the composition has audio. The video and audio encodes
+are identical to MP4; only the delivery container differs, and packaging is a
+stream copy rather than a second encode.
+
+```bash
+npx hyperframes render --format hls --output stream
+npx hyperframes render --format hls --hls-segment-seconds 6 --output stream
+```
+
+Segments are exactly `--hls-segment-seconds` long (default 4) except the last,
+and every segment starts on a keyframe. HLS output is SDR only, so `--hdr` is
+rejected, and `--gpu` is rejected because GPU encoders ignore the forced-keyframe
+lock that fixed-length segments depend on. Cloud rendering (`lambda`,
+`cloudrun`) does not offer HLS yet.
+
+## Input video codecs
+
+The browser editor, preview, `check`, and published projects normally create cached browser
+proxies for local video that Chrome cannot decode reliably, including common
+HEVC and ProRes inputs. The original file stays in the project and remains the
+render source.
+
+If a clip is black only in preview, keep automatic proxying enabled, confirm the
+source is local, and run `npx hyperframes check`. Disable proxying only when the
+browser already supports the source or you are diagnosing the proxy itself.
+
+## Choose quality and frame rate
+
+The default `looks` quality (CRF 16) is the right choice for most finished work.
+MOV is an editing intermediate. It uses ProRes 4444 with alpha unless
+`--prores-profile` picks a smaller 4:2:2 profile (`hq`, `422`, `lt` or `proxy`),
+which has no alpha: transparent areas render black. `--crf` and `--video-bitrate`
+do not map to ProRes and are rejected for MOV; choose MP4 or WebM when you need
+those controls.
+
+```bash
+npx hyperframes render --format mov --prores-profile hq --output edit.mov
+```
+
+For delivery to a player or platform, an MP4 render can also set how often a
+keyframe lands and how high the bitrate may peak. `--keyframe-interval 2` puts a
+keyframe at least every two seconds. `--max-bitrate 8M` caps the peak while the
+quality target still decides the rest, and `--buffer-size` (default twice the cap)
+sets the window the cap is measured over. Left out, the encode is unchanged.
+On Lambda the interval is a maximum, because joining chunks adds keyframes, and
+the cap holds per chunk, so a join can burst up to one buffer.
+
+```bash
+npx hyperframes render --keyframe-interval 2 --max-bitrate 8M --output delivery.mp4
+```
+
+```bash
+# Faster review version
+npx hyperframes render --quality draft --output review.mp4
+
+# Larger final master
+npx hyperframes render --quality high --output master.mp4
+
+# Explicit frame rate
+npx hyperframes render --fps 60 --output final-60fps.mp4
+```
+
+Use a higher frame rate only when the source or destination needs it. It creates more frames, so rendering takes longer.
+
+The CLI uses the composition’s `data-fps` when present and otherwise defaults to 30 fps.
+
+## 4:4:4 masters
+
+MP4 output stores colour at half resolution in each direction (4:2:0). Thin
+coloured text, UI strokes and saturated edges can come out soft or fringed. For
+a master file that is mostly text and UI, render with full-resolution colour:
+
+```bash
+npx hyperframes render --chroma-subsampling 444 --output master.mp4
+```
+
+This encodes H.264 High 4:4:4 Predictive (yuv444p) and captures every frame as
+a lossless PNG, because Chrome's JPEG capture is already 4:2:0 on Linux and on
+screenshot capture. Rendering is slower: in our tests a text and UI
+composition took about twice as long as the default render, and full-frame
+footage about three and a half times as long, because PNG encoding gets more
+expensive as the image gets more detailed.
+
+Measured at the same CRF against lossless masters, chroma PSNR rose by about
+16 dB for coloured text and 13 dB for a UI screen recording, while camera
+footage and gradients showed no meaningful change. Keep the default for
+footage-heavy videos.
+
+`444` supports SDR MP4 with the software encoder only. It is rejected with
+`--gpu`, `--hdr` and other formats. Distributed renders (including Lambda and
+Cloud Run) encode 4:2:0 only and reject a `chromaSubsampling` of `"444"`.
+
+Many players cannot decode 4:4:4, so use it for masters and editing handoff,
+not for files you publish directly:
+
+| Player | 4:4:4 MP4 |
+| ------ | --------- |
+| Chrome 155 (Windows) | Plays |
+| Edge 155 (Windows) | Plays |
+| Firefox 157 (Windows) | Does not play (no YUV 4:4:4 decoder) |
+| VLC 3.0 (Windows) | Plays |
+| Windows Media Player and Media Player app | Does not play ("unsupported encoding settings") |
+| Safari (iOS 26.6) | Plays |
+| Safari 26.6 (macOS 26.6) | Plays |
+| QuickTime / AVFoundation (macOS 26.6) | Plays |
+
+Tested with H.264 High 4:4:4 Predictive, 8-bit, 1920×1080. Every player above
+plays the default 4:2:0 output.
+
+## Local or Docker
+
+Local rendering is the normal choice:
+
+```bash
+npx hyperframes render --output final.mp4
+```
+
+It starts quickly and can use the computer’s browser GPU.
+On WSL2, Chrome may not reach the GPU; see
+[the render is slow under WSL2](/help#the-render-is-slow-under-wsl2).
+
+Use Docker when a controlled Chrome, FFmpeg, and font environment matters:
+
+```bash
+npx hyperframes render --docker --output final.mp4
+```
+
+Docker adds startup and infrastructure overhead. It is useful for CI and repeatable production environments, not a requirement for every final render.
+
+## Render another composition
+
+The root `index.html` is rendered by default. To target another standalone composition:
+
+```bash
+npx hyperframes render \
+  --composition compositions/intro.html \
+  --output intro.mp4
+```
+
+Nested compositions that use `<template>` wrappers should be rendered through the root composition that includes them.
+
+## Batch and cloud work
+
+For several variable-driven versions, use batch rendering. For remote infrastructure, use HyperFrames cloud, AWS Lambda, or Google Cloud Run.
+
+Those workflows involve output naming, credentials, concurrency, and infrastructure choices. Start in the [CLI guide](/developers/cli) and use the complete [CLI reference](/packages/cli) when you need every flag.
+
+## Render provenance
+
+Rendered video carries two container metadata tags that say which tool wrote the file:
+
+```bash
+ffprobe -v error -show_entries format_tags -of json out.mp4
+```
+
+```json
+{ "hyperframes_renderer": "hyperframes", "hyperframes_version": "0.7.107" }
+```
+
+That is the whole of it. The tags name the renderer and its version, and nothing else: no file
+paths, usernames, machine names, project names, or anything about the composition. They are
+container metadata, not a visible watermark, so no pixel of your video changes. Matroska
+uppercases tag names on read, so a `.webm` reports `HYPERFRAMES_RENDERER`.
+
+Strip them whenever you like:
+
+```bash
+ffmpeg -i out.mp4 -map_metadata -1 -c copy clean.mp4
+```
+
+<Note>
+  These tags are an unauthenticated diagnostic hint, not proof of origin. They are ordinary unsigned
+  container keys, so anything can write the same two values with a single `ffmpeg -metadata`
+  command: a tag that is present means the file *claims* to be HyperFrames output, not that
+  HyperFrames wrote it. A tag that is absent means just as little, because re-encoding, remuxing, or
+  any tool that drops unknown keys strips it, and files rendered by older versions never carried it.
+  Treat it as a "what probably produced this file?" hint for support and debugging, never as an
+  authenticity, attribution, or licensing check. Verifiable provenance needs signed claims such as
+  C2PA.
+</Note>
+
+## Ask the agent for the right output
+
+The flags above are what the agent sets for you. Say what you need in the request and it picks them. The defaults (MP4, 1920×1080, 30fps, `looks` quality) are deliberately good, so most of the skill is knowing when *not* to ask for more.
+
+### Quality tier
+
+Say the tier by name and the agent selects the matching encode preset — you don't specify CRF or encoder speed:
+
+| Say this | Tier | Best for |
+| --- | --- | --- |
+| "draft" / "quick render" | `draft` | Fast iteration while you're still judging the cut |
+| nothing | `looks` (default, CRF 16) | Finished work: visually lossless at 1080p |
+| "final" / "high quality" | `delivery` | Masters you hand off |
+
+The tiers trade encode time for fidelity. `looks` (the default) is already visually lossless at 1080p, so reserve `delivery` for the master you'll actually hand off, and use `draft` freely while iterating.
+
+- **Avoid:** `render everything at high quality`
+- **Instead:** `draft renders while we iterate, then one high-quality final` — you spend the slow encode once, on the cut you've already approved
+
+### Format
+
+MP4 is the default and the right answer for almost everything — it plays everywhere. Ask for a different container only when the delivery target needs one:
+
+> Render this as a transparent WebM overlay.
+
+> Export a MOV I can drop into Premiere with the background knocked out.
+
+Transparency has a container hierarchy, and the tradeoffs are real:
+
+| Ask for | You get | Watch out for |
+| --- | --- | --- |
+| "transparent MOV" | ProRes 4444 with alpha | The editor-grade choice (Premiere, Final Cut, Resolve, After Effects). Files are large — expected for an editing intermediate. |
+| "transparent WebM" | VP9 with alpha | Small, but **only browsers decode the alpha** — every video editor renders the transparent areas black. Browser playback only. |
+| "PNG sequence" | Lossless RGBA frames | For compositing in After Effects / Nuke / Fusion. Largest of all. |
+
+Transparency also only *means something* on a design that has empty space to see through. A lower third, a subscribe card, or a logo sting is mostly empty canvas — transparency lets it composite over other footage. A full-frame scene (edge-to-edge background, full-bleed video, a title card with its own backdrop) has nothing to be transparent; the request produces a file that looks identical to the opaque one but is larger and plays in fewer places.
+
+- **Avoid:** `render my full-screen product promo as a transparent WebM`
+- **Instead:** `render the promo as MP4; export just the lower-third overlay as transparent WebM` — transparency belongs to the layer meant to sit *over* other footage, not the finished full-frame film
+
+<DocsVideo
+  title="Overlay spotify preview"
+  src="https://static.heygen.ai/hyperframes-oss/docs/images/prompting/overlay-spotify-preview.mp4#t=0.1"
+  portrait
+  loop
+/>
+*A transparent VP9 WebM overlay previewed over a checkerboard. To verify alpha from the CLI: VP9 stores it out-of-band, so look for ALPHA_MODE=1 in ffprobe (a pix_fmt-only check false-negatives) or extract it with ffmpeg alphaextract.*
+
+
+<Note>
+  A transparent render also depends on the composition leaving `html` / `body` backgrounds unset — the transparency comes through only where nothing is painted. The skills handle this; see the [Rendering guide](/guides/rendering#transparent-video) if you're hand-authoring an overlay.
+</Note>
+
+### Resolution and framerate
+
+1920×1080 at 30fps is the default. Both cost real time when you raise them, and both are frequently asked for out of habit rather than need.
+
+**4K** is a render-time flag — the composition stays at its authored size and Chrome supersamples it to 3840×2160. That buys crisp text, SVG, and CSS at any scale, but it does *nothing* for content already locked to a pixel grid: a 1080p `<video>`, a fixed-size `<canvas>`, or a sub-4K image gain no detail from it. And it isn't free — a 4K render is roughly **4× slower per frame** and produces a **3–5× larger file**. Ask for it when the delivery surface genuinely needs it (a 4K display, a client spec), not reflexively.
+
+> Render this at 4K for the trade-show display.
+
+**Framerate** follows the same logic: 60fps doubles the frames the engine captures and encodes. It's worth it for fast motion graphics destined for a high-refresh screen; it's wasted on a talking-head clip or a slow title sequence.
+
+- **Avoid:** `render in 4K 60fps` for a clip headed to Instagram — the platform will transcode it down anyway, and you paid the slow render for nothing
+- **Instead:** say nothing for social; name `4K` (or `60fps`) only when the target actually resolves it
 
 <Warning>
-  ProRes MOV files are large (typically 5-40 MB for short clips) because ProRes is a high-quality intermediate codec optimized for editing, not delivery. This is expected — the same tradeoff Remotion and professional pipelines make.
+  A few 4K constraints will stop a render before it starts (all grounded in the [4K guide](/guides/4k-rendering#constraints)): the target orientation must match the composition's aspect ratio, the scale must be a whole number (1080p → 4K is exactly 2×), and **4K cannot be combined with HDR** in one pass. If you need both, render HDR at composition resolution and upscale separately.
 </Warning>
 
-### Format comparison
+### HDR
 
-| Format | Codec | Transparency | Video editors | Browsers | File size |
-|--------|-------|-------------|---------------|----------|-----------|
-| **MOV** | ProRes 4444 | Yes | CapCut, Final Cut, Premiere, DaVinci, After Effects | No | Large |
-| **WebM** | VP9 | Yes | None (shows black background) | Chrome, Firefox | Small |
-| **PNG sequence** | RGBA PNGs (no encoding) | Yes (lossless) | After Effects, Nuke, Fusion (image-sequence import) | No | Largest |
-| **MP4** | H.264 | No | All | All | Small |
+HDR output is **HDR10 MP4** (H.265 10-bit, BT.2020) and it is *source-driven* — the render only goes HDR when your composition actually references HDR media (video tagged BT.2020 with PQ or HLG transfer, or a 16-bit PNG). Text, gradients, and GSAP animation are not HDR sources; a composition made entirely of them has nothing to render in HDR.
 
-<Note>
-  **WebM VP9 alpha** is technically supported but all major video editors ignore the alpha channel and render transparent areas as black. Only Chromium-based browsers (Chrome, Arc, Brave, Edge) decode VP9 alpha correctly. Safari does not support it. Use MOV for editor workflows and WebM only for browser-based playback.
-</Note>
+> This composition has an HDR drone clip — render it as HDR10.
 
-### PNG sequence (no encoding)
+By default HDR is auto-detected, so with a real HDR source in the project you often need to say nothing. Force it explicitly only to override the probe:
 
-```bash Terminal
-npx hyperframes render --format png-sequence --output frames/
-```
+- "force HDR" → forces the HDR path even without a detected HDR source
+- "force SDR" → forces standard range even when HDR sources are present
 
-`--format png-sequence` skips the encoder entirely. The captured RGBA frames are copied to `<output>/frame_NNNNNN.png` (zero-padded) and, if the composition has audio, an `audio.aac` sidecar is written alongside. Use this when you want lossless frames — for compositing in After Effects / Nuke / Fusion, or as the input to a custom encode pipeline. `--output` is treated as a directory and is created if it doesn't exist.
+HDR is **MP4 only** (a transparent MOV/WebM request falls back to SDR) and it is **not available on Lambda** (distributed rendering is SDR-only). See the [HDR guide](/guides/hdr) for source requirements and verification.
 
-### How it works
+### Where the render runs
 
-When you render with `--format mov`, `--format webm`, or `--format png-sequence`, Hyperframes:
+Local rendering is the default and the right choice for the whole iteration loop. Reach for cloud rendering only when a single machine is the bottleneck:
 
-1. Captures each frame as a **PNG with alpha channel** (instead of JPEG for MP4)
-2. Sets Chrome's page background to transparent via `Emulation.setDefaultBackgroundColorOverride`
-3. Encodes with an alpha-capable codec (ProRes 4444 for MOV, VP9 for WebM); `png-sequence` skips encoding and writes the captured frames directly
+> Render this on Lambda.
 
-Your composition's HTML should **not** set a `background` on `html` or `body` — leave it unset so the transparent background comes through.
+That routes to HyperFrames' AWS Lambda path, which fans the render across many parallel workers. It's the right call for renders that are **too long or too large for one host** — multi-minute videos, 4K masters, or large parallel batches — and it needs AWS credentials configured first. For dev-loop iteration, stay on local `render`; the round-trip is faster than any cloud dispatch. Lambda is SDR-only (no HDR) and bills by compute time; the [AWS Lambda guide](/deploy/aws-lambda) covers setup, cost shape, and the conservative concurrency default.
 
-### Authoring transparent compositions
+- **Avoid:** `set up Lambda so I can preview edits faster` — cloud dispatch adds latency to a fast local loop
+- **Instead:** `render the final 3-minute 4K cut on Lambda` — the workload that actually justifies fanning out
 
-```html
-<style>
-  /* Do NOT set background on html/body — leave them transparent */
-  * { margin: 0; padding: 0; box-sizing: border-box; }
+Lambda is not the only remote target. **HeyGen-hosted cloud rendering** ([guide](/deploy/cloud)) takes the infrastructure off your hands entirely — no AWS account to configure — and **Google Cloud Run** ([guide](/deploy/gcp-cloud-run)) is the option when your stack already lives on GCP. Name the one you want ("render this on Cloud Run"); the routing is explicit, never inferred.
 
-  [data-composition-id="my-overlay"] {
-    position: relative;
-    width: 1920px;
-    height: 1080px;
-    overflow: hidden;
-    /* No background here either */
-  }
-</style>
-```
+### Preview before you commit the slow render
 
-Only the visible elements (cards, text, images) will appear in the final video. Everything else will be transparent.
+The cheapest way to avoid a wasted `high`/4K/HDR render is to judge the frame first. The habit the skills follow:
 
-### Verifying transparency
+1. Keep `preview` running and scrub the timeline — same runtime as the render, so what you see is what you get.
+2. Iterate with `draft` renders when you need a real file to check.
+3. Only when the cut is locked, ask for the final tier / resolution / format.
 
-- **In a browser:** Open the MOV file — it won't play (ProRes is not a browser codec). Instead, render a WebM copy and open it in Chrome on a checkerboard background page.
-- **In a video editor:** Import the MOV file and place it on a track above other footage. Transparent areas should show the footage below.
-- **Online tool:** Use [rotato.app/tools/transparent-video](https://rotato.app/tools/transparent-video) to verify your MOV or WebM has working transparency.
-
-<Note>
-  **`ffprobe` reports a transparent WebM as `yuv420p`, not `yuva420p`.** This is expected and does not mean the alpha is missing. VP9 stores its alpha plane in a Matroska `BlockAdditional` sidecar, not in the primary stream's pixel format, so `ffprobe` reports the primary stream as `pix_fmt=yuv420p` even when the file genuinely carries alpha. First check that the WebM declares the alpha sidecar, then force the VP9 library decoder to verify per-pixel alpha:
-
-  ```bash
-  ffprobe -v error -show_streams out.webm | grep -i alpha_mode   # ALPHA_MODE=1 or alpha_mode=1
-  ffmpeg -c:v libvpx-vp9 -i out.webm -frames:v 1 -f rawvideo -pix_fmt rgba frame.raw
-  ```
-
-  A fully transparent corner pixel in `frame.raw` reads `00 00 00 00`. MOV (ProRes 4444) and `png-sequence` report their alpha directly, so this caveat is WebM-only.
-</Note>
-
-## Tips
+- **Avoid:** `render the final 4K HDR master` on a cut you haven't watched end to end
+- **Instead:** `draft render so I can check timing` → approve → `now the 4K final`
 
 <Tip>
-  Use `draft` quality during development for fast previews. Switch to `standard` or `high` for final output.
+  Rendering is user-gated by design — the agent pauses at preview and renders only when you approve. Use that pause to lock the cut before you pay for the expensive export.
 </Tip>
 
-- Use `npx hyperframes benchmark` to find optimal settings for your system
-- Docker mode is slower but guarantees [identical output](/concepts/determinism) across platforms
-- For compositions with many frames, `--gpu` can significantly speed up local encoding
+## If rendering fails
 
-## Next Steps
+Run:
 
-<CardGroup cols={2}>
-  <Card title="Deterministic Rendering" icon="lock" href="/concepts/determinism">
-    Understand the determinism guarantees
-  </Card>
-  <Card title="HDR Rendering" icon="sun" href="/guides/hdr">
-    Render HDR10 MP4 from HDR video and image sources
-  </Card>
-  <Card title="Cloud Rendering" icon="cloud" href="/deploy/cloud">
-    Render on HeyGen's hosted cloud — no local Chrome or FFmpeg
-  </Card>
-  <Card title="CLI Reference" icon="terminal" href="/packages/cli">
-    Full list of CLI commands and flags
-  </Card>
-  <Card title="Troubleshooting" icon="wrench" href="/guides/troubleshooting">
-    Fix common rendering issues
-  </Card>
-</CardGroup>
+```bash
+npx hyperframes doctor
+npx hyperframes lint
+npx hyperframes check
+```
+
+Keep the first exact error rather than only the final “render failed” message. See [Troubleshooting](/help) for the next checks.
+
+A render refuses any composition HTML file, the entry or a sub-composition, that is larger than 16 MB. The error code is `COMPOSITION_TOO_LARGE`. Keep images, fonts and data in separate files and reference them by path instead of inlining them.
+
+The same error refuses a render whose sub-composition mounts add up to more than 64 MB of composition HTML, or to more than 10,000 mounts. Every mount counts, including each repeat of the same file and each mount nested inside another. The scripts and scoped styles generated for those mounts have their own 64 MB limit. Every inline script in a mounted file is wrapped in a few kilobytes of scoping code, and every style rule is prefixed with its host's `data-composition-id`. Many tiny inline scripts, or a long composition id over many style rules, can reach this limit. Merge small scripts and rules, or keep ids short.
+
+<Tip>
+  Always watch the exported file itself. Preview proves that the project can play; the output file
+  proves that the delivery is correct.
+</Tip>
+
+## Related topics
+
+- [Compare local, hosted, and self-managed rendering](/deploy/overview)
+- [Render and export from the browser editor](/studio/export)
+- [Diagnose a failed render](/help)

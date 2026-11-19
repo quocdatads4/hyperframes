@@ -4,6 +4,7 @@ import type {
   CommitMutationOptions,
 } from "./gsapScriptCommitTypes";
 import { trackStudioEvent } from "../utils/studioTelemetry";
+import { makeStudioDebugLogger } from "../utils/studioDebug";
 
 type PixelRect = Pick<DOMRect, "x" | "y" | "width" | "height">;
 
@@ -13,9 +14,11 @@ export interface GestureTransaction {
   element: HTMLElement;
   label: string;
   settle(): void;
-  persist(commit: TxCommit): Promise<void>;
+  persist(commit: TxCommit, coalesceKey: string): Promise<void>;
+  afterBufferedCommitsSaved?(): Promise<void>;
   restore(): void;
   skipPixelAssert?: boolean;
+  draw?<T>(run: () => T): T;
 }
 
 let transactionCounter = 0;
@@ -108,14 +111,7 @@ async function dispatchBufferedCommits(calls: BufferedCommit[]): Promise<number>
   return reloadsRequested(calls);
 }
 
-/**
- * Dev-only [hf-commit] lifecycle trace. The production observability lives in
- * the trackStudioEvent commit_* events (always on); these console lines are a
- * developer aid and stay out of end users' consoles.
- */
-function traceCommit(stage: string, data: Record<string, unknown>): void {
-  if (import.meta.env.DEV) console.info(`[hf-commit] ${stage}`, data);
-}
+const logCommit = makeStudioDebugLogger("commit");
 
 /**
  * Owns the visual + persistence + history lifecycle for one gesture release.
@@ -127,11 +123,13 @@ export function runGestureTransaction(tx: GestureTransaction): Promise<void> {
   let mutationCount = 0;
   let reloadCount = 0;
   const bufferedCommits: BufferedCommit[] = [];
-  traceCommit("start", { label: tx.label, coalesceKey });
+  logCommit("start", { label: tx.label, coalesceKey });
   tx.settle();
-  traceCommit("settled", { label: tx.label, coalesceKey });
+  logCommit("settled", { label: tx.label, coalesceKey });
 
-  const before = !tx.skipPixelAssert ? readPixelRect(tx.element) : null;
+  const measure = () =>
+    tx.draw ? tx.draw(() => readPixelRect(tx.element)) : readPixelRect(tx.element);
+  const before = !tx.skipPixelAssert ? measure() : null;
   const commit: TxCommit = (commitMutation) => {
     const wrapped: CommitMutation = (selection, mutation, options) => {
       mutationCount += 1;
@@ -148,23 +146,17 @@ export function runGestureTransaction(tx: GestureTransaction): Promise<void> {
   };
 
   return tx
-    .persist(commit)
+    .persist(commit, coalesceKey)
     .then(async () => {
       reloadCount = await dispatchBufferedCommits(bufferedCommits);
+      await tx.afterBufferedCommitsSaved?.();
       const durationMs = Math.round(performance.now() - startedAt);
-      traceCommit("persisted", { label: tx.label, coalesceKey });
+      logCommit("persisted", { label: tx.label, coalesceKey });
       if (before) {
-        const after = readPixelRect(tx.element);
+        const after = measure();
         const delta = pixelDelta(before, after);
         if (exceedsPixelTolerance(delta)) {
-          if (import.meta.env.DEV) {
-            console.error("[hf-commit] persist changed pixels", {
-              label: tx.label,
-              before,
-              after,
-              delta,
-            });
-          }
+          logCommit("persist-changed-pixels", { label: tx.label, before, after, delta });
           trackStudioEvent("commit_invariant_violation", {
             label: tx.label,
             delta_x: roundToOneDecimal(delta.x),
@@ -193,7 +185,7 @@ export function runGestureTransaction(tx: GestureTransaction): Promise<void> {
         error_name: error instanceof Error ? error.name : "unknown",
         restore_ran: true,
       });
-      traceCommit("restore", { label: tx.label, coalesceKey });
+      logCommit("restore", { label: tx.label, coalesceKey });
       throw error;
     });
 }

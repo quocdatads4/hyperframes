@@ -1,8 +1,11 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { useGsapSnapshotVersion } from "../../hooks/gsapFrameSnapshot";
+import { scopedElementKey } from "../../hooks/gsapKeyframeCacheHelpers";
+import { memo, useMemo, useRef, useState } from "react";
 import { Move } from "../../icons/SystemIcons";
 import { InspectorHeaderActions } from "./InspectorHeaderActions";
 import { useStudioShellContext } from "../../contexts/StudioContext";
-import { readStudioBoxSize, readStudioPathOffset, readStudioRotation } from "./manualEdits";
+import { readStudioBoxSize } from "./manualEdits";
+import { readMoveOffset, readShownRotation } from "./plainTranslate";
 import {
   buildElementInfoText,
   EMPTY_STYLES,
@@ -16,7 +19,7 @@ import {
 } from "./propertyPanelHelpers";
 import { MetricField, Section } from "./propertyPanelPrimitives";
 import { createTransformCommitHandlers } from "./propertyPanelTransformCommit";
-import { classifyPropertyGroup } from "@hyperframes/core/gsap-parser";
+import { resolveAnimIdForProperty } from "../../player/components/TimelinePropertyLanes";
 import { resolveEditingSections } from "@hyperframes/core/editing";
 import { MediaSection } from "./propertyPanelMediaSection";
 import { ColorGradingSection } from "./propertyPanelColorGradingSection";
@@ -25,19 +28,18 @@ import { TextSection, StyleSections } from "./propertyPanelSections";
 import { GsapAnimationSection } from "./GsapAnimationSection";
 import { PropertyPanel3dTransform } from "./propertyPanel3dTransform";
 import { KeyframeNavigation } from "./KeyframeNavigation";
-import {
-  STUDIO_FLAT_INSPECTOR_ENABLED,
-  STUDIO_GSAP_PANEL_ENABLED,
-  STUDIO_KEYFRAMES_ENABLED,
-} from "./manualEditingAvailability";
+import { STUDIO_FLAT_INSPECTOR_ENABLED } from "./manualEditingAvailability";
 import { PropertyPanelFlat } from "./PropertyPanelFlat";
 import { createGsapLivePreview } from "./gsapLivePreview";
-import { usePlayerStore, liveTime } from "../../player";
+import { usePlayerStore } from "../../player";
+import { useLivePlayheadTime } from "../../hooks/useLivePlayheadTime";
 import { TimingSection } from "./propertyPanelTimingSection";
 import { type PropertyPanelProps } from "./propertyPanelHelpers";
 import { GestureRecordPanelButton } from "./GestureRecordControl";
 import { PropertyPanelEmptyState } from "./PropertyPanelEmptyState";
 import { DesignPanelInputProvider } from "../../contexts/DesignPanelInputContext";
+import { isAudioDomElement } from "../../utils/timelineInspector";
+import { useManualEditDisabledFlags } from "./previewReadOnlyContext";
 
 // Re-export helpers that external consumers import from this module
 export {
@@ -57,7 +59,6 @@ export {
 export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelProps) {
   const {
     projectId,
-    projectDir,
     assets,
     element,
     multiSelectCount = 0,
@@ -71,8 +72,6 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
     onSetAttribute,
     onSetAttributeLive,
     onApplyColorGradingScope,
-    onSetHtmlAttribute,
-    onRemoveBackground,
     onSetManualOffset,
     onSetManualSize,
     onSetManualRotation,
@@ -101,6 +100,7 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
     onUpdateArcSegment,
     onUnroll,
     onUpdateKeyframeEase,
+    onUpdateSegmentEase,
     onSetAllKeyframeEases,
     onAddKeyframe,
     onRemoveKeyframe,
@@ -116,31 +116,16 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
   const { showToast } = useStudioShellContext();
   const [clipboardCopied, setClipboardCopied] = useState(false);
   const clipboardTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
-  const storeTime = usePlayerStore((s) => s.currentTime);
-  const isPlaying = usePlayerStore((s) => s.isPlaying);
   const timelineElements = usePlayerStore((s) => s.elements);
   const selectedElementId = usePlayerStore((s) => s.selectedElementId);
   const selectedElementHidden = isSelectedElementHidden(timelineElements, selectedElementId);
   const visibilityToggleLabel = selectedElementHidden ? "Show element" : "Hide element";
-  const liveTimeRef = useRef(storeTime);
-  const [, forceRender] = useState(0);
-  useEffect(() => {
-    if (!isPlaying) return;
-    let timerId: ReturnType<typeof setTimeout> | 0 = 0;
-    const unsub = liveTime.subscribe((t) => {
-      liveTimeRef.current = t;
-      if (!timerId)
-        timerId = setTimeout(() => {
-          timerId = 0;
-          forceRender((v) => v + 1);
-        }, 33);
-    });
-    return () => {
-      unsub();
-      if (timerId) clearTimeout(timerId);
-    };
-  }, [isPlaying]);
-  const currentTime = isPlaying ? liveTimeRef.current : storeTime;
+  // Audio gets no visibility toggle in this classic panel; the timeline and the flat panel offer it as a mute.
+  const audioSelection = isAudioDomElement(element?.element);
+  // Live during playback, the store's when paused — see the hook. Shared with the
+  // audio FX panel, which follows the playhead for the same reason: a value the
+  // timeline drives has to be shown moving, not frozen at what the attribute says.
+  const currentTime = useLivePlayheadTime();
   const cacheElementKey = element?.id ?? element?.selector ?? "";
   const cacheEntry = usePlayerStore((s) => s.keyframeCache.get(cacheElementKey));
 
@@ -150,13 +135,14 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
       gsapAnimations?.[0]?.id ??
       null)
     : null;
+  const sealedReads = useGsapSnapshotVersion();
   const gsapRuntimeValues = useMemo(
     () =>
       element
         ? readGsapRuntimeValuesForPanel(gsapAnimIdForMemo, gsapAnimations, element, iframeRef)
         : null,
     // eslint-disable-next-line react-hooks/exhaustive-deps -- iframeRef is stable; currentTime drives re-reads during playback
-    [gsapAnimIdForMemo, gsapAnimations, element, currentTime],
+    [gsapAnimIdForMemo, gsapAnimations, element, currentTime, sealedReads],
   );
   const gsapBorderRadius = useMemo(
     () =>
@@ -179,6 +165,10 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
     scale: 1,
     transformPerspective: 0,
   };
+  // Unconditional like the hooks above: must not sit behind the `!element` return below.
+  const manualOffset = element ? readMoveOffset(element.element) : { x: 0, y: 0 };
+  const { manualOffsetEditingDisabled, manualSizeEditingDisabled, manualRotationEditingDisabled } =
+    useManualEditDisabledFlags(element?.capabilities, manualOffset);
 
   if (!element) {
     return (
@@ -193,16 +183,12 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
     );
   }
 
-  const manualOffsetEditingDisabled = !element.capabilities.canApplyManualOffset;
-  const manualSizeEditingDisabled = !element.capabilities.canApplyManualSize;
-  const manualRotationEditingDisabled = !element.capabilities.canApplyManualRotation;
   const sourceLabel = element.id ? `#${element.id}` : (element.selector ?? "");
   // Capabilities are already resolved on the selection; recompute only sections,
   // feeding the live GSAP tween count (arrives on the gsapAnimations prop, not the
   // selection) so the Timing section shows for pure-GSAP elements with no data-start.
   const sections = resolveEditingSections(domEditSelectionToFacts(element, gsapAnimations.length));
   const showEditableSections = element.capabilities.canEditStyles && sections.style;
-  const manualOffset = readStudioPathOffset(element.element);
   const manualSize = readStudioBoxSize(element.element);
   const resolvedWidth =
     manualSize.width > 0
@@ -212,8 +198,7 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
     manualSize.height > 0
       ? manualSize.height
       : (parsePxMetricValue(styles.height ?? "") ?? element.boundingBox.height);
-
-  const manualRotation = readStudioRotation(element.element);
+  const manualRotation = readShownRotation(element.element);
 
   const elStart = Number.parseFloat(element?.dataAttributes?.start ?? "0") || 0;
   const elDuration = Number.parseFloat(element?.dataAttributes?.duration ?? "1") || 0;
@@ -241,12 +226,8 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
   const navKeyframes = cacheEntry?.keyframes ?? gsapKeyframes;
   const seekFromKfPct = (pct: number) => onSeekToTime?.(elStart + (pct / 100) * elDuration);
 
-  const animIdForProp = (prop: string): string => {
-    const group = classifyPropertyGroup(prop);
-    const groupAnim = gsapAnimations?.find((a) => a.propertyGroup === group);
-    if (groupAnim) return groupAnim.id;
-    return gsapAnimId ?? "";
-  };
+  const animIdForProp = (prop: string): string =>
+    resolveAnimIdForProperty(prop, gsapAnimations, gsapAnimId);
 
   const displayX = gsapRuntimeValues?.x ?? manualOffset.x;
   const displayY = gsapRuntimeValues?.y ?? manualOffset.y;
@@ -256,11 +237,19 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
 
   const handleCopyElementInfo = () => {
     const text = buildElementInfoText(element, sourceLabel, gsapAnimations, previewIframeRef);
-    void navigator.clipboard.writeText(text);
-    showToast(`Copied element info for ${element.label} — paste into any AI agent`, "info");
-    setClipboardCopied(true);
-    clearTimeout(clipboardTimerRef.current);
-    clipboardTimerRef.current = setTimeout(() => setClipboardCopied(false), 1500);
+    // Claim the copy only once the write actually lands — a denied clipboard
+    // permission otherwise reports a copy that never happened.
+    navigator.clipboard
+      .writeText(text)
+      .then(() => {
+        showToast(`Copied element info for ${element.label}. Paste it into any AI agent`, "info");
+        setClipboardCopied(true);
+        clearTimeout(clipboardTimerRef.current);
+        clipboardTimerRef.current = setTimeout(() => setClipboardCopied(false), 1500);
+      })
+      .catch(() => {
+        showToast("Couldn't copy to the clipboard. Check browser permissions", "error");
+      });
   };
 
   if (STUDIO_FLAT_INSPECTOR_ENABLED) {
@@ -323,7 +312,7 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
               selectedElementId={selectedElementId}
               selectedElementHidden={selectedElementHidden}
               visibilityLabel={visibilityToggleLabel}
-              onToggleHidden={onToggleElementHidden}
+              onToggleHidden={audioSelection ? undefined : onToggleElementHidden}
             />
           </div>
         </div>
@@ -373,17 +362,7 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
           />
         )}
 
-        {sections.media && (
-          <MediaSection
-            projectDir={projectDir}
-            element={element}
-            styles={styles}
-            onSetStyle={onSetStyle}
-            onSetAttribute={onSetAttribute}
-            onSetHtmlAttribute={onSetHtmlAttribute}
-            onRemoveBackground={onRemoveBackground}
-          />
-        )}
+        {sections.media && <MediaSection {...props} element={element} styles={styles} />}
 
         {sections.layout && (
           <Section title="Layout" icon={<Move size={15} />}>
@@ -398,7 +377,7 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
                     onCommit={(next) => commitManualOffset("x", next)}
                   />
                 </div>
-                {STUDIO_KEYFRAMES_ENABLED && gsapAnimId && (
+                {gsapAnimId && (
                   <KeyframeNavigation
                     property="x"
                     keyframes={navKeyframes}
@@ -408,7 +387,9 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
                       onCommitAnimatedProperty &&
                       void onCommitAnimatedProperty(element, "x", displayX)
                     }
-                    onRemoveKeyframe={(pct) => onRemoveKeyframe?.(animIdForProp("x"), pct)}
+                    onRemoveKeyframe={(pct, animationId) =>
+                      onRemoveKeyframe?.(animationId ?? animIdForProp("x"), pct)
+                    }
                     onConvertToKeyframes={() => onConvertToKeyframes?.(animIdForProp("x"))}
                   />
                 )}
@@ -423,7 +404,7 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
                     onCommit={(next) => commitManualOffset("y", next)}
                   />
                 </div>
-                {STUDIO_KEYFRAMES_ENABLED && gsapAnimId && (
+                {gsapAnimId && (
                   <KeyframeNavigation
                     property="y"
                     keyframes={navKeyframes}
@@ -433,7 +414,9 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
                       onCommitAnimatedProperty &&
                       void onCommitAnimatedProperty(element, "y", displayY)
                     }
-                    onRemoveKeyframe={(pct) => onRemoveKeyframe?.(animIdForProp("y"), pct)}
+                    onRemoveKeyframe={(pct, animationId) =>
+                      onRemoveKeyframe?.(animationId ?? animIdForProp("y"), pct)
+                    }
                     onConvertToKeyframes={() => onConvertToKeyframes?.(animIdForProp("y"))}
                   />
                 )}
@@ -448,7 +431,7 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
                     onCommit={(next) => commitManualSize("width", next)}
                   />
                 </div>
-                {STUDIO_KEYFRAMES_ENABLED && gsapAnimId && (
+                {gsapAnimId && (
                   <KeyframeNavigation
                     property="width"
                     keyframes={navKeyframes}
@@ -458,7 +441,9 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
                       onCommitAnimatedProperty &&
                       void onCommitAnimatedProperty(element, "width", displayW)
                     }
-                    onRemoveKeyframe={(pct) => onRemoveKeyframe?.(animIdForProp("width"), pct)}
+                    onRemoveKeyframe={(pct, animationId) =>
+                      onRemoveKeyframe?.(animationId ?? animIdForProp("width"), pct)
+                    }
                     onConvertToKeyframes={() => onConvertToKeyframes?.(animIdForProp("width"))}
                   />
                 )}
@@ -473,7 +458,7 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
                     onCommit={(next) => commitManualSize("height", next)}
                   />
                 </div>
-                {STUDIO_KEYFRAMES_ENABLED && gsapAnimId && (
+                {gsapAnimId && (
                   <KeyframeNavigation
                     property="height"
                     keyframes={navKeyframes}
@@ -483,7 +468,9 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
                       onCommitAnimatedProperty &&
                       void onCommitAnimatedProperty(element, "height", displayH)
                     }
-                    onRemoveKeyframe={(pct) => onRemoveKeyframe?.(animIdForProp("height"), pct)}
+                    onRemoveKeyframe={(pct, animationId) =>
+                      onRemoveKeyframe?.(animationId ?? animIdForProp("height"), pct)
+                    }
                     onConvertToKeyframes={() => onConvertToKeyframes?.(animIdForProp("height"))}
                   />
                 )}
@@ -497,7 +484,7 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
                     onCommit={(next) => commitManualRotation(next.replace("°", ""))}
                   />
                 </div>
-                {STUDIO_KEYFRAMES_ENABLED && gsapAnimId && (
+                {gsapAnimId && (
                   <KeyframeNavigation
                     property="rotation"
                     keyframes={navKeyframes}
@@ -507,7 +494,9 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
                       onCommitAnimatedProperty &&
                       void onCommitAnimatedProperty(element, "rotation", displayR)
                     }
-                    onRemoveKeyframe={(pct) => onRemoveKeyframe?.(animIdForProp("rotation"), pct)}
+                    onRemoveKeyframe={(pct, animationId) =>
+                      onRemoveKeyframe?.(animationId ?? animIdForProp("rotation"), pct)
+                    }
                     onConvertToKeyframes={() => onConvertToKeyframes?.(animIdForProp("rotation"))}
                   />
                 )}
@@ -543,13 +532,13 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
           </Section>
         )}
 
-        {STUDIO_GSAP_PANEL_ENABLED &&
-          onUpdateGsapProperty &&
+        {onUpdateGsapProperty &&
           onUpdateGsapMeta &&
           onDeleteGsapAnimation &&
           onAddGsapProperty &&
           onAddGsapAnimation && (
             <GsapAnimationSection
+              elementId={scopedElementKey(element)}
               animations={gsapAnimations}
               multipleTimelines={gsapMultipleTimelines}
               unsupportedTimelinePattern={gsapUnsupportedTimelinePattern}
@@ -566,6 +555,7 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
               onUpdateArcSegment={onUpdateArcSegment}
               onUnroll={onUnroll}
               onUpdateKeyframeEase={onUpdateKeyframeEase}
+              onUpdateSegmentEase={onUpdateSegmentEase}
               onSetAllKeyframeEases={onSetAllKeyframeEases}
             />
           )}
@@ -577,6 +567,7 @@ export const PropertyPanel = memo(function PropertyPanel(props: PropertyPanelPro
             styles={styles}
             assets={assets}
             onSetStyle={onSetStyle}
+            onSetHtmlAttribute={props.onSetHtmlAttribute}
             onImportAssets={onImportAssets}
             gsapBorderRadius={gsapBorderRadius}
           />

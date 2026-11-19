@@ -1,6 +1,126 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import { formatRenderSummaryDetail } from "./format.js";
+import {
+  errorBox,
+  formatBytes,
+  formatDuration,
+  formatRenderPipelineDetail,
+  formatRenderSummaryDetail,
+  formatScreenshotFallbackHint,
+  resolvePrintedCaptureMode,
+} from "./format.js";
+
+describe("formatRenderPipelineDetail", () => {
+  it("names the capture path, gpu mode and each stage in pipeline order", () => {
+    const line = formatRenderPipelineDetail({
+      captureMode: "screenshot",
+      browserGpuMode: "software",
+      stages: { encodeMs: 5767, captureFrameMs: 22856, compileMs: 685, assembleMs: 509 },
+    });
+    expect(line).toBe(
+      "screenshot capture · software gpu · compile 0.7s · capture 22.9s · encode 5.8s · assemble 0.5s",
+    );
+  });
+
+  it("skips fields that were never measured and returns nothing for an empty summary", () => {
+    expect(formatRenderPipelineDetail({ captureMode: "beginframe", stages: {} })).toBe(
+      "beginframe capture",
+    );
+    expect(formatRenderPipelineDetail({ stages: {} })).toBeUndefined();
+  });
+
+  it("keeps a measured 0 ms stage instead of dropping it", () => {
+    // a silent composition still records audioProcessMs = 0
+    expect(formatRenderPipelineDetail({ stages: { audioProcessMs: 0 } })).toBe("audio 0.0s");
+  });
+
+  it("labels encode as overlapped when the streaming encoder ran", () => {
+    expect(
+      formatRenderPipelineDetail({
+        streamingEncode: true,
+        stages: { captureFrameMs: 10_000, encodeMs: 4_000 },
+      }),
+    ).toBe("capture 10.0s · encode (during capture) 4.0s");
+  });
+});
+
+describe("resolvePrintedCaptureMode", () => {
+  it("prefers the session mode, including a joined fallback, over observability", () => {
+    expect(resolvePrintedCaptureMode("drawelement", "screenshot")).toBe("drawelement");
+    expect(resolvePrintedCaptureMode("beginframe|screenshot", "screenshot")).toBe(
+      "beginframe|screenshot",
+    );
+  });
+
+  it("treats the aggregator's unknown sentinel as absent and uses observability", () => {
+    expect(resolvePrintedCaptureMode("unknown", "screenshot")).toBe("screenshot");
+    expect(resolvePrintedCaptureMode(undefined, "beginframe")).toBe("beginframe");
+    expect(resolvePrintedCaptureMode("unknown", undefined)).toBeUndefined();
+  });
+});
+
+describe("formatScreenshotFallbackHint", () => {
+  const slow = {
+    captureMode: "screenshot",
+    browserGpuMode: "software" as const,
+    requestedGpuMode: "auto" as const,
+    platform: "linux" as const,
+  };
+
+  it("explains Linux software screenshot capture after automatic GPU selection", () => {
+    expect(formatScreenshotFallbackHint(slow)).toContain("BeginFrame did not run");
+    expect(formatScreenshotFallbackHint({ ...slow, platform: "darwin" })).toBeUndefined();
+    expect(formatScreenshotFallbackHint({ ...slow, captureMode: "beginframe" })).toBeUndefined();
+  });
+
+  it.each(["auto", "hardware"] as const)(
+    "explains hardware screenshot capture when GPU mode %s was requested",
+    (requestedGpuMode) => {
+      const hint = formatScreenshotFallbackHint({
+        ...slow,
+        browserGpuMode: "hardware",
+        requestedGpuMode,
+      });
+
+      expect(hint).toContain("BeginFrame did not run");
+      expect(hint).toContain("probe");
+      expect(hint).toContain("fewer --workers");
+      expect(hint).not.toContain("software GL");
+    },
+  );
+
+  it.each(["beginframe", "drawelement", "beginframe|screenshot", undefined])(
+    "does not claim BeginFrame was absent for capture mode %s",
+    (captureMode) => {
+      expect(
+        formatScreenshotFallbackHint({ ...slow, captureMode, browserGpuMode: "hardware" }),
+      ).toBeUndefined();
+    },
+  );
+
+  it.each(["darwin", "win32"] as const)("stays silent on %s", (platform) => {
+    expect(
+      formatScreenshotFallbackHint({ ...slow, platform, browserGpuMode: "hardware" }),
+    ).toBeUndefined();
+  });
+
+  it("stays silent when software gpu was requested, as --docker and --no-browser-gpu do", () => {
+    expect(formatScreenshotFallbackHint({ ...slow, requestedGpuMode: "software" })).toBeUndefined();
+    expect(formatScreenshotFallbackHint({ ...slow, requestedGpuMode: undefined })).toBeUndefined();
+    expect(
+      formatScreenshotFallbackHint({
+        ...slow,
+        browserGpuMode: "hardware",
+        requestedGpuMode: "software",
+      }),
+    ).toBeUndefined();
+  });
+
+  it("stays silent when the observed GPU mode is unavailable", () => {
+    expect(formatScreenshotFallbackHint({ ...slow, browserGpuMode: undefined })).toBeUndefined();
+    expect(formatScreenshotFallbackHint({ ...slow, browserGpuMode: "unknown" })).toBeUndefined();
+  });
+});
 
 describe("formatRenderSummaryDetail", () => {
   it("shows the output video length as the primary figure and labels render time", () => {
@@ -34,9 +154,73 @@ describe("formatRenderSummaryDetail", () => {
     expect(detail).not.toContain("video");
   });
 
+  it("shows the video length for an HLS playlist directory", () => {
+    const detail = formatRenderSummaryDetail({
+      elapsedMs: 12_000,
+      isDirectory: true,
+      playlistDirectory: true,
+      frameCount: 120,
+      outputDurationSeconds: 4,
+    });
+    expect(detail).toBe("4.0s video · rendered in 12.0s");
+  });
+
   it("does not crash and shows only render time for a directory with no frame count", () => {
     expect(formatRenderSummaryDetail({ elapsedMs: 1_000, isDirectory: true })).toBe(
       "rendered in 1.0s",
     );
+  });
+});
+
+describe("formatDuration", () => {
+  it("shows seconds with one decimal under a minute", () => {
+    expect(formatDuration(0)).toBe("0.0s");
+    expect(formatDuration(1234)).toBe("1.2s");
+    expect(formatDuration(59_940)).toBe("59.9s");
+  });
+
+  it("carries a rounded-up 60.0 seconds into the next minute", () => {
+    expect(formatDuration(59_960)).toBe("1m 0.0s");
+    expect(formatDuration(119_970)).toBe("2m 0.0s");
+  });
+
+  it("splits minutes and seconds past one minute", () => {
+    expect(formatDuration(60_000)).toBe("1m 0.0s");
+    expect(formatDuration(83_400)).toBe("1m 23.4s");
+  });
+});
+
+describe("formatBytes", () => {
+  it("steps up a unit when rounding reaches the next one", () => {
+    expect(formatBytes(1023)).toBe("1023 B");
+    expect(formatBytes(1536)).toBe("1.5 KB");
+    expect(formatBytes(1_048_575)).toBe("1.0 MB");
+    expect(formatBytes(1_048_576)).toBe("1.0 MB");
+  });
+});
+
+describe("errorBox", () => {
+  it("prints control characters in its title, hint and suggestion as visible escapes", () => {
+    const said: string[] = [];
+    const spy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      said.push(args.map(String).join(" "));
+    });
+    try {
+      errorBox(
+        "Load \u001b]0;t\u0007",
+        "page threw \u001b[2J\u009b\nsecond line",
+        "run \u001b[9;9H",
+      );
+    } finally {
+      spy.mockRestore();
+    }
+    const text = said.join("\n");
+    expect(text).toContain("Load \\x1b]0;t\\x07");
+    expect(text).toContain("page threw \\x1b[2J\\x9b");
+    expect(text).toContain("   second line");
+    expect(text).toContain("run \\x1b[9;9H");
+    for (const control of ["\u001b]", "\u0007", "\u009b", "\u001b[2J", "\u001b[9;9H"]) {
+      expect(text).not.toContain(control);
+    }
   });
 });

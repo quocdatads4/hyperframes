@@ -15,37 +15,50 @@ describe("release channel validation", () => {
     assert.equal(expectedDistTag("0.4.24-alpha.1"), "alpha");
   });
 
-  it("allows stable tags reachable from main", () => {
+  it("allows a stable release from a reviewed release PR", () => {
     const errors = validateReleaseChannel({
       version: "0.4.24",
       distTag: "latest",
-      eventName: "push",
-      prHeadRef: "",
-      remoteBranches: ["origin/main", "origin/next"],
+      source: "release-pr",
+      releaseRef: "release/v0.4.24",
+      remoteBranches: [],
     });
 
     assert.deepEqual(errors, []);
   });
 
-  it("blocks stable tags that only live on prerelease branches", () => {
+  it("blocks stable tag pushes even when reachable from main", () => {
     const errors = validateReleaseChannel({
       version: "0.4.24",
       distTag: "latest",
-      eventName: "push",
-      prHeadRef: "",
-      remoteBranches: ["origin/next"],
+      source: "tag",
+      releaseRef: "",
+      remoteBranches: ["origin/main", "origin/next"],
     });
 
     assert.equal(errors.length, 1);
-    assert.match(errors[0], /latest releases must be reachable from origin\/main/);
+    assert.match(errors[0], /Stable tag publishing is disabled/);
+  });
+
+  it("blocks stable tags that only live on an unmerged release branch", () => {
+    const errors = validateReleaseChannel({
+      version: "0.4.24",
+      distTag: "latest",
+      source: "tag",
+      releaseRef: "",
+      remoteBranches: ["origin/release/v0.4.24"],
+    });
+
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Stable tag publishing is disabled/);
   });
 
   it("allows alpha tags reachable from next", () => {
     const errors = validateReleaseChannel({
       version: "0.4.24-alpha.1",
       distTag: "alpha",
-      eventName: "push",
-      prHeadRef: "",
+      source: "tag",
+      releaseRef: "",
       remoteBranches: ["origin/next"],
     });
 
@@ -56,8 +69,8 @@ describe("release channel validation", () => {
     const errors = validateReleaseChannel({
       version: "0.4.24-alpha.1",
       distTag: "alpha",
-      eventName: "push",
-      prHeadRef: "",
+      source: "tag",
+      releaseRef: "",
       remoteBranches: ["origin/main"],
     });
 
@@ -69,8 +82,8 @@ describe("release channel validation", () => {
     const errors = validateReleaseChannel({
       version: "0.4.24-alpha.1",
       distTag: "latest",
-      eventName: "push",
-      prHeadRef: "",
+      source: "tag",
+      releaseRef: "",
       remoteBranches: ["origin/next"],
     });
 
@@ -82,14 +95,26 @@ describe("release channel validation", () => {
     const errors = validateReleaseChannel({
       version: "0.4.24-alpha.1",
       distTag: "alpha",
-      eventName: "pull_request",
-      prHeadRef: "release/v0.4.24-alpha.1",
+      source: "release-pr",
+      releaseRef: "release/v0.4.24-alpha.1",
       remoteBranches: [],
     });
 
     assert.equal(errors.length, 2);
     assert.match(errors.join("\n"), /release\/vX\.Y\.Z/);
     assert.match(errors.join("\n"), /stable releases only/);
+  });
+
+  it("rejects an unknown release source", () => {
+    const errors = validateReleaseChannel({
+      version: "0.4.24",
+      distTag: "latest",
+      source: "workflow_dispatch",
+      releaseRef: "",
+      remoteBranches: ["origin/main"],
+    });
+
+    assert.deepEqual(errors, ['Unsupported release source "workflow_dispatch".']);
   });
 
   it("normalizes git branch output", () => {

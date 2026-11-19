@@ -50,6 +50,9 @@ export interface RenderToCloudRunOptions {
   projectDir?: string;
   /** Re-use an existing `deploySite` upload (skips tar+GCS upload). */
   siteHandle?: SiteHandle;
+  /** Passed to {@link deploySite} when this call uploads the project, with its left-out notices. */
+  includeOutsideFiles?: boolean;
+  onNotice?: (message: string) => void;
   /** Validated `SerializableDistributedRenderConfig` (no logger / abortSignal). */
   config: SerializableDistributedRenderConfig;
   /** GCS bucket from the Terraform output (`render_bucket_name`). */
@@ -97,8 +100,20 @@ export interface RenderHandle {
   startedAt: string;
 }
 
+function rejectUnsupportedLegacyPlanProtocol(opts: object): void {
+  const planProtocol = Reflect.get(opts, "planProtocol");
+  if (planProtocol === undefined || planProtocol === "v2") return;
+
+  const error = new Error(
+    `[renderToCloudRun] planProtocol is no longer configurable; expected "v2" or absent, got ${JSON.stringify(planProtocol)}`,
+  );
+  error.name = "PLAN_PROTOCOL_UNSUPPORTED";
+  throw error;
+}
+
 // fallow-ignore-next-line complexity
 export async function renderToCloudRun(opts: RenderToCloudRunOptions): Promise<RenderHandle> {
+  rejectUnsupportedLegacyPlanProtocol(opts);
   validateDistributedRenderConfig(opts.config);
 
   if (!opts.bucketName) throw new Error("[renderToCloudRun] bucketName is required");
@@ -134,6 +149,8 @@ export async function renderToCloudRun(opts: RenderToCloudRunOptions): Promise<R
     (await deploySite({
       projectDir: opts.projectDir as string,
       bucketName: opts.bucketName,
+      onNotice: opts.onNotice,
+      includeOutsideFiles: opts.includeOutsideFiles,
       storage: opts.storage,
     }));
 
@@ -144,6 +161,7 @@ export async function renderToCloudRun(opts: RenderToCloudRunOptions): Promise<R
     OutputGcsUri: outputGcsUri,
     ServiceUrl: opts.serviceUrl,
     Config: opts.config,
+    PlanProtocol: "v2",
   };
 
   // Reject oversize input client-side. Cloud Workflows caps the execution

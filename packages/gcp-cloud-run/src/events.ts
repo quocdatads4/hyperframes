@@ -6,7 +6,7 @@
  * dispatches on the `Action` field of the JSON request body. Each action
  * maps 1:1 onto one of the three OSS distributed primitives:
  *
- *   "plan"        → `plan(projectDir, config, planDir)`        (Activity A)
+ *   "plan"        → `planV2WithPublisher(...)`                (Activity A)
  *   "renderChunk" → `renderChunk(planDir, chunkIndex, output)` (Activity B)
  *   "assemble"    → `assemble(planDir, chunkPaths, audio, out)` (Activity C)
  *
@@ -31,7 +31,6 @@ export type { SerializableDistributedRenderConfig } from "@hyperframes/producer/
 
 /** Discriminator for the three roles the one Cloud Run image fulfills. */
 export type CloudRunAction = "plan" | "renderChunk" | "assemble";
-
 /**
  * Top-level shape of any request body the handler may receive.
  *
@@ -56,13 +55,16 @@ export interface PlanEvent {
   PlanOutputGcsPrefix: string;
   /** `DistributedRenderConfig` minus runtime-only fields (logger, abortSignal). */
   Config: SerializableDistributedRenderConfig;
+  /** Optional for direct handler callers; the SDK and orchestrator send it explicitly. */
+  PlanProtocol?: "v2";
 }
+
+/** Compatibility alias for the only supported plan event. */
+export type PlanV2Event = PlanEvent;
 
 /** Activity B: fetch planDir, render one chunk, upload result. */
 export interface RenderChunkEvent {
   Action: "renderChunk";
-  /** GCS URI of the plan tar produced by a PlanEvent invocation. */
-  PlanGcsUri: string;
   /**
    * `PlanResult.planHash` from the Plan invocation. The handler verifies
    * this against the untarred planDir's `plan.json` before invoking the
@@ -77,17 +79,19 @@ export interface RenderChunkEvent {
   ChunkOutputGcsPrefix: string;
   /** Output container format from the plan's encoder.json; drives file vs frame-dir handling. */
   Format: DistributedFormat;
+  PlanProtocol?: "v2";
+  PlanV2ManifestGcsUri: string;
+  PlanV2ArtifactGcsPrefix: string;
 }
+
+/** Compatibility alias for the only supported chunk event. */
+export type RenderChunkV2Event = RenderChunkEvent;
 
 /** Activity C: fetch planDir + all chunks + audio, assemble, upload final. */
 export interface AssembleEvent {
   Action: "assemble";
-  /** GCS URI of the plan tar produced by a PlanEvent invocation. */
-  PlanGcsUri: string;
   /** GCS URIs of every chunk, ordered by chunk index. Length must equal `chunkCount`. */
   ChunkGcsUris: string[];
-  /** GCS URI of the planDir's `audio.aac` if the composition has audio; `null` otherwise. */
-  AudioGcsUri: string | null;
   /** Final output GCS URI (`gs://bucket/key.mp4`). */
   OutputGcsUri: string;
   /** Output container format; drives file vs frame-dir handling. */
@@ -102,27 +106,41 @@ export interface AssembleEvent {
    * unset preserves current `-c copy` behavior.
    */
   Cfr?: boolean;
+  PlanProtocol?: "v2";
+  PlanV2ManifestGcsUri: string;
+  PlanV2ArtifactGcsPrefix: string;
+  PlanHash: string;
+  /** V2 audio is a manifest artifact materialized only for the assembler. */
+  AudioGcsUri: null;
 }
+
+/** Compatibility alias for the only supported assemble event. */
+export type AssembleV2Event = AssembleEvent;
 
 // ── Result types — kept small to fit Cloud Workflows step budgets ────────────
 
 /** Result of a `plan` invocation. Carries enough to size the Map(N) state. */
 export interface PlanResultBody {
   Action: "plan";
-  PlanGcsUri: string;
   PlanHash: string;
   ChunkCount: number;
   TotalFrames: number;
-  Fps: 24 | 30 | 60;
+  Fps: SerializableDistributedRenderConfig["fps"];
   Width: number;
   Height: number;
   Format: DistributedFormat;
   HasAudio: boolean;
-  AudioGcsUri: string | null;
   FfmpegVersion: string;
   ProducerVersion: string;
   DurationMs: number;
+  PlanProtocol: "v2";
+  PlanV2ManifestGcsUri: string;
+  PlanV2ArtifactGcsPrefix: string;
+  AudioGcsUri: null;
 }
+
+/** Compatibility alias for the only supported plan result. */
+export type PlanV2ResultBody = PlanResultBody;
 
 /** Result of a `renderChunk` invocation. Sized ≤200 bytes. */
 export interface RenderChunkResultBody {
@@ -131,6 +149,8 @@ export interface RenderChunkResultBody {
   ChunkIndex: number;
   Sha256: string;
   FramesEncoded: number;
+  /** Effective engine mode after browser probing. Emitted by current handlers. */
+  CaptureMode?: "beginframe" | "screenshot" | "drawelement";
   DurationMs: number;
 }
 

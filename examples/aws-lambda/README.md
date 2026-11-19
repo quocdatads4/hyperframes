@@ -91,6 +91,17 @@ EOF
 
 The Step Functions execution kicks off Plan, fans out RenderChunk via
 the Map state, and finally Assemble. Final mp4 lands at `OutputS3Uri`.
+Plan v2 is the only supported plan transport. It uses separate manifest and
+content-addressed artifact locators throughout the workflow.
+
+### Upgrading an existing stack
+
+Pause new renders and let active Step Functions executions drain before the
+upgrade. Redeploy the Lambda handler and this state machine (or the matching
+CDK construct) from the same package version before upgrading the application
+that calls `renderToLambda`. The new SDK sends explicit v2, while older
+infrastructure may lack the Plan v2-only contract. Keep the application on its
+previous package version until the infrastructure redeploy completes.
 
 ## Local invocation
 
@@ -107,10 +118,11 @@ sam validate
 sam local invoke RenderFunction --event sample-events/plan.json
 ```
 
-The `sample-events/` directory ships small JSON payloads for each of the
-three actions. They reference fake S3 URIs — useful for sanity-checking
-the handler's dispatch logic; not for full end-to-end testing (real S3
-calls require credentials and a project zip to actually exist).
+The `sample-events/` directory ships default-v2 events with `PlanProtocol`
+omitted and `*-v2.json` events that stamp v2 explicitly. They reference fake S3 URIs —
+useful for sanity-checking the handler's dispatch logic; not for full
+end-to-end testing (real S3 calls require credentials and a project zip to
+actually exist).
 
 ## End-to-end smoke + benchmark
 
@@ -119,7 +131,7 @@ the architecture works on a deployed Lambda — use the local smoke
 script:
 
 ```bash
-# All defaults (mp4-h264-sdr fixture, chunk counts 2/4/8, PSNR >= 40 dB).
+# Defaults use Plan v2 and the fixture's meta.json minPsnr (30 dB for mp4-h264-sdr).
 ./scripts/smoke.sh
 
 # Customised:
@@ -141,7 +153,16 @@ per-run stack name, renders the fixture at each chunk count via the
 Step Functions state machine, PSNR-compares against the in-process
 baseline (which is git-LFS tracked under
 `packages/producer/tests/distributed/<fixture>/output/`), captures
-per-execution Step Functions history, and tears the stack down.
+per-execution Step Functions history, and tears the stack down. Encoded MP4
+SHA equality can be required with `--require-encoded-sha-equal`. The script
+assigns unique function/state-machine names, uses a
+dedicated temporary SAM artifact bucket, and removes render objects,
+retained buckets, the implicit Lambda log group, and deployment artifacts
+on teardown. Suspended-version buckets are purged in 1,000-entry batches,
+including concrete versions, null versions, and delete markers. It then
+verifies that the stack, both buckets, Lambda, state-machine, and both log
+groups are absent; an otherwise-successful run fails if cleanup cannot be
+proven.
 
 **Wall-clock methodology caveat (`eval.sh` only).** `eval.sh` reports a
 local-vs-Lambda "speedup" column. The local timing includes `bun` +
@@ -162,9 +183,9 @@ spend is roughly $0.10-$0.20 per pass before S3 transfer. Lower
 
 Outputs land under `<repo-root>/lambda-smoke-artifacts/`:
 
-- `results.json` — `chunkCount × wallClockMs × psnrAvgDb`
-- `renders/N<N>-output.mp4` — each rendered chunk count
-- `renders/N<N>-history.json` — full Step Functions execution history
+- generated results summary — `chunkCount × wallClockMs × psnrAvgDb`
+- `renders/v2-N<N>-output.mp4` — each rendered variant
+- `renders/v2-N<N>-history.json` — full Step Functions execution history
 
 Prerequisites: `aws` (v2), `sam` (≥ 1.100), `bun` (≥ 1.3), `ffmpeg`,
 `jq`, `zip`. AWS credentials come from the standard resolution chain
@@ -179,7 +200,7 @@ with `--profile <name>` or `AWS_PROFILE=<name>`.
 | `LambdaMemoryMb`                | `10240`       | Lambda memory; Lambda allocates CPU proportionally. 10 GB recommended for 1080p.                |
 | `LambdaTimeoutSec`              | `900`         | Per-invocation timeout. 15 min is Lambda's hard ceiling.                                        |
 | `ReservedConcurrency`           | `-1`          | Hard cap on simultaneous Lambda invocations. `-1` = unreserved. Set to e.g. `50` to bound cost. |
-| `ChromeSource`                  | `sparticuz`   | Must match the `--source=` flag passed to `build-zip.ts`.                                       |
+| `ChromeSource`                  | `sparticuz`   | Only `sparticuz`: a ZIP built with `--source=chrome-headless-shell` is over Lambda's limit.     |
 | `ChunkInvocationAlarmThreshold` | `1000`        | CloudWatch alarm threshold (RenderChunk invocations per hour).                                  |
 
 ## Cleanup

@@ -1,17 +1,26 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  applyTimelineMoveAttributes,
   applyTimelineStackingReorder,
   buildTimelineMoveTimingPatch,
+  buildTimelineResizeTimingPatch,
   deleteSelectedKeyframes,
   extendRootDurationIfNeeded,
   patchIframeDomTiming,
+  persistElementAttribute,
   persistTimelineBatchEdit,
+  persistTimelineEdit,
+  readTargetAttribute,
   type PersistTimelineBatchChange,
 } from "./timelineEditingHelpers";
+import { ensureHfIds } from "@hyperframes/parsers/hf-ids";
+import { parseTimelineFromDOM } from "../player/lib/timelineDOM";
 import type { TimelineElement } from "../player/store/playerStore";
+import { readMediaOffsetSeconds } from "@hyperframes/parsers/media-duration";
 import { usePlayerStore } from "../player/store/playerStore";
 import type { CommitMutationOptions } from "./gsapScriptCommitTypes";
+import { timelineKeyframeSelectionKey } from "../player/components/timelineKeyframeIdentity";
 
 afterEach(() => {
   usePlayerStore.getState().reset();
@@ -213,6 +222,26 @@ describe("patchIframeDomTiming", () => {
 
     expect([...cards!].map((card) => card.dataset.start)).toEqual(["1", "9"]);
   });
+
+  it("makes a runtime-stamped element authored on any timing edit, a lane move included", () => {
+    const iframe = makeIframeWith(`
+      <div data-composition-id="root">
+        <div id="title" data-start="0" data-duration="10" data-hf-autostamped="1"></div>
+        <div id="badge" data-start="0" data-duration="10" data-hf-autostamped="1"></div>
+      </div>
+    `);
+    const doc = iframe.contentDocument!;
+    const at = (id: string) => el({ id, tag: "div", domId: id, sourceFile: "index.html" });
+
+    patchIframeDomTiming(iframe, at("title"), [
+      ["data-start", "4"],
+      ["data-duration", "2"],
+    ]);
+    patchIframeDomTiming(iframe, at("badge"), [["data-track-index", "3"]]);
+
+    expect(doc.getElementById("title")?.hasAttribute("data-hf-autostamped")).toBe(false);
+    expect(doc.getElementById("badge")?.hasAttribute("data-hf-autostamped")).toBe(false);
+  });
 });
 
 describe("extendRootDurationIfNeeded", () => {
@@ -225,6 +254,61 @@ describe("extendRootDurationIfNeeded", () => {
     expect(extendRootDurationIfNeeded(5)).toBe(false);
     expect(extendRootDurationIfNeeded(3)).toBe(false);
     expect(usePlayerStore.getState().duration).toBe(5);
+  });
+});
+
+describe("buildTimelineMoveTimingPatch", () => {
+  it.each([
+    { root: ' data-duration="20"', length: 'data-composition-id="c" data-duration="8"' },
+    { root: "", length: 'data-composition-id="c">' },
+  ])(
+    "parses the saved file once to move a clip and sync the length (root$root)",
+    ({ root, length }) => {
+      const source = `<div data-composition-id="c"${root}><div id="a" class="clip" data-start="1" data-duration="3"></div></div>`;
+      const parse = vi.spyOn(DOMParser.prototype, "parseFromString");
+      try {
+        const patched = buildTimelineMoveTimingPatch(source, { id: "a" }, 5, 3);
+
+        expect(patched).toContain('data-start="5"');
+        expect(patched).toContain(length);
+        expect(parse).toHaveBeenCalledTimes(1);
+      } finally {
+        parse.mockRestore();
+      }
+    },
+  );
+});
+
+describe("buildTimelineResizeTimingPatch", () => {
+  it("moves a source-only in-point by the caller's own start change", () => {
+    const source = `<div id="root"><video id="a" class="clip" data-start="5" data-duration="3" data-media-start="0.337"></video></div>`;
+    const element = el({ id: "a", tag: "video", domId: "a", start: 5, duration: 3 });
+    const patched = buildTimelineResizeTimingPatch(source, { id: "a" }, element, {
+      start: 3,
+      duration: 5,
+      playbackStart: undefined,
+    });
+    expect(patched).toContain('data-media-start="0"');
+  });
+});
+
+describe("buildTimelineResizeTimingPatch — source in-point read as playback reads it", () => {
+  it.each([
+    ['data-playback-start="-1" data-media-start="2"', 4.5, 1.5],
+    ['data-playback-start="2"', 4.5, 1.5],
+    ['data-media-start="junk"', 5.5, 0.5],
+    ['data-media-start="1.5s"', 5.5, 0.5],
+  ])("%s, head to %s", (inPoint, start, expected) => {
+    const source = `<div id="root"><video id="a" class="clip" data-start="5" data-duration="3" ${inPoint}></video></div>`;
+    const element = el({ id: "a", tag: "video", domId: "a", start: 5, duration: 3 });
+    const host = document.createElement("div");
+    host.innerHTML = buildTimelineResizeTimingPatch(source, { id: "a" }, element, {
+      start,
+      duration: 8 - start,
+      playbackStart: undefined,
+    });
+    const video = host.querySelector("#a")!;
+    expect(readMediaOffsetSeconds((name) => video.getAttribute(name))).toBe(expected);
   });
 });
 
@@ -241,7 +325,6 @@ describe("persistTimelineBatchEdit", () => {
         writes.push([path, content]);
       },
       recordEdit: async () => {},
-      domEditSaveTimestampRef: { current: 0 },
       pendingTimelineEditPathRef: { current: new Set<string>() },
     };
   }
@@ -280,6 +363,43 @@ describe("persistTimelineBatchEdit", () => {
     vi.unstubAllGlobals();
   });
 
+  it("syncs each file's root duration once, landing where per-member sync would", async () => {
+    const source = `<div id="root" data-composition-id="main" data-duration="4"><video id="a" class="clip" data-start="1" data-duration="1"></video><video id="b" class="clip" data-start="2" data-duration="1"></video><video id="c" class="clip" data-start="3" data-duration="1"></video></div>`;
+    const members = ["a", "b", "c"].map((id, i) => ({
+      element: el({ id, tag: "video", domId: id, start: i + 1, duration: 1 }),
+      buildPatches: (original: string, target: Parameters<typeof applyTimelineMoveAttributes>[1]) =>
+        applyTimelineMoveAttributes(original, target, i + 6, 1),
+    }));
+    stubReadFileContent(source);
+    const writes: Array<[string, string]> = [];
+    await persistTimelineBatchEdit(batchInput(members, writes));
+
+    const perMember = members.reduce(
+      (current, { element }, i) =>
+        buildTimelineMoveTimingPatch(current, { id: element.id }, i + 6, 1),
+      source,
+    );
+    expect(writes).toEqual([["index.html", perMember]]);
+    expect(perMember).toContain('data-duration="9"');
+  });
+
+  it("files the move under every clip it moved, by identity and by the name the clip wears", async () => {
+    stubReadFileContent(SOURCE);
+    const recordEdit = vi.fn(async () => {});
+    await persistTimelineBatchEdit({
+      ...batchInput([moveMember("a", 3, 0, 0), moveMember("b", 4, 1, 1)], []),
+      recordEdit,
+    });
+    expect(recordEdit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        targets: [
+          { file: "index.html", id: "a", name: "a" },
+          { file: "index.html", id: "b", name: "b" },
+        ],
+      }),
+    );
+  });
+
   it("skips no-op members instead of aborting the batch (track-insert renumber)", async () => {
     // A track-insert renumber can include a member whose attributes already
     // hold the target values — its patch is string-identical. The batch must
@@ -314,6 +434,111 @@ describe("persistTimelineBatchEdit", () => {
     ).rejects.toThrow("Unable to patch timeline element ghost in index.html");
     expect(writes).toHaveLength(0);
   });
+
+  it("names which lookups a missing clip had, never their values", async () => {
+    stubReadFileContent(SOURCE);
+    // As the timeline builds them: a clip with an id also carries `#id` as its selector.
+    const missing = (element: Partial<TimelineElement>) => {
+      const change = moveMember("ghost", 3, 0, 2);
+      change.element = { ...change.element, ...element };
+      return persistTimelineBatchEdit(batchInput([change], []));
+    };
+    await expect(
+      missing({
+        domId: "intro__hf2",
+        hfId: "hf-zz9q",
+        selector: "#intro__hf2",
+        sourceFile: "compositions/intro.html",
+      }),
+    ).rejects.toThrow("(by hf-id, runtime-renamed id; file from the clip)");
+    await expect(missing({ selector: "#ghost" })).rejects.toThrow("(by id; no file on the clip)");
+    await expect(
+      missing({ domId: undefined, selector: ".caption", selectorIndex: 4 }),
+    ).rejects.toThrow("(by class; no file on the clip)");
+    await expect(
+      missing({ domId: undefined, selector: '[data-composition-id="intro__hf2"]' }),
+    ).rejects.toThrow("(by runtime-renamed composition id; no file on the clip)");
+  });
+});
+
+describe("persistTimelineEdit", () => {
+  const SOURCE = `<div id="root"><video id="a" class="clip" data-start="1" data-duration="3"></video></div>`;
+
+  async function runEdit(id: string, start: number) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, json: async () => ({ content: SOURCE }) })),
+    );
+    const writes: Array<[string, string]> = [];
+    const pending = new Set<string>();
+    const element = el({ id, tag: "video", domId: id, start: 1, duration: 3 });
+    const done = persistTimelineEdit({
+      projectId: "p1",
+      element,
+      activeCompPath: "index.html",
+      label: "Resize timeline clip",
+      buildPatches: (original, target) =>
+        buildTimelineResizeTimingPatch(original, target, element, {
+          start,
+          duration: 3,
+          playbackStart: undefined,
+        }),
+      writeProjectFile: async (path, content) => {
+        writes.push([path, content]);
+      },
+      recordEdit: async () => {},
+      pendingTimelineEditPathRef: { current: pending },
+    });
+    return { done, writes, pending };
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("saves nothing and says nothing when the clip already holds the values (a resize that lands where it began)", async () => {
+    // 1.0000001 is a different number from the clip's 1, so the gesture sees a change; the file writes "1" either way.
+    const { done, writes, pending } = await runEdit("a", 1.0000001);
+    await expect(done).resolves.toBeUndefined();
+    expect(writes).toHaveLength(0);
+    expect(pending.size).toBe(0);
+  });
+
+  it("writes a real change and marks its file", async () => {
+    const { done, writes, pending } = await runEdit("a", 2);
+    await done;
+    expect(writes).toHaveLength(1);
+    expect(writes[0]![1]).toContain('data-start="2"');
+    expect([...pending]).toEqual(["index.html"]);
+  });
+
+  it("files the edit under the clip it changed, by identity and by the name the clip wears", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, json: async () => ({ content: SOURCE }) })),
+    );
+    const recordEdit = vi.fn(async () => {});
+    const element = el({ id: "a", tag: "video", domId: "a", start: 1, duration: 3 });
+    await persistTimelineEdit({
+      projectId: "p1",
+      element,
+      activeCompPath: "index.html",
+      label: "Move timeline clip",
+      buildPatches: (original, target) => buildTimelineMoveTimingPatch(original, target, 2, 3, 0),
+      writeProjectFile: async () => {},
+      recordEdit,
+      pendingTimelineEditPathRef: { current: new Set<string>() },
+    });
+    expect(recordEdit).toHaveBeenCalledWith(
+      expect.objectContaining({ targets: [{ file: "index.html", id: "a", name: "a" }] }),
+    );
+  });
+
+  it("still throws for a clip the file does not hold", async () => {
+    const { done, writes } = await runEdit("ghost", 2);
+    await expect(done).rejects.toThrow("Unable to patch timeline element ghost in index.html");
+    expect(writes).toHaveLength(0);
+  });
 });
 
 describe("deleteSelectedKeyframes", () => {
@@ -341,5 +566,214 @@ describe("deleteSelectedKeyframes", () => {
     expect(options[0]).not.toHaveProperty("softReload");
     expect(options[1]).not.toHaveProperty("softReload");
     expect(options[2]).not.toHaveProperty("skipReload");
+  });
+
+  it("deletes two expanded lanes through their own animation and tween percentages", () => {
+    usePlayerStore.setState({
+      selectedElementId: "card",
+      selectedKeyframes: new Set([
+        timelineKeyframeSelectionKey("card", {
+          percentage: 30,
+          tweenPercentage: 20,
+          propertyGroup: "position",
+          animationId: "card-position",
+        }),
+        timelineKeyframeSelectionKey("card", {
+          percentage: 70,
+          tweenPercentage: 80,
+          propertyGroup: "visual",
+          animationId: "card-visual",
+        }),
+      ]),
+    });
+    const handleGsapRemoveKeyframe =
+      vi.fn<(animId: string, pct: number, options?: Partial<CommitMutationOptions>) => void>();
+
+    deleteSelectedKeyframes({
+      selectedGsapAnimations: [
+        { id: "card-position", keyframes: {} },
+        { id: "card-visual", keyframes: {} },
+      ],
+      handleGsapRemoveKeyframe,
+    });
+
+    expect(handleGsapRemoveKeyframe).toHaveBeenCalledTimes(2);
+    expect(
+      handleGsapRemoveKeyframe.mock.calls.map(([animationId, percentage]) => [
+        animationId,
+        percentage,
+      ]),
+    ).toEqual([
+      ["card-position", 20],
+      ["card-visual", 80],
+    ]);
+    expect(handleGsapRemoveKeyframe.mock.calls[0]?.[2]).toEqual(
+      expect.objectContaining({ skipReload: true }),
+    );
+    expect(handleGsapRemoveKeyframe.mock.calls[1]?.[2]).toEqual(
+      expect.objectContaining({ softReload: true }),
+    );
+  });
+
+  it("drops keyframes that belong to other elements", () => {
+    // A stale selection from a previously active element must not delete
+    // anything on the element that is active now.
+    usePlayerStore.setState({
+      selectedElementId: "card",
+      selectedKeyframes: new Set([
+        timelineKeyframeSelectionKey("card", {
+          percentage: 30,
+          tweenPercentage: 20,
+          propertyGroup: "position",
+          animationId: "card-position",
+        }),
+        timelineKeyframeSelectionKey("other", {
+          percentage: 70,
+          tweenPercentage: 80,
+          propertyGroup: "position",
+          animationId: "card-position",
+        }),
+      ]),
+    });
+    const handleGsapRemoveKeyframe =
+      vi.fn<(animId: string, pct: number, options?: Partial<CommitMutationOptions>) => void>();
+
+    deleteSelectedKeyframes({
+      selectedGsapAnimations: [{ id: "card-position", keyframes: {} }],
+      handleGsapRemoveKeyframe,
+    });
+
+    expect(handleGsapRemoveKeyframe).toHaveBeenCalledTimes(1);
+    expect(handleGsapRemoveKeyframe.mock.calls[0]?.[1]).toBe(20);
+  });
+});
+
+describe("persistElementAttribute", () => {
+  /**
+   * The optimistic live patch used to run BEFORE the target was resolved, and
+   * only the save was wrapped in the unwind. So an unresolvable target threw
+   * with the preview holding a value that never reached disk — and the group
+   * writer's catch mirrors the live DOM into the store, so the UI reported the
+   * write as applied until a reload dropped it.
+   */
+  it("does not patch the live DOM when the target resolves to nothing", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(JSON.stringify({ content: '<body><audio id="other"></audio></body>' })),
+      );
+    const patchLive = vi.fn();
+    const writeProjectFile = vi.fn();
+
+    await expect(
+      persistElementAttribute({
+        projectId: "p",
+        targetPath: "index.html",
+        patchTarget: { id: "missing" },
+        attr: "data-volume",
+        value: "0.4",
+        label: "Set volume",
+        writeProjectFile,
+        recordEdit: vi.fn(),
+        pendingTimelineEditPathRef: { current: new Set() },
+        onFileRead: vi.fn(),
+        patchLive,
+      }),
+    ).rejects.toThrow("Unable to patch element in index.html");
+
+    expect(patchLive).not.toHaveBeenCalled();
+    expect(writeProjectFile).not.toHaveBeenCalled();
+    fetchSpy.mockRestore();
+  });
+});
+
+describe("a clip whose file has no ids yet", () => {
+  // Added outside Studio: no id, no class, and nothing has stamped the file since. The preview mints its hf-id.
+  const ON_DISK = `<div data-composition-id="main" data-start="0" data-duration="10"><img src="a.png" data-start="1" data-duration="3" data-volume="0.5"></div>`;
+  const served = () => {
+    const doc = document.implementation.createHTMLDocument("");
+    doc.body.innerHTML = ensureHfIds(ON_DISK);
+    const [clip] = parseTimelineFromDOM(doc, 10);
+    if (!clip?.hfId) throw new Error("expected the served clip to carry an hf-id");
+    return { hfId: clip.hfId };
+  };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("saves an attribute on it by the id the preview served it with", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ content: ON_DISK }))),
+    );
+    const target = served();
+    const writes: string[] = [];
+
+    await persistElementAttribute({
+      projectId: "p",
+      targetPath: "index.html",
+      patchTarget: target,
+      attr: "data-volume",
+      value: "0.9",
+      label: "Set volume",
+      writeProjectFile: async (_path, content) => void writes.push(content),
+      recordEdit: vi.fn(async () => {}),
+      pendingTimelineEditPathRef: { current: new Set() },
+      onFileRead: vi.fn(),
+      patchLive: vi.fn(),
+    });
+
+    expect(readTargetAttribute(writes[0] ?? "", target, "data-volume")).toBe("0.9");
+  });
+
+  it("reads its attribute by that id", () => {
+    expect(readTargetAttribute(ON_DISK, served(), "data-volume")).toBe("0.5");
+  });
+});
+
+describe("persistElementAttribute — unwind value", () => {
+  /**
+   * The unwind has to restore the value on DISK, not the one in the preview.
+   *
+   * Every live-write caller patches the DOM before committing (a fader drag is
+   * `setLive` per frame; hovering a preset auditions the whole chain), so by
+   * commit time the live DOM already holds the in-progress value. Reading it as
+   * `previousValue` made the unwind a no-op, and the group writer's catch —
+   * which deliberately re-mirrors the store off the live DOM — then mirrored the
+   * never-saved value: the panel agreed with the preview, and a reload dropped it.
+   */
+  it("restores the file's value, not the audition already in the live DOM", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(
+          JSON.stringify({ content: `<body><audio id="bgm" data-volume="0.25"></audio></body>` }),
+        ),
+      );
+    const patched: Array<string | null> = [];
+    const writeProjectFile = vi.fn(() => Promise.reject(new Error("save failed")));
+
+    await expect(
+      persistElementAttribute({
+        projectId: "p",
+        targetPath: "index.html",
+        patchTarget: { id: "bgm" },
+        attr: "data-volume",
+        value: "0.9",
+        label: "Set volume",
+        writeProjectFile,
+        recordEdit: vi.fn(),
+        pendingTimelineEditPathRef: { current: new Set() },
+        onFileRead: vi.fn(),
+        // The live DOM is ALREADY at the new value when the commit runs — that
+        // is what `setLive` does on every drag frame.
+        patchLive: (v) => patched.push(v),
+      }),
+    ).rejects.toThrow("save failed");
+
+    // First the optimistic write, then the unwind — back to what the FILE said.
+    expect(patched).toEqual(["0.9", "0.25"]);
+    fetchSpy.mockRestore();
   });
 });

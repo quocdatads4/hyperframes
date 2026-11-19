@@ -103,7 +103,112 @@ const kinds = (t: Array<{ prov: any }>): any[] => t.map((x) => x.prov?.kind);
 const sites = (t: Array<{ prov: any }>): any[] => t.map((x) => x.prov?.callSite);
 const iters = (t: Array<{ prov: any }>): any[] => t.map((x) => x.prov?.iteration);
 
+function hasFunctionDeclaration(ast: any): boolean {
+  return ast.body.some((node: any) => node.type === "FunctionDeclaration");
+}
+
+function expectInlinedPosition(code: string, position: Record<string, unknown>): void {
+  const { ast, tweens } = run(code);
+  expect(hasFunctionDeclaration(ast)).toBe(false);
+  expect(tweens).toHaveLength(1);
+  expect(tweens[0]!.pos).toMatchObject(position);
+}
+
+function expectHelperPreserved(code: string): void {
+  const { ast, tweens } = run(code);
+  expect(hasFunctionDeclaration(ast)).toBe(true);
+  expect(tweens).toHaveLength(1);
+  expect(tweens[0]!.prov).toBeUndefined();
+}
+
 describe("inlineComputedTimelines — helpers", () => {
+  it("binds omitted and explicit undefined arguments through identifier defaults", () => {
+    const { tweens } = run(`const tl=gsap.timeline();
+      function slam(selector, at, opts = {}) { tl.to(selector, opts, at); }
+      slam("#a", 1);
+      slam("#b", 2, undefined);`);
+    expect(tweens).toHaveLength(2);
+    expect(tweens.map((t) => t.pos.value)).toEqual([1, 2]);
+    expect(kinds(tweens)).toEqual(["helper", "helper"]);
+  });
+
+  it("treats void 0 as undefined for default binding", () => {
+    const { tweens } = run(`const tl=gsap.timeline();
+      function slam(selector, at = 7) { tl.to(selector, {}, at); }
+      slam("#a", void 0);`);
+    expect(tweens).toHaveLength(1);
+    expect(tweens[0]!.pos).toMatchObject({ type: "Literal", value: 7 });
+  });
+
+  it("binds omitted required parameters before resolving later defaults", () => {
+    expectInlinedPosition(
+      `const tl=gsap.timeline();
+      function slam(selector, at, end = at) { tl.to(selector, {}, end); }
+      slam("#a");`,
+      { type: "Identifier", name: "undefined" },
+    );
+  });
+
+  it("keeps null as the explicit argument instead of applying the default", () => {
+    const { ast } = run(`const tl=gsap.timeline();
+      function slam(selector, at, opts = {}) { tl.to(selector, opts, at); }
+      slam("#a", 1, null);`);
+    let vars: any;
+    simple(ast, {
+      CallExpression(n: any) {
+        if (tlMethod(n, "tl") === "to") vars = n.arguments[1];
+      },
+    });
+    expect(vars).toMatchObject({ type: "Literal", value: null });
+  });
+
+  it("resolves a default that only references an earlier bound parameter", () => {
+    const { tweens } = run(`const tl=gsap.timeline();
+      function slam(selector, at, end = at) { tl.to(selector, {}, end); }
+      slam("#a", 3);`);
+    expect(tweens[0]!.pos).toMatchObject({ type: "Literal", value: 3 });
+  });
+
+  it("does not treat object keys as unresolved value identifiers", () => {
+    expectInlinedPosition(
+      `const tl=gsap.timeline();
+      function slam(selector, at, opts = { at: at }) { tl.to(selector, opts, at); }
+      slam("#a", 3);`,
+      { type: "Literal", value: 3 },
+    );
+  });
+
+  it("leaves helpers with effectful or forward-reference defaults uninlined", () => {
+    const effectful = run(`const tl=gsap.timeline();
+      function slam(selector, at = Date.now()) { tl.to(selector, {}, at); }
+      slam("#a");`);
+    expect(effectful.ast.body.some((s: any) => s.type === "FunctionDeclaration")).toBe(true);
+
+    const forward = run(`const tl=gsap.timeline();
+      function slam(selector = later, later = "#a") { tl.to(selector, {}, 0); }
+      slam();`);
+    expect(forward.ast.body.some((s: any) => s.type === "FunctionDeclaration")).toBe(true);
+  });
+
+  it.each([
+    ["call", "makeOptions()"],
+    ["constructor", "new Options()"],
+    ["assignment", "(seed = 2)"],
+    ["sequence", "(seed, 2)"],
+    ["ambient member", "Math.PI"],
+  ])("leaves a helper with an unsafe %s default uninlined", (_label, unsafeDefault) => {
+    expectHelperPreserved(`const tl=gsap.timeline();
+      function slam(selector, seed, at = ${unsafeDefault}) { tl.to(selector, {}, at); }
+      slam("#a", 1);`);
+  });
+
+  it("keeps a helper declaration when any call uses spread arguments", () => {
+    expectHelperPreserved(`const tl=gsap.timeline();
+      function slam(selector, at = 0) { tl.to(selector, {}, at); }
+      const args = ["#a", 2];
+      slam(...args);`);
+  });
+
   it("expands a helper called N times, substituting positions per call", () => {
     const { tweens } = run(`const tl=gsap.timeline();
       function addCycle(at){ tl.to("#p", {}, at + 0.3); }
@@ -167,5 +272,63 @@ describe("inlineComputedTimelines — loops", () => {
       [{t:1},{t:2}].forEach((d) => { tl.to("#x", {}, d.t); });`);
     expect(tweens).toHaveLength(2);
     expect(kinds(tweens)).toEqual(["loop", "loop"]);
+  });
+});
+
+describe("inlineComputedTimelines — expansion budget", () => {
+  const fresh = (code: string): any => parse(code, { ecmaVersion: "latest" });
+  const literals = (n: number): string => `[${"1,".repeat(n)}]`;
+  const nestedFor = Array.from(
+    { length: 6 },
+    (_, i) => `for (let i${i} = 0; i${i} < 100; i${i}++) {`,
+  );
+  const nestedForEach = Array.from(
+    { length: 4 },
+    (_, i) => `${literals(200)}.forEach((e${i}) => {`,
+  );
+
+  it.each([
+    ["nested literal loops", `${nestedFor.join("")} tl.to("#x", { x: i0 }, 0); ${"}".repeat(6)}`],
+    [
+      "nested forEach over literal arrays",
+      `${nestedForEach.join("")} tl.to("#x", { x: e0 }, 0); ${"});".repeat(4)}`,
+    ],
+    // Empty bodies still allocate a block per iteration: 512 x 512 of them.
+    ["empty loop bodies", "for (let i = 0; i < 512; i++) { for (let j = 0; j < 512; j++) {} }"],
+    // A default is cloned on every call that omits its argument, so it is charged like a body.
+    [
+      "a helper whose large default is cloned on every call",
+      `function f(p = [${"{ x: 1 },".repeat(300)}]) { tl.to("#x", {}, 0); }\n${"f();".repeat(300)}`,
+    ],
+    // 10 self-calls: 10^8 copies at MAX_DEPTH. A handful of calls stays small enough to finish unbudgeted.
+    [
+      "a helper that calls itself",
+      `function f(n) { tl.to("#x", { x: n }, n); ${"f(n + 1); ".repeat(10)}} f(0);`,
+    ],
+  ])("leaves a script whose %s would expand past the budget as written", (_label, body) => {
+    const code = `const tl = gsap.timeline();\n${body}`;
+    const ast = fresh(code);
+    // An abort costs ~1 s of CPU; the unbudgeted run never finishes. The bound only has to tell them apart.
+    const started = performance.now();
+    inlineComputedTimelines(ast, "tl", litResolve);
+    expect(performance.now() - started).toBeLessThan(10_000);
+    expect(ast).toEqual(fresh(code));
+  });
+
+  it("charges a large argument for every place a helper body uses it", () => {
+    // Small body, huge argument used 40 times per call: only the substitution clones add up.
+    const big = `[${"{ x: 1 },".repeat(300)}]`;
+    const code = `const tl = gsap.timeline();\nfunction f(p) { ${"tl.to('#x', { p }, 0); ".repeat(40)} }\n${`f(${big});`.repeat(20)}`;
+    const ast = fresh(code);
+    inlineComputedTimelines(ast, "tl", litResolve);
+    expect(ast).toEqual(fresh(code));
+  });
+
+  it.each([
+    ["for-of", `for (const el of ${literals(513)}) tl.to("#x", { x: el }, 0);`],
+    ["forEach", `${literals(513)}.forEach((el) => tl.to("#x", { x: el }, 0));`],
+  ])("does not unroll %s over more elements than a for loop may run", (_label, body) => {
+    const { tweens } = run(`const tl = gsap.timeline();\n${body}`);
+    expect(tweens).toHaveLength(1);
   });
 });

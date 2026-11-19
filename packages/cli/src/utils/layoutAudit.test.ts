@@ -136,6 +136,16 @@ describe("layoutAudit helpers", () => {
     });
   });
 
+  it("keeps canvas_covered an error only when the canvas is covered for most of the film", () => {
+    const covered = (times: number[], samples: number) =>
+      collapseStaticLayoutIssues(
+        times.map((time) => ({ ...issue("canvas_covered", "error"), time })),
+        samples,
+      )[0]?.severity;
+    expect(covered([1, 2, 3, 4, 5], 8)).toBe("error");
+    expect(covered([7, 8], 8)).toBe("info");
+  });
+
   it("formats issues with timestamp, selector, container, and fix hint", () => {
     const formatted = formatLayoutIssue({
       ...issue("text_box_overflow", "error"),
@@ -154,6 +164,32 @@ describe("layoutAudit helpers", () => {
     expect(formatted).toContain("Fix: Increase container padding");
   });
 
+  it("shows control characters in composition text as visible escapes", () => {
+    const formatted = formatLayoutIssue({
+      ...issue("text_box_overflow", "error"),
+      selector: "#h\u001b]0;t\u0007",
+      containerSelector: ".b\u009b2J",
+      text: "Plan\u001b[2K",
+      message: "clipped\u001b[1A",
+      fixHint: "pad \u001b]52;c;Y2xpcA==\u0007",
+    });
+
+    for (const control of ["\u0007", "\u001b", "\u009b"]) expect(formatted).not.toContain(control);
+    expect(formatted).toContain("#h\\x1b]0;t\\x07 inside .b\\x9b2J");
+    expect(formatted).toContain('"Plan\\x1b[2K" — clipped\\x1b[1A');
+    expect(formatted).toContain("\n    Fix: pad \\x1b]52;c;Y2xpcA==\\x07");
+  });
+
+  it("shows control characters in an issue code from the page as visible escapes", () => {
+    const formatted = formatLayoutIssue({
+      ...issue("text_box_overflow", "error"),
+      code: "text_box_overflow\u001b]52;c;Y2xpcA==\u0007" as LayoutIssue["code"],
+    });
+
+    expect(formatted).not.toContain("\u001b");
+    expect(formatted).toContain("text_box_overflow\\x1b]52;c;Y2xpcA==\\x07");
+  });
+
   it("formats collapsed issue time ranges", () => {
     const formatted = formatLayoutIssue({
       ...issue("text_box_overflow", "error"),
@@ -166,15 +202,11 @@ describe("layoutAudit helpers", () => {
     expect(formatted).toContain("t=1-5s (3 samples)");
   });
 
-  // The clip rule that suppresses the odometer/ticker false positive: text
-  // spilling past an `overflow:hidden` reel window is the mechanism, not a bug.
-  it("treats clipping overflow values as masking (suppress) and visible as not (still report)", () => {
-    // Intended clipping — the queued digit rows of a reel are masked here.
+  it("treats hidden, clip, auto, and scroll as clipping", () => {
     expect(overflowValueClips("hidden")).toBe(true);
     expect(overflowValueClips("clip")).toBe(true);
     expect(overflowValueClips("auto")).toBe(true);
     expect(overflowValueClips("scroll")).toBe(true);
-    // Genuine overflow — nothing masks the text, so it must STILL be reported.
     expect(overflowValueClips("visible")).toBe(false);
     expect(overflowValueClips("clip visible")).toBe(false);
     expect(overflowValueClips("")).toBe(false);
@@ -203,6 +235,7 @@ describe("layoutAudit helpers", () => {
 // Sample counts below (9) mirror the CLI's default grid so the "1 sample =
 // entrance/exit transient, 2+ adjacent samples = held" framing in the
 // approach doc lines up with the numbers used here.
+
 describe("persistence-tiered severity (#U10)", () => {
   it("demotes a content_overlap seen at only one sample among several to info", () => {
     const collapsed = collapseStaticLayoutIssues(
@@ -221,6 +254,206 @@ describe("persistence-tiered severity (#U10)", () => {
         { ...issue("content_overlap", "warning"), time: 3.6 },
       ],
       9,
+    );
+
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0]).toMatchObject({ severity: "error", occurrences: 2 });
+  });
+
+  it("keeps a content_overlap that spans under the 500ms floor as a warning, even with 2 occurrences", () => {
+    // Two dense-pass occurrences ~125ms apart are under the held-duration floor, so occurrences>=2 alone must not promote to error.
+    const collapsed = collapseStaticLayoutIssues(
+      [
+        { ...issue("content_overlap", "warning"), time: 4.0 },
+        { ...issue("content_overlap", "warning"), time: 4.125 },
+      ],
+      73,
+    );
+
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0]).toMatchObject({ severity: "warning", occurrences: 2 });
+  });
+
+  it("does NOT promote content_overlap whose two occurrences span exactly 499ms (under the floor)", () => {
+    // Boundary: a span one millisecond short of the 500ms floor stays a warning — guards the AND-tighten for sparse callers.
+    const collapsed = collapseStaticLayoutIssues(
+      [
+        { ...issue("content_overlap", "warning"), time: 4.0 },
+        { ...issue("content_overlap", "warning"), time: 4.499 },
+      ],
+      73,
+    );
+
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0]).toMatchObject({ severity: "warning", occurrences: 2 });
+  });
+
+  it("promotes a content_overlap whose text changes every sample (count-up over a label)", () => {
+    const collapsed = collapseStaticLayoutIssues(
+      [
+        {
+          ...issue("content_overlap", "warning"),
+          time: 4.0,
+          containerSelector: ".num",
+          text: "$1,204",
+        },
+        {
+          ...issue("content_overlap", "warning"),
+          time: 4.5,
+          containerSelector: ".num",
+          text: "$8,930",
+        },
+      ],
+      73,
+    );
+
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0]).toMatchObject({ severity: "error", occurrences: 2 });
+  });
+
+  it("keeps a text_occluded at error when the word lives one sample and is hidden at it", () => {
+    const grid = [0.167, 0.5, 0.833, 1.167];
+    const word = (time: number, lifetime: { start: number; end: number }) => ({
+      ...issue("text_occluded", "error"),
+      time,
+      lifetime,
+    });
+
+    const collapsed = collapseStaticLayoutIssues(
+      [word(0.167, { start: 0, end: 0.4 }), word(0.5, { start: 0.4, end: 0.8 })].map((entry) => ({
+        ...entry,
+        selector: `#w${entry.time}`,
+      })),
+      grid.length,
+      grid,
+    );
+
+    expect(collapsed.map((entry) => entry.severity)).toEqual(["error", "error"]);
+  });
+
+  it("still demotes a text_occluded seen at one of several samples its clip spans", () => {
+    const grid = [0.1, 0.3, 0.5, 0.7];
+
+    const collapsed = collapseStaticLayoutIssues(
+      [{ ...issue("text_occluded", "error"), time: 0.3, lifetime: { start: 0, end: 1 } }],
+      grid.length,
+      grid,
+    );
+
+    expect(collapsed[0]).toMatchObject({ severity: "info", occurrences: 1 });
+  });
+
+  it("keeps a text_occluded over changing text at error, not demoted per sample", () => {
+    const collapsed = collapseStaticLayoutIssues(
+      [
+        {
+          ...issue("text_occluded", "error"),
+          time: 4.0,
+          containerSelector: ".scrim",
+          text: "$1,204",
+        },
+        {
+          ...issue("text_occluded", "error"),
+          time: 4.5,
+          containerSelector: ".scrim",
+          text: "$8,930",
+        },
+      ],
+      73,
+    );
+
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0]).toMatchObject({ severity: "error", occurrences: 2 });
+  });
+
+  it("keeps two content_overlap pairs on different containers in separate groups", () => {
+    const collapsed = collapseStaticLayoutIssues(
+      [
+        { ...issue("content_overlap", "warning"), time: 4.0, containerSelector: ".num" },
+        { ...issue("content_overlap", "warning"), time: 4.5, containerSelector: ".pct" },
+      ],
+      73,
+    );
+
+    expect(collapsed).toHaveLength(2);
+  });
+
+  it("does not bridge two separate transients on one pair into a held collision", () => {
+    const blip = { ...issue("content_overlap", "warning"), containerSelector: ".label" };
+    const collapsed = collapseStaticLayoutIssues(
+      [
+        { ...blip, time: 1.0 },
+        { ...blip, time: 1.125 },
+        { ...blip, time: 9.0 },
+        { ...blip, time: 9.125 },
+      ],
+      73,
+    );
+
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0]).toMatchObject({ severity: "warning", occurrences: 4 });
+  });
+
+  it("promotes only when one contiguous run clears the floor, not the span between runs", () => {
+    const blip = { ...issue("content_overlap", "warning"), containerSelector: ".label" };
+    const held = [1.0, 1.125, 1.25, 1.375, 1.5, 1.625].map((time) => ({ ...blip, time }));
+    const collapsed = collapseStaticLayoutIssues([...held, { ...blip, time: 9.0 }], 73);
+
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0]).toMatchObject({ severity: "error", occurrences: 7 });
+  });
+
+  it("does not bridge two blips 1.5s apart, whatever grid the collapse was handed", () => {
+    const blip = { ...issue("content_overlap", "warning"), containerSelector: ".label" };
+    for (const sampleCount of [9, 81]) {
+      const collapsed = collapseStaticLayoutIssues(
+        [
+          { ...blip, time: 2.0 },
+          { ...blip, time: 3.5 },
+        ],
+        sampleCount,
+      );
+      expect(collapsed[0]).toMatchObject({ severity: "warning" });
+    }
+  });
+
+  it("promotes a 625ms contiguous collision even when a tight pair sits elsewhere", () => {
+    const blip = { ...issue("content_overlap", "warning"), containerSelector: ".label" };
+    const held = [5.0, 5.125, 5.25, 5.375, 5.5, 5.625].map((time) => ({ ...blip, time }));
+    const elsewhere = { ...issue("content_overlap", "warning"), containerSelector: ".other" };
+    const collapsed = collapseStaticLayoutIssues(
+      [
+        ...held,
+        { ...elsewhere, time: 2.0 },
+        { ...elsewhere, time: 2.05 },
+        { ...elsewhere, time: 2.1 },
+      ],
+      81,
+    );
+
+    const label = collapsed.find((entry) => entry.containerSelector === ".label");
+    expect(label).toMatchObject({ severity: "error", heldMs: 625 });
+  });
+
+  it("still separates two distinct text_box_overflow findings that differ only by text", () => {
+    const collapsed = collapseStaticLayoutIssues(
+      [
+        { ...issue("text_box_overflow", "warning"), time: 4.0, text: "first" },
+        { ...issue("text_box_overflow", "warning"), time: 4.5, text: "second" },
+      ],
+      73,
+    );
+
+    expect(collapsed).toHaveLength(2);
+  });
+
+  it("promotes content_overlap whose two occurrences span exactly 500ms (at the floor)", () => {
+    const collapsed = collapseStaticLayoutIssues(
+      [
+        { ...issue("content_overlap", "warning"), time: 4.0 },
+        { ...issue("content_overlap", "warning"), time: 4.5 },
+      ],
+      73,
     );
 
     expect(collapsed).toHaveLength(1);
@@ -268,9 +501,29 @@ describe("persistence-tiered severity (#U10)", () => {
       "escaped_container",
       "panel_out_of_canvas",
       "connector_detached",
+      "connector_orphan",
     ] as const) {
       const collapsed = collapseStaticLayoutIssues([{ ...issue(code, "warning"), time: 3 }], 9);
       expect(collapsed[0]).toMatchObject({ severity: "info", occurrences: 1 });
+    }
+  });
+
+  it("keeps id-less connector findings apart by geometry, so each stays a single sample", () => {
+    for (const code of ["connector_detached", "connector_orphan"] as const) {
+      const shaft = { ...issue(code, "warning"), selector: "svg path" };
+      const collapsed = collapseStaticLayoutIssues(
+        [
+          { ...shaft, time: 1, rect: { ...shaft.rect, left: 100, top: 100 } },
+          { ...shaft, time: 3, rect: { ...shaft.rect, left: 600, top: 300 } },
+          { ...shaft, time: 5, rect: { ...shaft.rect, left: 1200, top: 700 } },
+        ],
+        9,
+      );
+
+      expect(collapsed).toHaveLength(3);
+      for (const finding of collapsed) {
+        expect(finding).toMatchObject({ severity: "info", occurrences: 1 });
+      }
     }
   });
 

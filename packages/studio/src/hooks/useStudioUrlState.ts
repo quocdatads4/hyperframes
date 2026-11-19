@@ -1,12 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { usePlayerStore } from "../player";
-import { findElementForSelection, type DomEditSelection } from "../components/editor/domEditing";
+import type { DomEditSelection } from "../components/editor/domEditing";
+import type { SelectionLookupTarget } from "../components/editor/domEditSelectionRules";
+import { findSelectionElement } from "../components/editor/previewSelection";
+import type { PreviewElement } from "../player/lib/previewElements";
+import type { MarqueeSelectionMode } from "../utils/marqueeGeometry";
 import { clampNumber, type RightPanelTab } from "../utils/studioHelpers";
 import { parseProjectIdFromHash } from "../utils/projectRouting";
 import {
   buildStudioHash,
   parseStudioUrlStateFromHash,
   type StudioUrlSelectionState,
+  type StudioUrlSelectionTarget,
   type StudioUrlState,
 } from "../utils/studioUrlState";
 
@@ -22,9 +27,11 @@ interface UseStudioUrlStateParams {
   rightCollapsed: boolean;
   activeCompPathHydrated: boolean;
   domEditSelection: DomEditSelection | null;
+  domEditGroupSelections: DomEditSelection[];
+  applyMarqueeSelection: (selections: DomEditSelection[], mode: MarqueeSelectionMode) => void;
   buildDomSelectionFromTarget: (
-    target: HTMLElement,
-    options?: { preferClipAncestor?: boolean },
+    target: HTMLElement | PreviewElement,
+    options?: { preferClipAncestor?: boolean; skipSourceProbe?: boolean },
   ) => Promise<DomEditSelection | null>;
   applyDomSelection: (
     selection: DomEditSelection | null,
@@ -38,8 +45,7 @@ interface UseStudioUrlStateParams {
   initialState: StudioUrlState;
 }
 
-function toPersistedSelection(selection: DomEditSelection | null): StudioUrlSelectionState | null {
-  if (!selection) return null;
+function toPersistedTarget(selection: DomEditSelection): StudioUrlSelectionTarget | null {
   if (!selection.id && !selection.selector) return null;
   return {
     sourceFile: selection.sourceFile || undefined,
@@ -49,10 +55,227 @@ function toPersistedSelection(selection: DomEditSelection | null): StudioUrlSele
   };
 }
 
+function selectionTargetKey(selection: StudioUrlSelectionTarget): string {
+  return [
+    selection.sourceFile ?? "",
+    selection.id ?? "",
+    selection.selector ?? "",
+    selection.selectorIndex ?? "",
+  ].join("|");
+}
+
+function toPersistedSelection(
+  selection: DomEditSelection | null,
+  // Optional: a caller that only ever has one selection has nothing to add, and
+  // the URL must still carry that one rather than throwing on the way out.
+  group: DomEditSelection[] = [],
+): StudioUrlSelectionState | null {
+  if (!selection) return null;
+  const primary = toPersistedTarget(selection);
+  if (!primary) return null;
+  // The primary is already carried by the top-level fields; the rest ride along so the link
+  // reopens the same multi-selection instead of a single element.
+  const primaryKey = selectionTargetKey(primary);
+  const members = new Map<string, StudioUrlSelectionTarget>();
+  for (const member of group) {
+    const target = toPersistedTarget(member);
+    if (!target) continue;
+    const key = selectionTargetKey(target);
+    if (key !== primaryKey) members.set(key, target);
+  }
+  return {
+    ...primary,
+    group: members.size > 0 ? [...members.values()] : undefined,
+  };
+}
+
+// A frame still loading cannot answer a lookup yet: it is asked again this often, this many times (about 10 s).
+const URL_SELECTION_RETRY_MS = 250;
+const URL_SELECTION_TRIES = 40;
+
 function replaceHash(nextHash: string) {
   if (typeof window === "undefined") return;
   if (window.location.hash === nextHash) return;
   window.history.replaceState(null, "", nextHash);
+}
+
+type UrlSelectionFound = HTMLElement | PreviewElement | null | undefined;
+
+interface ResolveUrlSelectionsParams {
+  find: (target: SelectionLookupTarget) => Promise<UrlSelectionFound>;
+  selection: StudioUrlSelectionState;
+  group: StudioUrlSelectionTarget[];
+  isCurrent: () => boolean;
+  buildDomSelection: UseStudioUrlStateParams["buildDomSelectionFromTarget"];
+}
+
+function urlLookupTarget(
+  target: StudioUrlSelectionTarget,
+  fallbackSourceFile: string,
+): SelectionLookupTarget {
+  return {
+    sourceFile: target.sourceFile ?? fallbackSourceFile,
+    id: target.id,
+    selector: target.selector,
+    selectorIndex: target.selectorIndex,
+  };
+}
+
+async function buildOptionalDomSelection(
+  element: HTMLElement | PreviewElement | null | undefined,
+  buildDomSelection: UseStudioUrlStateParams["buildDomSelectionFromTarget"],
+): Promise<DomEditSelection | null> {
+  if (!element) return null;
+  // No source probe for group members. Each one costs a request, they are
+  // resolved one after another, and the URL carries the whole selection — so a
+  // marquee over a captured page turned every reload into hundreds of serial
+  // round trips before the canvas answered anything, including a Delete press.
+  // The marquee that produced these members already skips the probe for the
+  // same reason; only the primary, whose panel reads the flag, still pays it.
+  return buildDomSelection(element, { preferClipAncestor: false, skipSourceProbe: true });
+}
+
+export async function resolveUrlSelections({
+  find,
+  selection,
+  group,
+  isCurrent,
+  buildDomSelection,
+}: ResolveUrlSelectionsParams): Promise<DomEditSelection[] | null | undefined> {
+  const found = await find(urlLookupTarget(selection, ""));
+  if (!isCurrent()) return null;
+  if (found === undefined) return undefined;
+  const primary = found && (await buildDomSelection(found, { preferClipAncestor: false }));
+  if (!isCurrent()) return null;
+  if (!primary) return [];
+  const members = [primary];
+  for (const member of group) {
+    const element = await find(urlLookupTarget(member, selection.sourceFile ?? ""));
+    if (!isCurrent()) return null;
+    // A member the frame cannot answer for yet is not missing: the whole lookup waits for it.
+    if (element === undefined) return undefined;
+    const resolved = await buildOptionalDomSelection(element, buildDomSelection);
+    if (!isCurrent()) return null;
+    if (resolved) members.push(resolved);
+  }
+  return members;
+}
+
+interface UrlSelectionLookup extends ResolveUrlSelectionsParams {
+  apply: (members: DomEditSelection[]) => void;
+  settle: () => void;
+  retry: (next: () => void) => void;
+}
+
+function lookUpUrlSelection(lookup: UrlSelectionLookup, triesLeft = URL_SELECTION_TRIES): void {
+  void resolveUrlSelections(lookup).then((members) => {
+    if (members === undefined && triesLeft > 1) {
+      lookup.retry(() => lookUpUrlSelection(lookup, triesLeft - 1));
+      return;
+    }
+    if (members) lookup.apply(members);
+    lookup.settle();
+  });
+}
+
+function applyUrlMembers(
+  members: DomEditSelection[],
+  grouped: boolean,
+  applyDomSelection: (
+    selection: DomEditSelection | null,
+    options: { revealPanel: boolean },
+  ) => void,
+  applyMarqueeSelection: (selections: DomEditSelection[], mode: MarqueeSelectionMode) => void,
+): void {
+  const primary = members[0];
+  if (!primary) return applyDomSelection(null, { revealPanel: false });
+  if (!grouped) return applyDomSelection(primary, { revealPanel: false });
+  // Missing group members are dropped without failing the rest.
+  applyMarqueeSelection(members, "replace");
+}
+
+// One URL-selection lookup at a time: a newer one replaces the older, which ends then.
+interface UrlLookupState {
+  applySeq: number;
+  retryTimer: ReturnType<typeof setTimeout> | undefined;
+  pendingSettle: (() => void) | undefined;
+  hydrating: boolean;
+}
+
+function useUrlLookupState(): UrlLookupState {
+  const state = useRef<UrlLookupState>({
+    applySeq: 0,
+    retryTimer: undefined,
+    pendingSettle: undefined,
+    hydrating: false,
+  }).current;
+  useEffect(() => () => clearTimeout(state.retryTimer), [state]);
+  return state;
+}
+
+function endOnce(state: UrlLookupState, onSettled?: () => void): () => void {
+  let ended = false;
+  const settle = () => {
+    if (ended) return;
+    ended = true;
+    if (state.pendingSettle === settle) state.pendingSettle = undefined;
+    onSettled?.();
+  };
+  return settle;
+}
+
+interface UrlSelectionHost {
+  iframe: HTMLIFrameElement | null;
+  activeCompPath: string | null;
+  lookup: UrlLookupState;
+  buildDomSelection: ResolveUrlSelectionsParams["buildDomSelection"];
+  applyDomSelection: (
+    selection: DomEditSelection | null,
+    options: { revealPanel: boolean },
+  ) => void;
+  applyMarqueeSelection: (selections: DomEditSelection[], mode: MarqueeSelectionMode) => void;
+}
+
+// Resolve a URL selection in the preview, sealed or not, and apply it. False when there is no preview yet; a frame
+// that cannot answer yet is asked again on a timer. onSettled runs once the lookup ends, however it ends.
+function startUrlSelection(
+  host: UrlSelectionHost,
+  selection: StudioUrlSelectionState | null,
+  onSettled?: () => void,
+): boolean {
+  const { iframe } = host;
+  if (selection && !iframe) return false;
+  const { lookup } = host;
+  clearTimeout(lookup.retryTimer);
+  const applySeq = ++lookup.applySeq;
+  lookup.pendingSettle?.();
+  const settle = endOnce(lookup, onSettled);
+  lookup.pendingSettle = settle;
+  if (!selection || !iframe) {
+    host.applyDomSelection(null, { revealPanel: false });
+    settle();
+    return true;
+  }
+  const group = selection.group ?? [];
+  lookUpUrlSelection({
+    find: (target) => findSelectionElement(iframe, target, host.activeCompPath),
+    selection,
+    group,
+    isCurrent: () => applySeq === lookup.applySeq,
+    buildDomSelection: host.buildDomSelection,
+    apply: (members) =>
+      applyUrlMembers(
+        members,
+        group.length > 0,
+        host.applyDomSelection,
+        host.applyMarqueeSelection,
+      ),
+    settle,
+    retry: (next) => {
+      lookup.retryTimer = setTimeout(next, URL_SELECTION_RETRY_MS);
+    },
+  });
+  return true;
 }
 
 export function useStudioUrlState({
@@ -67,6 +290,8 @@ export function useStudioUrlState({
   rightCollapsed,
   activeCompPathHydrated,
   domEditSelection,
+  domEditGroupSelections,
+  applyMarqueeSelection,
   buildDomSelectionFromTarget,
   applyDomSelection,
   setRightPanelTab,
@@ -82,6 +307,7 @@ export function useStudioUrlState({
   const [selectionHydrated, setSelectionHydrated] = useState(initialState.selection == null);
   const pendingSelectionRef = useRef(initialState.selection);
   const stableTimeRef = useRef<number | null>(initialState.currentTime);
+  const urlLookup = useUrlLookupState();
 
   const buildUrlState = useCallback(
     (): StudioUrlState => ({
@@ -91,49 +317,35 @@ export function useStudioUrlState({
       rightCollapsed,
       timelineVisible: null,
       selection: hydratedSelectionRef.current
-        ? toPersistedSelection(domEditSelection)
+        ? toPersistedSelection(domEditSelection, domEditGroupSelections)
         : pendingSelectionRef.current,
     }),
-    [activeCompPath, domEditSelection, rightCollapsed, rightPanelTab],
+    [activeCompPath, domEditGroupSelections, domEditSelection, rightCollapsed, rightPanelTab],
   );
 
-  // Resolve a URL selection to a live element and apply it. Shared by the initial
-  // hydration effect and the external-navigation (hashchange) handler. Returns
-  // false ONLY when the iframe document isn't ready yet (caller should retry);
-  // a missing element or null selection clears the selection and returns true.
+  // Shared by the initial hydration effect and the hashchange handler.
   const applyUrlSelection = useCallback(
-    (selection: StudioUrlSelectionState | null): boolean => {
-      if (!selection) {
-        applyDomSelection(null, { revealPanel: false });
-        return true;
-      }
-      let doc: Document | null = null;
-      try {
-        doc = previewIframeRef.current?.contentDocument ?? null;
-      } catch {
-        return false;
-      }
-      if (!doc) return false;
-      const element = findElementForSelection(
-        doc,
+    (selection: StudioUrlSelectionState | null, onSettled?: () => void): boolean =>
+      startUrlSelection(
         {
-          sourceFile: selection.sourceFile ?? "",
-          id: selection.id,
-          selector: selection.selector,
-          selectorIndex: selection.selectorIndex,
+          iframe: previewIframeRef.current,
+          activeCompPath,
+          lookup: urlLookup,
+          buildDomSelection: buildDomSelectionFromTarget,
+          applyDomSelection,
+          applyMarqueeSelection,
         },
-        activeCompPath,
-      );
-      if (!element) {
-        applyDomSelection(null, { revealPanel: false });
-        return true;
-      }
-      void buildDomSelectionFromTarget(element, { preferClipAncestor: false }).then((resolved) => {
-        applyDomSelection(resolved, { revealPanel: false });
-      });
-      return true;
-    },
-    [activeCompPath, applyDomSelection, buildDomSelectionFromTarget, previewIframeRef],
+        selection,
+        onSettled,
+      ),
+    [
+      activeCompPath,
+      applyDomSelection,
+      applyMarqueeSelection,
+      buildDomSelectionFromTarget,
+      previewIframeRef,
+      urlLookup,
+    ],
   );
 
   useEffect(() => {
@@ -158,7 +370,7 @@ export function useStudioUrlState({
   const selectionHydrationTime = selectionHydrated ? 0 : currentTime;
   useEffect(() => {
     if (!projectId || hydratedSelectionRef.current || compositionLoading) return;
-    if (!hydratedSeekRef.current) return;
+    if (!hydratedSeekRef.current || urlLookup.hydrating) return;
     const targetTime = initialState.currentTime;
     if (targetTime != null && Math.abs(selectionHydrationTime - stableTimeRef.current!) > 0.05) {
       return;
@@ -173,10 +385,13 @@ export function useStudioUrlState({
       markHydrated();
       return;
     }
-    // Doc not ready yet → leave hydration pending so a later tick retries.
-    if (!applyUrlSelection(pendingSelection)) return;
-    markHydrated();
-    pendingSelectionRef.current = null;
+    // Hydration ends with the lookup, so the URL keeps the selection; no preview yet: a later tick retries.
+    const settled = () => {
+      urlLookup.hydrating = false;
+      markHydrated();
+      pendingSelectionRef.current = null;
+    };
+    urlLookup.hydrating = applyUrlSelection(pendingSelection, settled);
   }, [
     applyUrlSelection,
     compositionLoading,
@@ -184,6 +399,7 @@ export function useStudioUrlState({
     initialState.currentTime,
     projectId,
     refreshKey,
+    urlLookup,
   ]);
 
   useEffect(() => {

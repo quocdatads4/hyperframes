@@ -3,8 +3,15 @@
  * the `perf-summary.json` debug artifact.
  */
 
-import { fpsToNumber } from "@hyperframes/core";
-import type { CapturePerfSummary, SubTimelineWaitOutcome, WorkerSizing } from "@hyperframes/engine";
+import { arch, platform, totalmem } from "node:os";
+import { fpsToNumber, type HfVfxCapture } from "@hyperframes/core";
+import { hostCpuCount } from "@hyperframes/engine";
+import type {
+  CapturePerfSummary,
+  StaticVerificationOutcome,
+  SubTimelineWaitOutcome,
+  WorkerSizing,
+} from "@hyperframes/engine";
 import type { CaptureCalibrationSample, CaptureCostEstimate } from "./captureCost.js";
 import type {
   CaptureAttemptSummary,
@@ -13,7 +20,7 @@ import type {
   RenderPerfSummary,
 } from "../renderOrchestrator.js";
 import { type HdrPerfCollector, finalizeHdrPerf } from "./hdrPerf.js";
-import type { RenderObservabilitySummary } from "./observability.js";
+import type { RenderCaptureObservability, RenderObservabilitySummary } from "./observability.js";
 
 /**
  * Worst sub-composition timeline wait outcome across sessions: script_failure
@@ -48,6 +55,39 @@ export function pushWorkerDedupPerfs(
   }
 }
 
+/** Beyond-viewport capture as the workers' sessions used it: on if any kept it, `fallback` when none reported. */
+export function capturedBeyondViewport(
+  perfs: ReadonlyArray<CapturePerfSummary>,
+  fallback: boolean | undefined,
+): boolean | undefined {
+  const used = perfs.flatMap((perf) => perf.captureBeyondViewport ?? []);
+  return used.length > 0 ? used.includes(true) : fallback;
+}
+
+/** The capture facts with beyond-viewport capture as the sessions used it, on every capture path. */
+export function withCapturedBeyondViewport(
+  capture: RenderCaptureObservability,
+  perfs: ReadonlyArray<CapturePerfSummary>,
+): RenderCaptureObservability {
+  const used = capturedBeyondViewport(perfs, capture.captureBeyondViewport);
+  return used === undefined ? capture : { ...capture, captureBeyondViewport: used };
+}
+
+/** Adds each worker's page-error console lines to `sink`, once per distinct line. */
+export function pushWorkerPageErrors(
+  results: ReadonlyArray<{ pageErrorLines?: string[] }>,
+  sink: string[],
+): void {
+  for (const result of results) {
+    for (const line of result.pageErrorLines ?? []) if (!sink.includes(line)) sink.push(line);
+  }
+}
+
+/** The console lines plus the workers' page-error lines the console does not already hold. */
+export function withWorkerPageErrors(consoleLines: string[], workerLines: string[]): string[] {
+  return [...consoleLines, ...workerLines.filter((line) => !consoleLines.includes(line))];
+}
+
 /**
  * Collapse per-session/per-worker static-dedup perf into one render-level
  * outcome. enabled/armed = OR across workers (they run the same gates on the
@@ -77,9 +117,41 @@ export function roundDb(value: number | undefined): number | undefined {
 export interface DrawElementPerfInput {
   compileGate?: string;
   clampReason?: string;
+  /** Engine init-time gate the pre-capture probe hit; its session may be closed before capture. */
+  probeGateReason?: string;
   workerInversion?: "inverted" | "reverted";
   /** Auto-resolved worker count before the inversion pinned it to 1 (set only when the inversion fired). */
   preInversionWorkers?: number;
+  /** Rough compiled-composition element count — gate variable for the short-comp inversion band. */
+  compositionElementCount?: number;
+  /** Provenance of the element count: "live" (probe DOM, trusted to gate) | "static" (source scan, not). */
+  compositionElementCountSource?: "live" | "static";
+  /** Per-tag breakdown of the same static scan behind compositionElementCount; only set when the source above is "static". */
+  compositionElementTags?: Readonly<Record<string, number>>;
+  /** `<video data-aroll="true">` count from the same static scan; only set when compositionElementCountSource is "static". */
+  arollVideoCount?: number;
+  /** `<video data-media-source="heygen">` count from the same static scan; only set when compositionElementCountSource is "static". */
+  heygenVideoCount?: number;
+  /** Runtime adapters exercised (live+static union); always set (possibly empty). */
+  adaptersUsed?: readonly string[];
+  /** Audio/image/sub-comp/color-grading counts, same static scan; only set when the source above is "static". */
+  audioCount?: number;
+  imageCount?: number;
+  subCompositionCount?: number;
+  audioGroupCount?: number;
+  colorGradingCount?: number;
+  hasLut?: boolean;
+  /** Authored root data-width/height vs. the scaffold's html/body CSS size; absent when either is undetectable. */
+  rootBodyMismatch?: boolean;
+  rootBodyDeltaPxBucket?: "0" | "1-10" | "11-50" | "51+";
+  /** `data-vfx-chain` host count from the same static scan. Only set when the source above is "static". */
+  vfxHostCount?: number;
+  /** Strongest enabled node's capture across every host (`chainCapture`, max: backdrop > self > none). Undefined when vfxHostCount is 0. */
+  vfxCapture?: HfVfxCapture;
+  /** Sorted unique def ids across every enabled node in every chain, comma-joined ("" when vfxHostCount is 0). */
+  vfxTypes?: string;
+  /** Short-comp band decision when the band was DECISIVE: "applied" (inverts once HF_DE_SHORT_BAND_ROUTE is on; counterfactual in the baseline release) | "skipped_elements" (element ceiling was the only blocker); unset when the band could not have affected this render. */
+  shortBand?: "applied" | "skipped_elements" | "unmeasured";
   parallelRouter?: "routed" | "reverted";
   /** Auto-resolved worker count before the router pinned it to 3 (set only when the router fired). */
   preRouterWorkers?: number;
@@ -109,7 +181,12 @@ function aggregateDrawElement(
   if (perfs.length === 0) return undefined;
   const modes = [...new Set(perfs.map((p) => p.captureMode).filter(Boolean))].sort();
   const gateReasons = [
-    ...new Set(perfs.map((p) => p.deGateReason).filter((r): r is string => !!r)),
+    ...new Set(
+      [de.probeGateReason, ...perfs.map((p) => p.deGateReason)].filter((r): r is string => !!r),
+    ),
+  ].sort();
+  const gpuRenderers = [
+    ...new Set(perfs.map((p) => p.gpuRenderer).filter((r): r is string => !!r)),
   ].sort();
   const drain = de.drainStats;
   return {
@@ -118,9 +195,28 @@ function aggregateDrawElement(
     clampReason: de.clampReason,
     workerInversion: de.workerInversion ?? "none",
     preInversionWorkers: de.preInversionWorkers,
+    compositionElementCount: de.compositionElementCount,
+    compositionElementCountSource: de.compositionElementCountSource,
+    compositionElementTags: de.compositionElementTags,
+    arollVideoCount: de.arollVideoCount,
+    heygenVideoCount: de.heygenVideoCount,
+    adaptersUsed: de.adaptersUsed,
+    audioCount: de.audioCount,
+    imageCount: de.imageCount,
+    subCompositionCount: de.subCompositionCount,
+    audioGroupCount: de.audioGroupCount,
+    colorGradingCount: de.colorGradingCount,
+    hasLut: de.hasLut,
+    rootBodyMismatch: de.rootBodyMismatch,
+    rootBodyDeltaPxBucket: de.rootBodyDeltaPxBucket,
+    vfxHostCount: de.vfxHostCount,
+    vfxCapture: de.vfxCapture,
+    vfxTypes: de.vfxTypes,
+    shortBand: de.shortBand,
     parallelRouter: de.parallelRouter ?? "none",
     preRouterWorkers: de.preRouterWorkers,
     gateReason: gateReasons.length > 0 ? gateReasons.join("|") : undefined,
+    gpuRenderer: gpuRenderers.length > 0 ? gpuRenderers.join("|") : undefined,
     workerEncode: perfs.some((p) => p.deWorkerEncode),
     verifyArmed: perfs.reduce((sum, p) => sum + (p.deVerifyArmed ?? 0), 0),
     verifyChecked: drain?.verifyChecked ?? 0,
@@ -135,8 +231,43 @@ function aggregateDrawElement(
     blankDeterministicAccepts: drain?.blankDeterministicAccepts ?? 0,
     blankRecaptures: drain?.blankRecaptures ?? 0,
     boundaryFrames: perfs.reduce((sum, p) => sum + (p.deBoundaryFrames ?? 0), 0),
+    riskFrames: perfs.reduce((sum, p) => sum + (p.deRiskFrames ?? 0), 0),
     ncprFallbacks: perfs.reduce((sum, p) => sum + (p.deNcprFallbacks ?? 0), 0),
+    frameTimeouts: perfs.reduce((sum, p) => sum + (p.deFrameTimeouts ?? 0), 0),
   };
+}
+
+function maxDefined(values: Array<number | undefined>): number | undefined {
+  const present = values.filter((v): v is number => typeof v === "number");
+  return present.length > 0 ? Math.max(...present) : undefined;
+}
+
+/**
+ * Chrome memory across capture sessions: max of per-session peaks, sum of the
+ * last samples. Sessions that never produced a reading are excluded so
+ * `samples: 0` cannot be published alongside another worker's real peaks.
+ */
+function aggregateChromeMemory(perfs: CapturePerfSummary[]): RenderPerfSummary["chromeMemory"] {
+  const sampled = perfs.filter((p) => (p.chromeMemorySamples ?? 0) > 0);
+  if (sampled.length === 0) return undefined;
+  return {
+    browserRssPeakMb: maxDefined(sampled.map((p) => p.chromeBrowserRssPeakMb)),
+    rendererRssPeakMb: maxDefined(sampled.map((p) => p.chromeRendererRssPeakMb)),
+    // Last samples are per session; summing approximates the whole fleet's
+    // footprint at the end of capture (workers run concurrently).
+    rssLastMb: sampled.reduce((sum, p) => sum + (p.chromeRssLastMb ?? 0), 0),
+    gpuProcessSeenLastSample: sampled.some((p) => p.chromeGpuProcessSeenLastSample === true),
+    samples: sampled.reduce((sum, p) => sum + (p.chromeMemorySamples ?? 0), 0),
+  };
+}
+
+function frameWeightedAvgMs(
+  perfs: CapturePerfSummary[],
+  avgOf: (perf: CapturePerfSummary) => number,
+): number | undefined {
+  const frames = perfs.reduce((sum, p) => sum + p.frames, 0);
+  if (frames === 0) return undefined;
+  return Math.round(perfs.reduce((sum, p) => sum + avgOf(p) * p.frames, 0) / frames);
 }
 
 function aggregateDedup(perfs: CapturePerfSummary[]): RenderPerfSummary["staticDedup"] {
@@ -146,17 +277,58 @@ function aggregateDedup(perfs: CapturePerfSummary[]): RenderPerfSummary["staticD
   // rather than just the first — workers can diverge (e.g. one `ineligible`, one
   // `capture_mode`), and dropping the rest hides why dedup didn't engage. Cardinality
   // stays bounded (a handful of codes, small combinations).
-  const skipReasons = armed
-    ? []
-    : [
-        ...new Set(perfs.map((p) => p.staticDedupSkipReason).filter((r): r is string => !!r)),
-      ].sort();
+  const distinctUnarmed = (values: Array<string | undefined>): string | undefined => {
+    const distinct = armed ? [] : [...new Set(values.filter((v): v is string => !!v))].sort();
+    return distinct.length > 0 ? distinct.join("|") : undefined;
+  };
+  const verificationPerfs = perfs.filter((perf) => perf.staticDedupVerificationOutcome);
+  const verificationOutcomes = [
+    ...new Set(
+      verificationPerfs
+        .map((perf) => perf.staticDedupVerificationOutcome)
+        .filter((outcome): outcome is StaticVerificationOutcome => outcome != null),
+    ),
+  ].sort();
   return {
     enabled: perfs.some((p) => p.staticDedupEnabled),
     armed,
     predictedFrames: perfs.reduce((sum, p) => sum + (p.staticDedupPredicted ?? 0), 0),
     reusedFrames: perfs.reduce((sum, p) => sum + (p.staticDedupReused ?? 0), 0),
-    skipReason: skipReasons.length > 0 ? skipReasons.join("|") : undefined,
+    skipReason: distinctUnarmed(perfs.map((p) => p.staticDedupSkipReason)),
+    ineligibleCause: distinctUnarmed(perfs.map((p) => p.staticDedupIneligibleCause)),
+    ...(verificationPerfs.length === 0
+      ? {}
+      : {
+          verifiedFrames: verificationPerfs.reduce(
+            (sum, perf) => sum + (perf.staticDedupVerified ?? 0),
+            0,
+          ),
+          verificationOutcomes,
+          plannedRuns: verificationPerfs.reduce(
+            (sum, perf) => sum + (perf.staticDedupVerificationPlannedRuns ?? 0),
+            0,
+          ),
+          completedRuns: verificationPerfs.reduce(
+            (sum, perf) => sum + (perf.staticDedupVerificationCompletedRuns ?? 0),
+            0,
+          ),
+          screenshots: verificationPerfs.reduce(
+            (sum, perf) => sum + (perf.staticDedupVerificationScreenshots ?? 0),
+            0,
+          ),
+          seeks: verificationPerfs.reduce(
+            (sum, perf) => sum + (perf.staticDedupVerificationSeeks ?? 0),
+            0,
+          ),
+          comparisons: verificationPerfs.reduce(
+            (sum, perf) => sum + (perf.staticDedupVerificationComparisons ?? 0),
+            0,
+          ),
+          verificationElapsedMs: verificationPerfs.reduce(
+            (sum, perf) => sum + (perf.staticDedupVerificationElapsedMs ?? 0),
+            0,
+          ),
+        }),
   };
 }
 
@@ -176,6 +348,21 @@ function aggregateBeginFrameReuse(
   const hasDamageFrames = perfs.reduce((sum, p) => sum + (p.beginFrameHasDamage ?? 0), 0);
   if (noDamageFrames + hasDamageFrames === 0) return undefined;
   return { noDamageFrames, hasDamageFrames };
+}
+
+/** The page's blur outcome across sessions: first reported value wins, failed frames sum. */
+function aggregateMotionBlur(perfs: CapturePerfSummary[]): RenderPerfSummary["motionBlur"] {
+  const ran = perfs.flatMap((p) => p.motionBlur ?? []).filter((m) => m.tier || m.failedFrames > 0);
+  const first = ran[0];
+  if (!first) return undefined;
+  return {
+    tier: first.tier ?? ran.find((m) => m.tier)?.tier ?? null,
+    reasonCode: first.reasonCode,
+    movers: first.movers,
+    failedFrames: ran.reduce((sum, m) => sum + m.failedFrames, 0),
+    readEvents: ran.some((m) => m.readEvents),
+    fingerprint: ran.find((m) => m.fingerprint)?.fingerprint ?? null,
+  };
 }
 
 export function buildRenderPerfSummary(input: {
@@ -208,6 +395,8 @@ export function buildRenderPerfSummary(input: {
   /** Per-session/per-worker static-dedup perf; aggregated into `staticDedup`. */
   dedupPerfs: CapturePerfSummary[];
   drawElement?: DrawElementPerfInput;
+  /** `cfg.disableGpu` — the hard `--disable-gpu` flag, for the `host` GPU picture. */
+  gpuDisabled: boolean;
 }): RenderPerfSummary {
   return {
     renderId: input.job.id,
@@ -261,13 +450,30 @@ export function buildRenderPerfSummary(input: {
       if (withSamples.length === 0) return undefined;
       return withSamples.reduce((a, b) => (b.frames > a.frames ? b : a)).p50TotalMs;
     })(),
+    captureSeekAvgMs: frameWeightedAvgMs(input.dedupPerfs, (p) => p.avgSeekMs),
+    captureBeforeCaptureAvgMs: frameWeightedAvgMs(input.dedupPerfs, (p) => p.avgBeforeCaptureMs),
+    captureScreenshotAvgMs: frameWeightedAvgMs(input.dedupPerfs, (p) => p.avgScreenshotMs),
+    encoderWaitAvgMs:
+      input.perfStages.encoderDrainWaitMs !== undefined && input.totalFrames > 0
+        ? Math.round(input.perfStages.encoderDrainWaitMs / input.totalFrames)
+        : undefined,
     peakRssMb: Math.round(input.peakRssBytes / (1024 * 1024)),
     peakHeapUsedMb: Math.round(input.peakHeapUsedBytes / (1024 * 1024)),
     staticDedup: aggregateDedup(input.dedupPerfs),
+    chromeMemory: aggregateChromeMemory(input.dedupPerfs),
     beginFrameReuse: aggregateBeginFrameReuse(input.dedupPerfs),
+    motionBlur: aggregateMotionBlur(input.dedupPerfs),
     drawElement: aggregateDrawElement(
       input.dedupPerfs,
       input.drawElement ?? { selfVerifyFallback: false },
     ),
+    host: {
+      platform: platform(),
+      arch: arch(),
+      cpuCount: hostCpuCount(),
+      totalMemMb: Math.round(totalmem() / (1024 * 1024)),
+      nodeVersion: process.version,
+      gpuDisabled: input.gpuDisabled,
+    },
   };
 }

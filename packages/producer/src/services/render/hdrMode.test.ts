@@ -7,7 +7,14 @@
 
 import { describe, expect, it, vi } from "vitest";
 import type { ExtractionResult, VideoColorSpace } from "@hyperframes/engine";
-import { resolveEffectiveHdrMode } from "./hdrMode.js";
+import {
+  findRenderHdrAutoPromotionTrigger,
+  rendersSdrOnly,
+  resolveEffectiveHdrMode,
+} from "./hdrMode.js";
+
+const NO_MEDIA = { videos: [], images: [] };
+const GRADED_VIDEO = { videos: [{ graded: true }, {}], images: [] };
 
 function makeLog() {
   return { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
@@ -37,9 +44,41 @@ const HDR_PQ: VideoColorSpace = {
 };
 
 describe("resolveEffectiveHdrMode", () => {
+  it("keeps an auto render with graded media SDR when an HDR source would promote it, and says why", () => {
+    const log = makeLog();
+    const result = resolveEffectiveHdrMode({
+      media: GRADED_VIDEO,
+      hdrMode: "auto",
+      outputFormat: "mp4",
+      extractionResult: extractionWith([HDR_PQ]),
+      imageColorSpaces: [],
+      log,
+    });
+    expect(result).toBeUndefined();
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("color grading is SDR-only"));
+    expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining("auto-promotion"));
+  });
+
+  it("keeps --hdr with graded media HDR and warns that the grades are SDR", () => {
+    const log = makeLog();
+    const result = resolveEffectiveHdrMode({
+      media: { videos: [], images: [{ graded: true }] },
+      hdrMode: "force-hdr",
+      outputFormat: "mp4",
+      extractionResult: extractionWith([HDR_PQ]),
+      imageColorSpaces: [],
+      log,
+    });
+    expect(result).toEqual({ transfer: "pq" });
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("graded elements are graded in SDR"),
+    );
+  });
+
   it("returns undefined when force-sdr is set, regardless of HDR sources", () => {
     const log = makeLog();
     const result = resolveEffectiveHdrMode({
+      media: NO_MEDIA,
       hdrMode: "force-sdr",
       outputFormat: "mp4",
       extractionResult: extractionWith([HDR_PQ]),
@@ -53,19 +92,26 @@ describe("resolveEffectiveHdrMode", () => {
   it("auto-detects HDR from video sources when format=mp4", () => {
     const log = makeLog();
     const result = resolveEffectiveHdrMode({
-      hdrMode: "auto",
+      media: NO_MEDIA,
+      hdrMode: undefined,
       outputFormat: "mp4",
       extractionResult: extractionWith([HDR_PQ]),
       imageColorSpaces: [],
+      autoPromotionTrigger: "assets/source-hdr.mp4?token=secret\r\n[ERROR] forged",
       log,
     });
     expect(result).toEqual({ transfer: "pq" });
-    expect(log.info).toHaveBeenCalledWith(expect.stringContaining("auto-detected from source(s)"));
+    expect(log.warn).toHaveBeenCalledTimes(1);
+    expect(log.warn).toHaveBeenCalledWith(
+      '[Render] HDR auto-promotion triggered by "assets/source-hdr.mp4", output: BT.2020 / HEVC Main10',
+    );
+    expect(log.info).not.toHaveBeenCalled();
   });
 
   it("auto-detects SDR with no HDR sources", () => {
     const log = makeLog();
     const result = resolveEffectiveHdrMode({
+      media: NO_MEDIA,
       hdrMode: "auto",
       outputFormat: "mp4",
       extractionResult: extractionWith([]),
@@ -73,12 +119,13 @@ describe("resolveEffectiveHdrMode", () => {
       log,
     });
     expect(result).toBeUndefined();
-    expect(log.info).toHaveBeenCalledWith("[Render] No HDR sources detected — rendering SDR");
+    expect(log.info).toHaveBeenCalledWith("[Render] No HDR sources detected, rendering SDR");
   });
 
   it("force-hdr without sources falls back to HLG and warns", () => {
     const log = makeLog();
     const result = resolveEffectiveHdrMode({
+      media: NO_MEDIA,
       hdrMode: "force-hdr",
       outputFormat: "mp4",
       extractionResult: extractionWith([]),
@@ -94,6 +141,7 @@ describe("resolveEffectiveHdrMode", () => {
   it("force-hdr uses the dominant probed transfer when sources are HDR", () => {
     const log = makeLog();
     const result = resolveEffectiveHdrMode({
+      media: NO_MEDIA,
       hdrMode: "force-hdr",
       outputFormat: "mp4",
       extractionResult: extractionWith([HDR_PQ]),
@@ -108,6 +156,7 @@ describe("resolveEffectiveHdrMode", () => {
     for (const fmt of ["webm", "mov", "png-sequence"] as const) {
       const log = makeLog();
       const result = resolveEffectiveHdrMode({
+        media: NO_MEDIA,
         hdrMode: "auto",
         outputFormat: fmt,
         extractionResult: extractionWith([HDR_PQ]),
@@ -116,14 +165,41 @@ describe("resolveEffectiveHdrMode", () => {
       });
       expect(result).toBeUndefined();
       expect(log.warn).toHaveBeenCalledWith(
-        expect.stringContaining(`format is "${fmt}" — falling back to SDR`),
+        expect.stringContaining(`format is "${fmt}", so falling back to SDR`),
+      );
+      expect(log.warn).toHaveBeenCalledWith(
+        expect.stringContaining("HDR + alpha is not supported"),
       );
     }
+  });
+
+  // hls is the one non-mp4 format downgraded for a reason other than alpha:
+  // HDR10 would need HEVC in fMP4 segments. `force-hdr` + `hls` is rejected
+  // before the render starts, so only auto-detect reaches this gate.
+  it("downgrades auto-detected HDR on hls with an SDR-only reason, not the alpha one", () => {
+    const log = makeLog();
+    const result = resolveEffectiveHdrMode({
+      media: NO_MEDIA,
+      hdrMode: "auto",
+      outputFormat: "hls",
+      extractionResult: extractionWith([HDR_PQ]),
+      imageColorSpaces: [],
+      log,
+    });
+    expect(result).toBeUndefined();
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining('format is "hls", so falling back to SDR'),
+    );
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining("HLS output is SDR-only (H.264 in MPEG-TS)"),
+    );
+    expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining("HDR + alpha"));
   });
 
   it("force-hdr without sources + non-mp4 format: still downgrades, two warns fire", () => {
     const log = makeLog();
     const result = resolveEffectiveHdrMode({
+      media: NO_MEDIA,
       hdrMode: "force-hdr",
       outputFormat: "webm",
       extractionResult: extractionWith([]),
@@ -143,5 +219,40 @@ describe("resolveEffectiveHdrMode", () => {
       2,
       expect.stringContaining("HDR forced by --hdr flag, but no HDR sources were detected"),
     );
+  });
+});
+
+describe("findRenderHdrAutoPromotionTrigger", () => {
+  it("maps a successfully extracted remote HDR video back to its authored source", () => {
+    const extractionResult = extractionWith([HDR_PQ])!;
+    extractionResult.extracted[0]!.videoId = "remote-video";
+
+    expect(
+      findRenderHdrAutoPromotionTrigger({
+        extractionResult,
+        videos: [{ id: "remote-video", src: "https://media.example/hdr.mp4?token=secret" }],
+        images: [],
+        nativeHdrImageIds: new Set(),
+      }),
+    ).toBe("https://media.example/hdr.mp4?token=secret");
+  });
+
+  it("falls back to the native HDR image when no extracted video is HDR", () => {
+    expect(
+      findRenderHdrAutoPromotionTrigger({
+        extractionResult: undefined,
+        videos: [{ id: "unextracted-video", src: "assets/unextracted.mp4" }],
+        images: [{ id: "hero-image", src: "assets/hero.png" }],
+        nativeHdrImageIds: new Set(["hero-image"]),
+      }),
+    ).toBe("assets/hero.png");
+  });
+});
+
+describe("rendersSdrOnly", () => {
+  it("is true for an auto render with graded media, so HDR sources are tone-mapped before the grade", () => {
+    expect(rendersSdrOnly({ hdrMode: undefined, format: "mp4" }, GRADED_VIDEO)).toBe(true);
+    expect(rendersSdrOnly({ hdrMode: "auto", format: "mp4" }, NO_MEDIA)).toBe(false);
+    expect(rendersSdrOnly({ hdrMode: "force-hdr", format: "mp4" }, GRADED_VIDEO)).toBe(false);
   });
 });

@@ -1,5 +1,7 @@
+import { editsPlainCss } from "../../hooks/gsapRuntimeKeyframes";
 import type { DomEditSelection } from "./domEditingTypes";
-import { readStudioBoxSize, readStudioPathOffset } from "./manualEdits";
+import { readStudioBoxSize } from "./manualEdits";
+import { readMoveOffset, UNREADABLE_TRANSLATE } from "./plainTranslate";
 import { parsePxMetricValue, type PropertyPanelProps } from "./propertyPanelHelpers";
 
 interface TransformCommitDeps {
@@ -41,13 +43,13 @@ export function createTransformCommitHandlers({
   // Route a transform value into the GSAP animation (or a new keyframe) when the
   // element is animated. Returns true when handled, so callers fall through to
   // the manual-transform path only for non-animated elements.
-  const commitAnimatedTransformValue = (
+  const commitAnimatedTransformValue = async (
     property: string,
     value: number,
     noCallbacksMessage: string,
-  ): boolean => {
+  ): Promise<boolean> => {
     if (onCommitAnimatedProperty && hasGsapAnimation) {
-      void onCommitAnimatedProperty(element, property, value);
+      await onCommitAnimatedProperty(element, property, value);
       return true;
     }
     if (gsapKeyframes && gsapAnimId && onAddKeyframe) {
@@ -62,36 +64,40 @@ export function createTransformCommitHandlers({
     return false;
   };
 
-  const commitManualOffset = (axis: "x" | "y", nextValue: string) => {
+  const commitManualOffset = async (axis: "x" | "y", nextValue: string) => {
     const parsed = parsePxMetricValue(nextValue);
     if (parsed == null) return;
     if (
-      commitAnimatedTransformValue(
+      await commitAnimatedTransformValue(
         axis,
         parsed,
-        "Cannot edit position — animation callbacks not available",
+        "This element's position can't be edited here yet: its animation drives it",
       )
     )
       return;
-    const current = readStudioPathOffset(element.element);
-    void Promise.resolve(
-      onSetManualOffset(element, {
-        x: axis === "x" ? parsed : current.x,
-        y: axis === "y" ? parsed : current.y,
-      }),
-    ).catch(() => undefined);
+    const plainTranslate = editsPlainCss(element.element, "move");
+    const current = readMoveOffset(element.element, plainTranslate);
+    if (!Number.isFinite(current.x) || !Number.isFinite(current.y))
+      return void showToast?.(UNREADABLE_TRANSLATE);
+    await Promise.resolve(
+      onSetManualOffset(
+        element,
+        { x: axis === "x" ? parsed : current.x, y: axis === "y" ? parsed : current.y },
+        { plainTranslate },
+      ),
+    );
   };
 
   // fallow-ignore-next-line complexity
-  const commitManualSize = (axis: "width" | "height", nextValue: string) => {
+  const commitManualSize = async (axis: "width" | "height", nextValue: string) => {
     const parsed = parsePxMetricValue(nextValue);
     if (parsed == null || parsed <= 0) return;
     if (onCommitAnimatedProperty && hasGsapAnimation) {
-      void onCommitAnimatedProperty(element, axis, parsed);
+      await onCommitAnimatedProperty(element, axis, parsed);
       return;
     }
     if (hasGsapAnimation) {
-      showToast?.("Cannot edit size — animation callbacks not available");
+      showToast?.("This element's size can't be edited here yet: its animation drives it");
       return;
     }
     const current = readStudioBoxSize(element.element);
@@ -103,26 +109,26 @@ export function createTransformCommitHandlers({
       current.height > 0
         ? current.height
         : (parsePxMetricValue(styles.height ?? "") ?? element.boundingBox.height);
-    void Promise.resolve(
+    await Promise.resolve(
       onSetManualSize(element, {
         width: axis === "width" ? parsed : width,
         height: axis === "height" ? parsed : height,
       }),
-    ).catch(() => undefined);
+    );
   };
 
-  const commitManualRotation = (nextValue: string) => {
+  const commitManualRotation = async (nextValue: string) => {
     const parsed = Number.parseFloat(nextValue);
     if (!Number.isFinite(parsed)) return;
     if (
-      commitAnimatedTransformValue(
+      await commitAnimatedTransformValue(
         "rotation",
         parsed,
-        "Cannot edit rotation — animation callbacks not available",
+        "This element's rotation can't be edited here yet: its animation drives it",
       )
     )
       return;
-    void Promise.resolve(onSetManualRotation(element, { angle: parsed })).catch(() => undefined);
+    await Promise.resolve(onSetManualRotation(element, { angle: parsed }));
   };
 
   return { commitManualOffset, commitManualSize, commitManualRotation };

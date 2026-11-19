@@ -1,13 +1,46 @@
 import { describe, expect, it } from "vitest";
 import {
   rewriteAssetPath,
+  rewriteAssetPaths,
   rewriteCssAssetUrls,
   rewriteInlineStyleAssetUrls,
 } from "./rewriteSubCompPaths.js";
 
 describe("rewriteAssetPath", () => {
+  it("probes a raw filename and emits URL spelling with its suffix preserved", () => {
+    const probed: string[] = [];
+    const output = rewriteAssetPath(
+      "scenes%20?/scene.html",
+      "clip%3F%2520%23.png?v=2#frame",
+      (path) => {
+        probed.push(path);
+        return true;
+      },
+    );
+    expect(probed).toEqual(["scenes%20?/clip?%20#.png"]);
+    expect(output).toBe("scenes%2520%3F/clip%3F%2520%23.png?v=2#frame");
+  });
+
+  it("decodes traversal before rebasing and preserves URL suffixes", () => {
+    expect(rewriteAssetPath("scenes%20?/scene.html", "%2e%2e/clip%3F%2520%23.png?v=2#frame")).toBe(
+      "clip%3F%2520%23.png?v=2#frame",
+    );
+  });
+
   it("rewrites `../` against the sub-composition dir", () => {
     expect(rewriteAssetPath("compositions/scene.html", "../icon.svg")).toBe("icon.svg");
+  });
+
+  it("rewrites a backslash-separated `..\\` path like its slash form", () => {
+    expect(rewriteAssetPath("compositions/scene.html", "..\\assets\\x.png")).toBe("assets/x.png");
+  });
+
+  it("keeps an encoded backslash in the name and a leading backslash absolute, as browsers do", () => {
+    const exists = () => true;
+    expect(rewriteAssetPath("compositions/scene.html", "a%5Cb.png", exists)).toBe(
+      "compositions/a%5Cb.png",
+    );
+    expect(rewriteAssetPath("compositions/scene.html", "\\x.png", exists)).toBe("\\x.png");
   });
 
   it("leaves plain relative paths untouched", () => {
@@ -54,5 +87,79 @@ describe("rewriteAssetPath", () => {
     );
 
     expect(elements[0]?.style).toBe(`background-image: url("cover.png")`);
+  });
+
+  // A sub-composition referencing a SIBLING file (`_shared.css`, no `../`) means
+  // a file in its own directory, but the inlined/preview document resolves it
+  // against the project root — so it 404s. `assetExists` lets a caller that can
+  // see the filesystem opt into browser semantics, while paths with no such
+  // sibling (the registry's project-root `assets/logo.png` convention) stay put.
+  describe("with an assetExists probe", () => {
+    const exists = (p: string) =>
+      [
+        "design/styleframes/_shared.css",
+        "design/styleframes/frame.png",
+        "assets/logo.png",
+      ].includes(p);
+
+    it("resolves a sibling file against the sub-composition dir", () => {
+      expect(rewriteAssetPath("design/styleframes/frame-01.html", "_shared.css", exists)).toBe(
+        "design/styleframes/_shared.css",
+      );
+    });
+
+    it("keeps a query string and hash on the rewritten path", () => {
+      expect(rewriteAssetPath("design/styleframes/frame-01.html", "frame.png?v=2", exists)).toBe(
+        "design/styleframes/frame.png?v=2",
+      );
+    });
+
+    it("leaves project-root-relative paths alone when no sibling exists", () => {
+      expect(rewriteAssetPath("blocks/hero.html", "assets/logo.png", exists)).toBe(
+        "assets/logo.png",
+      );
+    });
+
+    it("still resolves `../` without consulting the probe", () => {
+      expect(rewriteAssetPath("compositions/scene.html", "../icon.svg", exists)).toBe("icon.svg");
+    });
+
+    it("is a no-op without the probe (unchanged default)", () => {
+      expect(rewriteAssetPath("design/styleframes/frame-01.html", "_shared.css")).toBe(
+        "_shared.css",
+      );
+    });
+  });
+});
+
+describe("rebasing charge", () => {
+  it("reports what each rebased reference adds, for every rewrite path", () => {
+    const added: number[] = [];
+    const charge = (bytes: number) => added.push(bytes);
+    rewriteAssetPath("scenes/a/scene.html", "../logo.png", undefined, charge);
+    rewriteCssAssetUrls(
+      "a { background: url(../bg.png) }",
+      "scenes/a/scene.html",
+      undefined,
+      charge,
+    );
+    const el = { srcset: "../x.png 1x, ../y.png 2x", style: "background: url(../s.png)" };
+    rewriteAssetPaths(
+      [el],
+      "scenes/a/scene.html",
+      (e, attr) => (attr === "srcset" ? e.srcset : null),
+      () => {},
+      undefined,
+      charge,
+    );
+    rewriteInlineStyleAssetUrls(
+      [el],
+      "scenes/a/scene.html",
+      (e) => e.style,
+      () => {},
+      undefined,
+      charge,
+    );
+    expect(added).toEqual([4, 4, 4, 4, 4]);
   });
 });

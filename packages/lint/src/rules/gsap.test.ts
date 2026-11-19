@@ -3,6 +3,100 @@ import { describe, it, expect } from "vitest";
 import { lintHyperframeHtml } from "../hyperframeLinter.js";
 
 describe("GSAP rules", () => {
+  it("warns when a GSAP color tween uses an undefined CSS variable", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080">
+    <h1 id="title">Visible text</h1>
+  </div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    tl.to("#title", { color: "var(--accent2)", duration: 0.5 }, 0);
+    window.__timelines = { c1: tl };
+  </script>
+</body></html>`;
+
+    const result = await lintHyperframeHtml(html);
+    expect(
+      result.findings.find((finding) => finding.code === "gsap_undefined_css_variable"),
+    ).toMatchObject({
+      severity: "warning",
+      selector: "#title",
+    });
+  });
+
+  it("checks both ends of a fromTo color tween", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"><h1 id="title">Text</h1></div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#title", { color: "var(--missing-from)" }, { color: "#fff", duration: 0.5 }, 0);
+    window.__timelines = { c1: tl };
+  </script>
+</body></html>`;
+
+    const result = await lintHyperframeHtml(html);
+    expect(
+      result.findings.find((finding) => finding.code === "gsap_undefined_css_variable")?.message,
+    ).toContain("--missing-from");
+  });
+
+  it.each([
+    ["style block", `<style>:root { --accent2: #ff3366; }</style>`],
+    ["inline style", `<div style="--accent2: #ff3366"></div>`],
+  ])("accepts a GSAP CSS variable defined in a %s", async (_source, definition) => {
+    const html = `
+<html><head>${definition}</head><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"><h1 id="title">Text</h1></div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    tl.to("#title", { color: "var(--accent2)", duration: 0.5 }, 0);
+    window.__timelines = { c1: tl };
+  </script>
+</body></html>`;
+
+    const result = await lintHyperframeHtml(html);
+    expect(
+      result.findings.find((finding) => finding.code === "gsap_undefined_css_variable"),
+    ).toBeUndefined();
+  });
+
+  it("accepts an undefined CSS variable with a var() fallback", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"><h1 id="title">Text</h1></div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    tl.to("#title", { color: "var(--accent2, #fff)", duration: 0.5 }, 0);
+    window.__timelines = { c1: tl };
+  </script>
+</body></html>`;
+
+    const result = await lintHyperframeHtml(html);
+    expect(
+      result.findings.find((finding) => finding.code === "gsap_undefined_css_variable"),
+    ).toBeUndefined();
+  });
+
+  it("accepts a CSS variable declared through data-composition-variables", async () => {
+    const html = `
+<html data-composition-variables='[{"id":"accent2","type":"color","label":"Accent","default":"#ff3366"}]'>
+<body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"><h1 id="title">Text</h1></div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    tl.to("#title", { color: "var(--accent2)", duration: 0.5 }, 0);
+    window.__timelines = { c1: tl };
+  </script>
+</body></html>`;
+
+    const result = await lintHyperframeHtml(html);
+    expect(
+      result.findings.find((finding) => finding.code === "gsap_undefined_css_variable"),
+    ).toBeUndefined();
+  });
+
   it("errors when window.__timelines is registered BEFORE the fonts.ready build", async () => {
     const html = `
 <html><body>
@@ -42,6 +136,79 @@ describe("GSAP rules", () => {
       (f) => f.code === "gsap_timeline_registered_before_async_build",
     );
     expect(finding).toBeUndefined();
+  });
+
+  it.each([
+    ["bracket / load", 'window.__timelines["c1"]', 'document.fonts.load("16px Inter")'],
+    ["dot / ready", "window.__timelines.c1", "document.fonts.ready"],
+    ["dot / load", "window.__timelines.c1", 'document.fonts.load("16px Inter")'],
+    ["spaced dot / load", "window . __timelines . c1", 'document . fonts . load("16px Inter")'],
+  ])("flags early registration with %s", async (_label, registry, fontWait) => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"><h1 id="title">Text</h1></div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    ${registry} = tl;
+    ${fontWait}.then(() => {
+      tl.to("#title", { x: 20, duration: 1 });
+    });
+  </script>
+</body></html>`;
+
+    const result = await lintHyperframeHtml(html);
+    expect(
+      result.findings.filter(
+        (finding) => finding.code === "gsap_timeline_registered_before_async_build",
+      ),
+    ).toEqual([expect.objectContaining({ severity: "error" })]);
+  });
+
+  it.each([
+    ['window.__timelines["c1"]', "document.fonts.ready"],
+    ['window.__timelines["c1"]', 'document.fonts.load("16px Inter")'],
+    ["window.__timelines.c1", "document.fonts.ready"],
+    ["window.__timelines.c1", 'document.fonts.load("16px Inter")'],
+  ])("accepts %s registered after %s builds the timeline", async (registry, fontWait) => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"><h1 id="title">Text</h1></div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    const existing = ${registry};
+    ${fontWait}.then(() => {
+      tl.to("#title", { x: 20, duration: 1 });
+      ${registry} = tl;
+    });
+  </script>
+</body></html>`;
+
+    const result = await lintHyperframeHtml(html);
+    expect(
+      result.findings.find(
+        (finding) => finding.code === "gsap_timeline_registered_before_async_build",
+      ),
+    ).toBeUndefined();
+  });
+
+  it("accepts a fonts.load callback that adds no deferred animation", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"><h1 id="title">Text</h1></div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    tl.to("#title", { x: 20, duration: 1 });
+    window.__timelines.c1 = tl;
+    document.fonts.load("16px Inter").then(() => console.log("fonts loaded"));
+  </script>
+</body></html>`;
+
+    const result = await lintHyperframeHtml(html);
+    expect(
+      result.findings.find(
+        (finding) => finding.code === "gsap_timeline_registered_before_async_build",
+      ),
+    ).toBeUndefined();
   });
 
   it("does NOT error when GSAP animates opacity on a clip element (by id)", async () => {
@@ -240,27 +407,6 @@ describe("GSAP rules", () => {
     ).toHaveLength(1);
   });
 
-  it("errors when a full-frame transition flash uses a GSAP from reveal", async () => {
-    const html = `
-<html><body data-composition-id="c1" data-width="1920" data-height="1080">
-  <div id="tr-flash-1" style="position:fixed;inset:0;background:#fff;pointer-events:none;z-index:990"></div>
-  <section class="clip" data-start="0" data-duration="8"><h1>Scene 1</h1></section>
-  <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
-  <script>
-    window.__timelines = window.__timelines || {};
-    const tl = gsap.timeline({ paused: true });
-    tl.from("#tr-flash-1", { opacity: 0, duration: 0.18 }, 7.92);
-    window.__timelines["c1"] = tl;
-  </script>
-</body></html>`;
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find(
-      (f) => f.code === "gsap_fullscreen_overlay_starts_visible",
-    );
-    expect(finding).toBeDefined();
-    expect(finding?.selector).toBe("#tr-flash-1");
-  });
-
   it("errors when a grouped GSAP selector targets a visible full-frame flash", async () => {
     const html = `
 <html><body data-composition-id="c1" data-width="1920" data-height="1080">
@@ -408,6 +554,53 @@ describe("GSAP rules", () => {
     expect(finding?.message).toContain("visibility");
   });
 
+  it("ERRORS when GSAP animates autoAlpha on a clip element", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080">
+    <div id="incoming" class="clip" data-start="1.01" data-duration="5" data-track-index="1">
+      <p>Incoming scene</p>
+    </div>
+  </div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#incoming", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.3 }, 1.01);
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "gsap_animates_clip_element");
+
+    expect(finding).toBeDefined();
+    expect(finding?.severity).toBe("error");
+    expect(finding?.message).toContain("autoAlpha");
+    expect(finding?.fixHint).toContain("child");
+  });
+
+  it("does NOT flag autoAlpha on content inside a clip", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080">
+    <div id="incoming" class="clip" data-start="1.01" data-duration="5" data-track-index="1">
+      <p id="content">Incoming scene</p>
+    </div>
+  </div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#content", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.3 }, 1.01);
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "gsap_animates_clip_element");
+
+    expect(finding).toBeUndefined();
+  });
+
   it("ERRORS when GSAP animates display on a clip element", async () => {
     const html = `
 <html><body>
@@ -476,6 +669,27 @@ describe("GSAP rules", () => {
     expect(finding?.selector).toBe("#title");
     expect(finding?.fixHint).toMatch(/fromTo/);
     expect(finding?.fixHint).toMatch(/xPercent/);
+  });
+
+  it("warns for every selector of a comma list with a CSS scale transform, not only the last", async () => {
+    const html = `
+<html><body>
+  <div id="root" data-composition-id="c1" data-width="1920" data-height="1080">
+    <div id="hero"></div><div id="badge"></div>
+  </div>
+  <style>
+    #hero, #badge { transform: scale(0.8); }
+  </style>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.to("#hero", { scale: 1, duration: 0.5 }, 1.0);
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "gsap_css_transform_conflict");
+    expect(finding?.selector).toBe("#hero");
   });
 
   it("warns when tl.to animates scale on an element with CSS scale transform", async () => {
@@ -584,6 +798,31 @@ describe("GSAP rules", () => {
     const conflicts = result.findings.filter((f) => f.code === "gsap_css_transform_conflict");
     expect(conflicts).toHaveLength(1);
     expect(conflicts[0]?.message).toMatch(/x\/scale|scale\/x/);
+  });
+
+  it("does not duplicate the CSS transform text when one declaration matches both translate and scale", async () => {
+    const html = `
+<html><body>
+  <div id="root" data-composition-id="c1" data-width="1920" data-height="1080">
+    <div id="scene-1" class="scene-1">hi</div>
+  </div>
+  <style>
+    .scene-1 { transform: scale(1.08) translate3d(1.5%, 0, 0); }
+  </style>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.to(".scene-1", { duration: 1, x: 100, scale: 1.2 });
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const conflict = result.findings.find((f) => f.code === "gsap_css_transform_conflict");
+    expect(conflict).toBeDefined();
+    const doubled = "scale(1.08) translate3d(1.5%, 0, 0) scale(1.08) translate3d(1.5%, 0, 0)";
+    expect(conflict?.message).not.toContain(doubled);
+    expect(conflict?.fixHint).not.toContain(doubled);
+    expect(conflict?.message).toContain("transform: scale(1.08) translate3d(1.5%, 0, 0)");
   });
 
   // --- Inline style transform detection tests ---
@@ -773,6 +1012,72 @@ describe("GSAP rules", () => {
     expect(finding?.message).toContain("GSAP");
   });
 
+  it.each([
+    ["after the script that uses it", "", '<script src="./gsap.min.js"></script>'],
+    ["with defer before it", '<script defer src="./gsap.min.js"></script>', ""],
+  ])("reports gsap_loaded_after_use when the GSAP tag sits %s", async (_, before, after) => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"></div>
+  ${before}
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    window.__timelines["main"] = tl;
+  </script>
+  ${after}
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "gsap_loaded_after_use");
+    expect(finding?.severity).toBe("error");
+    expect(result.findings.find((f) => f.code === "missing_gsap_script")).toBeUndefined();
+  });
+
+  it.each([
+    [
+      "a defer tag and a DOMContentLoaded listener",
+      '<head><script defer src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script></head>',
+      '<script>window.__timelines={};document.addEventListener("DOMContentLoaded",()=>{window.__timelines.main=gsap.timeline({paused:true});});</script>',
+      "",
+    ],
+    [
+      "a later tag and a load listener",
+      "",
+      '<script>window.addEventListener("load", function () { window.__timelines = { main: gsap.timeline({ paused: true }) }; });</script>',
+      '<script src="./gsap.min.js"></script>',
+    ],
+  ])("does not report gsap_loaded_after_use for %s", async (_, head, body, after) => {
+    const html = `<html>${head}<body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"></div>
+  ${body}
+  ${after}
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    expect(result.findings.find((f) => f.code === "gsap_loaded_after_use")).toBeUndefined();
+  });
+
+  it("reports gsap_loaded_after_use for a function called on the spot before a later tag", async () => {
+    const html = `<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"></div>
+  <script>(function () { window.__timelines = { main: gsap.timeline({ paused: true }) }; })();</script>
+  <script src="./gsap.min.js"></script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    expect(result.findings.find((f) => f.code === "gsap_loaded_after_use")?.severity).toBe("error");
+  });
+
+  it("does not report gsap_loaded_after_use when GSAP loads in the head first", async () => {
+    const html = `
+<html><head><script src="./gsap.min.js"></script></head><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"></div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    window.__timelines["main"] = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    expect(result.findings.find((f) => f.code === "gsap_loaded_after_use")).toBeUndefined();
+  });
+
   it("does not report missing_gsap_script when GSAP CDN script is present", async () => {
     const html = `
 <html><body>
@@ -790,9 +1095,42 @@ describe("GSAP rules", () => {
     expect(finding).toBeUndefined();
   });
 
+  it("reports missing_gsap_script when only a GSAP plugin script is loaded", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"></div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/MotionPathPlugin.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.to("#box", { x: 100, duration: 1 }, 0);
+    window.__timelines["main"] = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "missing_gsap_script");
+    expect(finding?.severity).toBe("error");
+  });
+
+  it.each(["/api/vendor/npm/gsap@3.15.0/dist/gsap.min.js", "assets/gsap-3.14.2.min.js"])(
+    "does not report missing_gsap_script for the local GSAP core %s",
+    async (src) => {
+      const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"></div>
+  <script src="${src}"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    window.__timelines["main"] = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+      const result = await lintHyperframeHtml(html);
+      expect(result.findings.find((f) => f.code === "missing_gsap_script")).toBeUndefined();
+    },
+  );
+
   it("does not report missing_gsap_script when GSAP is bundled inline", async () => {
-    // Simulate a large inline GSAP bundle (>5KB) with GreenSock marker
-    const fakeGsapLib = "/* GreenSock GSAP */" + " ".repeat(6000);
+    const fakeGsapLib = "/*!\n * GSAP 3.15.0\n * https://gsap.com\n */\n" + " ".repeat(6000);
     const html = `
 <html><body>
   <div data-composition-id="main" data-width="1920" data-height="1080"></div>
@@ -807,6 +1145,34 @@ describe("GSAP rules", () => {
     const result = await lintHyperframeHtml(html);
     const finding = result.findings.find((f) => f.code === "missing_gsap_script");
     expect(finding).toBeUndefined();
+  });
+
+  it.each([
+    [
+      "registerPlugin",
+      "gsap.registerPlugin(MotionPathPlugin);",
+      '<script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/MotionPathPlugin.min.js"></script>',
+    ],
+    ["defaults", 'gsap.defaults({ ease: "none" });', ""],
+    ["a large GreenSock comment", "/* GreenSock */" + " ".repeat(6000), ""],
+    [
+      "an inlined plugin",
+      "/* inlined: https://cdn.jsdelivr.net/npm/gsap@3/dist/MotionPathPlugin.min.js */",
+      "",
+    ],
+  ])("reports missing_gsap_script when the only inline GSAP is %s", async (_name, inline, tag) => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"></div>
+  ${tag}
+  <script>${inline}</script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    window.__timelines["main"] = gsap.timeline({ paused: true });
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    expect(result.findings.find((f) => f.code === "missing_gsap_script")?.severity).toBe("error");
   });
 
   it("does not report missing_gsap_script when producer inlined CDN script", async () => {
@@ -863,6 +1229,26 @@ describe("GSAP rules", () => {
     expect(finding?.severity).toBe("error");
     expect(finding?.message).toContain("repeat: -1");
     expect(finding?.fixHint).toContain("Math.max(0, Math.floor");
+  });
+
+  it("warns on repeat: -1 when an explicit finite composition duration bounds export", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080" data-duration="8"></div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.to("#spinner", { rotation: 360, duration: 0.8, repeat: -1, ease: "none" }, 0);
+    window.__timelines["main"] = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "gsap_infinite_repeat");
+    expect(finding).toBeDefined();
+    expect(finding?.severity).toBe("warning");
+    expect(finding?.message).toContain("finite 8s window");
+    expect(finding?.fixHint).toContain("explicit finite composition");
   });
 
   it("does not error on finite repeat values", async () => {
@@ -941,6 +1327,62 @@ describe("GSAP rules", () => {
     expect(finding).toBeUndefined();
   });
 
+  describe("a set that fires inside a running tween on the same property", () => {
+    const lint = (body: string) =>
+      lintHyperframeHtml(`
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080">
+    <h1 id="w" class="clip" data-start="0" data-duration="5" data-track-index="0">IM</h1>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    ${body}
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`);
+    const overlap = (result: Awaited<ReturnType<typeof lint>>) =>
+      result.findings.find((f) => f.code === "overlapping_gsap_tweens");
+
+    it("reports a hide that lands in a pop-in's last frames, naming the element and both times", async () => {
+      const result = await lint(`
+    tl.fromTo("#w", { opacity: 0 }, { opacity: 1, duration: 0.16, ease: "expo.out" }, 0.54);
+    tl.set("#w", { opacity: 0 }, 0.69);`);
+      expect(overlap(result)).toMatchObject({
+        severity: "warning",
+        selector: "#w",
+        message: expect.stringMatching(/set on "#w" for opacity fires at 0\.69s.*0\.54s to 0\.70s/),
+        fixHint: expect.stringContaining("move the set to 0.70s or later"),
+      });
+    });
+
+    it.each([
+      [
+        "after the tween ends",
+        `tl.to("#w", { opacity: 1, duration: 0.16 }, 0.54); tl.set("#w", { opacity: 0 }, 0.7);`,
+      ],
+      [
+        "on the tween's first frame",
+        `tl.to("#w", { opacity: 1, duration: 0.16 }, 0.54); tl.set("#w", { opacity: 0 }, 0.54);`,
+      ],
+      [
+        "on another property",
+        `tl.to("#w", { scale: 1.2, duration: 0.16 }, 0.54); tl.set("#w", { opacity: 0 }, 0.6);`,
+      ],
+      [
+        "on another element",
+        `tl.to("#w", { opacity: 1, duration: 0.16 }, 0.54); tl.set("#x", { opacity: 0 }, 0.6);`,
+      ],
+      [
+        "with two sets and no tween",
+        `tl.set("#w", { opacity: 1 }, 0.5); tl.set("#w", { opacity: 0 }, 0.5);`,
+      ],
+    ])("does not report a set %s", async (_label, body) => {
+      expect(overlap(await lint(body))).toBeUndefined();
+    });
+  });
+
   it("does NOT report overlapping_gsap_tweens when an object-target tween is interleaved (regression)", async () => {
     // Regression: a non-DOM-targeting tween like `tl.to({ _: 0 }, …)` (used to
     // anchor timeline duration) was matched by the regex but skipped by the
@@ -959,6 +1401,24 @@ describe("GSAP rules", () => {
     tl.to({ _: 0 }, { _: 1, duration: 5, ease: "none" }, 0);
     tl.to("#a", { opacity: 1, duration: 0.5 }, 0);
     tl.to("#b", { opacity: 1, duration: 0.5 }, 1);
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "overlapping_gsap_tweens");
+    expect(finding).toBeUndefined();
+  });
+
+  it("does NOT report overlapping_gsap_tweens for two inline object proxies with the same values", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"></div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.to({ _: 0 }, { _: 1, duration: 5, ease: "none" }, 0);
+    tl.to({ _: 0 }, { _: 1, duration: 5, ease: "none" }, 1);
     window.__timelines["c1"] = tl;
   </script>
 </body></html>`;
@@ -1009,6 +1469,47 @@ describe("GSAP rules", () => {
     const result = await lintHyperframeHtml(html);
     const finding = result.findings.find((f) => f.code === "overlapping_gsap_tweens");
     expect(finding).toBeDefined();
+  });
+
+  it("does not report overlapping_gsap_tweens when tweens only meet at an endpoint", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080">
+    <div id="w-weeks"></div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.to("#w-weeks", { scaleY: 0.18, scaleX: 1.25, duration: 0.22 }, 2.35);
+    tl.to("#w-weeks", { scaleX: 0, scaleY: 0, duration: 0.14 }, 2.57);
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "overlapping_gsap_tweens");
+    expect(finding).toBeUndefined();
+  });
+
+  it("reports overlapping_gsap_tweens when shared properties overlap for real", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080">
+    <div id="w-weeks"></div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.to("#w-weeks", { scaleX: 1.25, duration: 0.5 }, 2.35);
+    tl.to("#w-weeks", { scaleX: 0, duration: 0.14 }, 2.57);
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "overlapping_gsap_tweens");
+    expect(finding).toBeDefined();
+    expect(finding?.message).toContain("scaleX");
   });
 
   it("reports motionPath usage without MotionPathPlugin", async () => {
@@ -1417,164 +1918,6 @@ describe("GSAP rules", () => {
     expect(finding).toBeUndefined();
   });
 
-  it("warns when an opacity exit ends at a clip start boundary without a hard kill", async () => {
-    const html = `
-<html><body>
-  <div data-composition-id="c1" data-width="1920" data-height="1080" data-start="0" data-duration="6">
-    <div id="scene-a" class="clip" data-start="0" data-duration="3" data-track-index="0">
-      <h1 id="headline">First beat</h1>
-    </div>
-    <div id="scene-b" class="clip" data-start="3" data-duration="3" data-track-index="0">
-      <h1>Second beat</h1>
-    </div>
-  </div>
-  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
-  <script>
-    window.__timelines = window.__timelines || {};
-    const tl = gsap.timeline({ paused: true });
-    tl.to("#headline", { opacity: 0, duration: 0.3 }, 2.7);
-    window.__timelines["c1"] = tl;
-  </script>
-</body></html>`;
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "gsap_exit_missing_hard_kill");
-    expect(finding).toBeDefined();
-    expect(finding?.severity).toBe("error");
-    expect(finding?.selector).toBe("#headline");
-    expect(finding?.message).toContain("3.00s");
-  });
-
-  it("gsap_exit_missing_hard_kill points at the inner-wrapper pattern when the exiting selector is a clip element", async () => {
-    // Regression: a tl.set hard kill on a clip-classed selector is exactly what
-    // gsap_animates_clip_element then errors on — the two rules must not give
-    // contradictory advice for a crossfading scene that is itself class="clip".
-    const html = `
-<html><body>
-  <div data-composition-id="c1" data-width="1920" data-height="1080" data-start="0" data-duration="6">
-    <div id="scene-a" class="clip" data-start="0" data-duration="3" data-track-index="0"></div>
-    <div id="scene-b" class="clip" data-start="3" data-duration="3" data-track-index="0"></div>
-  </div>
-  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
-  <script>
-    window.__timelines = window.__timelines || {};
-    const tl = gsap.timeline({ paused: true });
-    tl.to("#scene-a", { opacity: 0, duration: 0.3 }, 2.7);
-    window.__timelines["c1"] = tl;
-  </script>
-</body></html>`;
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "gsap_exit_missing_hard_kill");
-    expect(finding).toBeDefined();
-    expect(finding?.fixHint).toContain("clip element");
-    expect(finding?.fixHint).toContain("inner");
-    expect(finding?.fixHint).not.toContain('tl.set("#scene-a"');
-  });
-
-  it("does NOT report gsap_exit_missing_hard_kill for an unresolved-target boundary exit", async () => {
-    // The exit tween targets an element via a value the parser cannot resolve (a helper
-    // call), so it collapses to the `__unresolved__` sentinel. You cannot assert a missing
-    // hard kill on an unknown element, and a `tl.set("__unresolved__", ...)` hint is
-    // meaningless. The resolved-target exit in the same timeline is still flagged.
-    const html = `
-<html><body>
-  <div data-composition-id="c1" data-width="1920" data-height="1080" data-start="0" data-duration="6">
-    <div id="scene-a" class="clip" data-start="0" data-duration="3" data-track-index="0">
-      <h1 id="headline">First beat</h1>
-    </div>
-    <div id="scene-b" class="clip" data-start="3" data-duration="3" data-track-index="0">
-      <h1>Second beat</h1>
-    </div>
-  </div>
-  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
-  <script>
-    window.__timelines = window.__timelines || {};
-    const tl = gsap.timeline({ paused: true });
-    const el = pickWord(0);
-    tl.to(el, { opacity: 0, duration: 0.3 }, 2.7);
-    tl.to("#headline", { opacity: 0, duration: 0.3 }, 2.7);
-    window.__timelines["c1"] = tl;
-  </script>
-</body></html>`;
-    const result = await lintHyperframeHtml(html);
-    const exitFindings = result.findings.filter((f) => f.code === "gsap_exit_missing_hard_kill");
-    expect(exitFindings).toHaveLength(1);
-    expect(exitFindings[0]?.selector).toBe("#headline");
-  });
-
-  it("does not warn when a boundary exit has a matching hard kill", async () => {
-    const html = `
-<html><body>
-  <div data-composition-id="c1" data-width="1920" data-height="1080" data-start="0" data-duration="6">
-    <div id="scene-a" class="clip" data-start="0" data-duration="3" data-track-index="0">
-      <h1 id="headline">First beat</h1>
-    </div>
-    <div id="scene-b" class="clip" data-start="3" data-duration="3" data-track-index="0">
-      <h1>Second beat</h1>
-    </div>
-  </div>
-  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
-  <script>
-    window.__timelines = window.__timelines || {};
-    const tl = gsap.timeline({ paused: true });
-    tl.to("#headline", { opacity: 0, duration: 0.3 }, 2.7);
-    tl.set("#headline", { opacity: 0, visibility: "hidden" }, 3);
-    window.__timelines["c1"] = tl;
-  </script>
-</body></html>`;
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "gsap_exit_missing_hard_kill");
-    expect(finding).toBeUndefined();
-  });
-
-  it("does not match sub-composition exits against root clip boundaries", async () => {
-    const html = `
-<html><body>
-  <div data-composition-id="root" data-width="1920" data-height="1080" data-start="0" data-duration="6">
-    <div id="root-a" class="clip" data-start="0" data-duration="3" data-track-index="0"></div>
-    <div id="root-b" class="clip" data-start="3" data-duration="3" data-track-index="0"></div>
-  </div>
-  <div data-composition-id="sub" data-width="1920" data-height="1080" data-start="0" data-duration="4">
-    <div id="sub-a" class="clip" data-start="0" data-duration="2" data-track-index="0">
-      <h1 id="sub-title">Sub scene</h1>
-    </div>
-    <div id="sub-b" class="clip" data-start="2" data-duration="2" data-track-index="0"></div>
-  </div>
-  <script>
-    window.__timelines = window.__timelines || {};
-    const tl = gsap.timeline({ paused: true });
-    tl.to("#sub-title", { opacity: 0, duration: 0.3 }, 2.7);
-    window.__timelines["sub"] = tl;
-  </script>
-</body></html>`;
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "gsap_exit_missing_hard_kill");
-    expect(finding).toBeUndefined();
-  });
-
-  it("uses the authored hidden property in hard-kill fix hints", async () => {
-    const html = `
-<html><body>
-  <div data-composition-id="c1" data-width="1920" data-height="1080" data-start="0" data-duration="6">
-    <div id="scene-a" class="clip" data-start="0" data-duration="3" data-track-index="0">
-      <h1 id="headline">First beat</h1>
-    </div>
-    <div id="scene-b" class="clip" data-start="3" data-duration="3" data-track-index="0">
-      <h1>Second beat</h1>
-    </div>
-  </div>
-  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
-  <script>
-    window.__timelines = window.__timelines || {};
-    const tl = gsap.timeline({ paused: true });
-    tl.to("#headline", { autoAlpha: 0, duration: 0.3 }, 2.7);
-    window.__timelines["c1"] = tl;
-  </script>
-</body></html>`;
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "gsap_exit_missing_hard_kill");
-    expect(finding?.fixHint).toContain("{ autoAlpha: 0 }");
-  });
-
   it("does not false-positive on repeat: -10 (invalid GSAP but not infinite)", async () => {
     const html = `
 <html><body>
@@ -1769,6 +2112,170 @@ describe("GSAP rules", () => {
     expect(finding).toBeDefined();
   });
 
+  it("errors when a grouped gsap.set array hides a fromTo target with no destination opacity", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080">
+    <div id="header">Header</div>
+    <div id="card">Visible after entrance</div>
+  </div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const header = "#header";
+    const card = "#card";
+    gsap.set([header, card], { opacity: 0 });
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#card", { opacity: 1, x: -60 }, { x: 0, duration: 0.5 }, 1);
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find(
+      (f) => f.code === "gsap_cold_seek_hidden_fromto_missing_reveal",
+    );
+    expect(finding).toBeDefined();
+    expect(finding?.selector).toBe("#card");
+  });
+
+  it("errors when a single-element gsap.set array hides a from({opacity:0}) target", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080">
+    <div id="card">Never visible</div>
+  </div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const card = "#card";
+    gsap.set([card], { opacity: 0 });
+    const tl = gsap.timeline({ paused: true });
+    tl.from("#card", { opacity: 0, y: 30, duration: 0.5 }, 0.2);
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "gsap_from_opacity_noop");
+    expect(finding).toBeDefined();
+    expect(finding?.selector).toBe("#card");
+  });
+
+  it("errors when a gsap.set array of quoted selectors hides a fromTo target", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080">
+    <div id="header">Header</div>
+    <div id="card">Visible after entrance</div>
+  </div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    gsap.set(["#header", "#card"], { opacity: 0 });
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#card", { opacity: 1, x: -60 }, { x: 0, duration: 0.5 }, 1);
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find(
+      (f) => f.code === "gsap_cold_seek_hidden_fromto_missing_reveal",
+    );
+    expect(finding).toBeDefined();
+    expect(finding?.selector).toBe("#card");
+  });
+
+  it("errors when a comma-separated gsap.set selector string hides a fromTo target", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080">
+    <div id="header">Header</div>
+    <div id="card">Visible after entrance</div>
+  </div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    gsap.set("#header, #card", { opacity: 0 });
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#card", { opacity: 1, x: -60 }, { x: 0, duration: 0.5 }, 1);
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find(
+      (f) => f.code === "gsap_cold_seek_hidden_fromto_missing_reveal",
+    );
+    expect(finding).toBeDefined();
+    expect(finding?.selector).toBe("#card");
+  });
+
+  it("does NOT error when a grouped gsap.set array sets a non-opacity property", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080">
+    <div id="header">Header</div>
+    <div id="card">Visible after entrance</div>
+  </div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const header = "#header";
+    const card = "#card";
+    gsap.set([header, card], { scaleX: 0, transformOrigin: "left center" });
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#card", { opacity: 1, x: -60 }, { x: 0, duration: 0.5 }, 1);
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find(
+      (f) => f.code === "gsap_cold_seek_hidden_fromto_missing_reveal",
+    );
+    expect(finding).toBeUndefined();
+  });
+
+  it("keeps a later gsap.set hide visible when an earlier one has non-literal vars", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080">
+    <div id="card">Visible after entrance</div>
+  </div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const staggerVars = { y: 20 };
+    gsap.set(document.querySelectorAll(".row"), staggerVars);
+    gsap.set("#card", { opacity: 0 });
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#card", { opacity: 1, x: -60 }, { x: 0, duration: 0.5 }, 1);
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find(
+      (f) => f.code === "gsap_cold_seek_hidden_fromto_missing_reveal",
+    );
+    expect(finding).toBeDefined();
+    expect(finding?.selector).toBe("#card");
+  });
+
+  it("does NOT error when a grouped gsap.set hide sits inside a callback body", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080">
+    <div id="card">Visible after entrance</div>
+  </div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const card = "#card";
+    const tl = gsap.timeline({ paused: true });
+    tl.eventCallback("onComplete", function () {
+      gsap.set([card], { opacity: 0 });
+    });
+    tl.fromTo("#card", { opacity: 1, x: -60 }, { x: 0, duration: 0.5 }, 1);
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find(
+      (f) => f.code === "gsap_cold_seek_hidden_fromto_missing_reveal",
+    );
+    expect(finding).toBeUndefined();
+  });
+
   it("does NOT error when gsap.to() uses opacity:0 (exit animation)", async () => {
     const html = `
 <html><body>
@@ -1894,93 +2401,6 @@ describe("GSAP rules", () => {
 </template>`;
     const result = await lintHyperframeHtml(html);
     const finding = result.findings.find((f) => f.code === "gsap_timeline_not_registered");
-    expect(finding).toBeUndefined();
-  });
-
-  it("scene_layer_missing_visibility_kill: fires when multi-scene exit lacks hard kill", async () => {
-    const html = `
-<html><body>
-  <div data-composition-id="c1" data-width="1920" data-height="1080">
-    <div id="scene1"></div>
-    <div id="scene2"></div>
-  </div>
-  <script>
-    window.__timelines = window.__timelines || {};
-    const tl = gsap.timeline({ paused: true });
-    tl.to("#scene1", { opacity: 0, duration: 0.5 }, 2.0);
-    window.__timelines["c1"] = tl;
-  </script>
-</body></html>`;
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "scene_layer_missing_visibility_kill");
-    expect(finding).toBeDefined();
-    expect(finding?.severity).toBe("error");
-    expect(finding?.elementId).toBe("scene1");
-  });
-
-  it("scene_layer_missing_visibility_kill points at the inner-wrapper pattern when the scene element is a clip", async () => {
-    // Same contradiction as gsap_exit_missing_hard_kill above, via the older
-    // id-pattern-based rule: `tl.set("#scene1", { visibility: "hidden" }, ...)`
-    // on a class="clip" scene element is exactly what gsap_animates_clip_element
-    // then errors on.
-    const html = `
-<html><body>
-  <div data-composition-id="c1" data-width="1920" data-height="1080">
-    <div id="scene1" class="clip"></div>
-    <div id="scene2" class="clip"></div>
-  </div>
-  <script>
-    window.__timelines = window.__timelines || {};
-    const tl = gsap.timeline({ paused: true });
-    tl.to("#scene1", { opacity: 0, duration: 0.5 }, 2.0);
-    window.__timelines["c1"] = tl;
-  </script>
-</body></html>`;
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "scene_layer_missing_visibility_kill");
-    expect(finding).toBeDefined();
-    expect(finding?.fixHint).toContain("clip element");
-    expect(finding?.fixHint).toContain("inner");
-    expect(finding?.fixHint).not.toContain('tl.set("#scene1"');
-  });
-
-  it("scene_layer_missing_visibility_kill: DOES fire when kill is only in a comment (stripJsComments guard)", async () => {
-    const html = `
-<html><body>
-  <div data-composition-id="c1" data-width="1920" data-height="1080">
-    <div id="scene1"></div>
-    <div id="scene2"></div>
-  </div>
-  <script>
-    window.__timelines = window.__timelines || {};
-    const tl = gsap.timeline({ paused: true });
-    // tl.set("#scene1", { visibility: "hidden" }, 2.5);
-    tl.to("#scene1", { opacity: 0, duration: 0.5 }, 2.0);
-    window.__timelines["c1"] = tl;
-  </script>
-</body></html>`;
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "scene_layer_missing_visibility_kill");
-    expect(finding).toBeDefined();
-  });
-
-  it("scene_layer_missing_visibility_kill: does NOT fire when hard kill is present", async () => {
-    const html = `
-<html><body>
-  <div data-composition-id="c1" data-width="1920" data-height="1080">
-    <div id="scene1"></div>
-    <div id="scene2"></div>
-  </div>
-  <script>
-    window.__timelines = window.__timelines || {};
-    const tl = gsap.timeline({ paused: true });
-    tl.to("#scene1", { opacity: 0, duration: 0.5 }, 2.0);
-    tl.set("#scene1", { visibility: "hidden" }, 2.5);
-    window.__timelines["c1"] = tl;
-  </script>
-</body></html>`;
-    const result = await lintHyperframeHtml(html);
-    const finding = result.findings.find((f) => f.code === "scene_layer_missing_visibility_kill");
     expect(finding).toBeUndefined();
   });
 
@@ -2799,6 +3219,67 @@ describe("SVG draw-on rules", () => {
     expect(finding).toBeUndefined();
   });
 
+  it("svg_drawon_css_dasharray_conflict: resolves a template id with a literal segment to the matching element", async () => {
+    const html = `
+<html><body>
+  <style>.wire-b { stroke-dasharray: 10 10; }</style>
+  <div data-composition-id="b" data-width="1920" data-height="1080">
+    <svg><path id="line-b" class="wire-b" d="M 0 0 L 100 100"/></svg>
+  </div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    const name = "b";
+    const target = document.getElementById(\`line-\${name}\`);
+    tl.set(target, { strokeDasharray: 141.4, strokeDashoffset: 141.4 }, 0);
+    window.__timelines["b"] = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "svg_drawon_css_dasharray_conflict");
+    expect(finding).toBeDefined();
+  });
+
+  it("matches a many-placeholder template id against a long near-miss id in linear time", async () => {
+    const template = Array.from({ length: 40 }, () => "${x}").join("a") + "b";
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080">
+    <svg><path id="${"a".repeat(5000)}c" d="M 0 0 L 1 1"/></svg>
+  </div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const el = document.getElementById(\`${template}\`);
+    const tl = gsap.timeline({ paused: true });
+    tl.set(el, { strokeDasharray: 1 }, 0);
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+    const started = performance.now();
+    await lintHyperframeHtml(html);
+    expect(performance.now() - started).toBeLessThan(2000);
+  });
+
+  it("scans a long style block with no braces in linear time", async () => {
+    const html = `<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"></div>
+  <style>${"a ".repeat(40000)}</style>
+</body></html>`;
+    const started = performance.now();
+    await lintHyperframeHtml(html);
+    expect(performance.now() - started).toBeLessThan(3000);
+  });
+
+  it("scans a closed style block of many unclosed rules in linear time", async () => {
+    const html = `<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"></div>
+  <style>${"x{".repeat(40000)}</style>
+</body></html>`;
+    const started = performance.now();
+    await lintHyperframeHtml(html);
+    expect(performance.now() - started).toBeLessThan(2000);
+  });
+
   // ── gsap_timeline_set_initial_hide ─────────────────────────────────────────
 
   it("gsap_timeline_set_initial_hide: warns on tl.set hidden state at position 0", async () => {
@@ -2839,6 +3320,26 @@ describe("SVG draw-on rules", () => {
     const result = await lintHyperframeHtml(html);
     const finding = result.findings.find((f) => f.code === "gsap_timeline_set_initial_hide");
     expect(finding).toBeUndefined();
+  });
+
+  it("gsap_timeline_set_initial_hide: counts every selector of a comma list as hidden by authored CSS", async () => {
+    const html = `
+<html><head><style>#stroke-a, #stroke-b { opacity: 0; }</style></head><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080">
+    <svg width="400" height="200"><path id="stroke-a" d="M0 0 L100 100" /><path id="stroke-b" d="M0 100 L100 0" /></svg>
+  </div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.set("#stroke-a", { opacity: 0 }, 0);
+    tl.set("#stroke-b", { opacity: 0 }, 0);
+    tl.to(["#stroke-a", "#stroke-b"], { opacity: 1, duration: 1 }, 0.5);
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const findings = result.findings.filter((f) => f.code === "gsap_timeline_set_initial_hide");
+    expect(findings).toEqual([]);
   });
 
   it("gsap_timeline_set_initial_hide: does NOT warn when the target is already hidden by authored CSS", async () => {
@@ -2972,6 +3473,331 @@ describe("SVG draw-on rules", () => {
     const result = await lintHyperframeHtml(html);
     const finding = result.findings.find((f) => f.code === "gsap_timeline_set_initial_hide");
     expect(finding).toBeUndefined();
+  });
+
+  it("gsap_repeated_fromto_without_baseline: warns for repeated future fromTo state", async () => {
+    const html = `
+<html><body>
+  <style>#ring { opacity: 0; }</style>
+  <div data-composition-id="main" data-width="1920" data-height="1080">
+    <div id="ring"></div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#ring", { opacity: 0, scale: 1 }, { opacity: 1, duration: 0.5 }, 5);
+    tl.fromTo("#ring", { opacity: 1, scale: 0.4 }, { opacity: 0, duration: 0.5 }, 10);
+    window.__timelines.main = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find(
+      (candidate) => candidate.code === "gsap_repeated_fromto_without_baseline",
+    );
+
+    expect(finding?.severity).toBe("warning");
+    expect(finding?.selector).toBe("#ring");
+    expect(finding?.fixHint).toContain("every fromTo except the earliest-positioned one (at 5s)");
+    expect(finding?.fixHint).toContain("gsap_timeline_set_initial_hide");
+  });
+
+  it("does not warn when two fromTo calls on one element animate different properties", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"><div id="card"></div></div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#card", { y: 80, rotation: 8 }, { y: 0, rotation: 0, duration: 0.8 }, 0.3);
+    tl.fromTo("#card", { scale: 0 }, { scale: 1, duration: 0.65 }, 0.3);
+    window.__timelines.main = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find(
+      (candidate) => candidate.code === "gsap_repeated_fromto_without_baseline",
+    );
+    expect(finding).toBeUndefined();
+  });
+
+  it("gsap_repeated_fromto_without_baseline: accepts the hinted shape when the later tween is authored first", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"><div id="ring"></div></div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#ring", { opacity: 1 }, { opacity: 0, duration: 0.5, immediateRender: false }, 10);
+    tl.fromTo("#ring", { opacity: 0 }, { opacity: 1, duration: 0.5 }, 5);
+    window.__timelines.main = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find(
+      (candidate) => candidate.code === "gsap_repeated_fromto_without_baseline",
+    );
+
+    expect(finding).toBeUndefined();
+  });
+
+  it("gsap_repeated_fromto_without_baseline: accepts explicit immediateRender false", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"><div id="ring"></div></div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#ring", { opacity: 0 }, { opacity: 1, duration: 0.5, immediateRender: false }, 5);
+    tl.fromTo("#ring", { opacity: 1 }, { opacity: 0, duration: 0.5, immediateRender: false }, 10);
+    window.__timelines.main = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find(
+      (candidate) => candidate.code === "gsap_repeated_fromto_without_baseline",
+    );
+
+    expect(finding).toBeUndefined();
+  });
+
+  it("gsap_repeated_fromto_without_baseline: accepts an earlier timeline set baseline", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"><div id="ring"></div></div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.set("#ring", { opacity: 0, scale: 1 }, 0);
+    tl.fromTo("#ring", { opacity: 0 }, { opacity: 1, duration: 0.5 }, 5);
+    tl.fromTo("#ring", { opacity: 1 }, { opacity: 0, duration: 0.5 }, 10);
+    window.__timelines.main = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find(
+      (candidate) => candidate.code === "gsap_repeated_fromto_without_baseline",
+    );
+
+    expect(finding).toBeUndefined();
+  });
+
+  it("gsap_repeated_fromto_without_baseline: rejects an earlier standalone set", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"><div id="ring"></div></div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    gsap.set("#ring", { opacity: 0, scale: 1 });
+    tl.fromTo("#ring", { opacity: 0, scale: 1 }, { opacity: 1, duration: 0.5 }, 5);
+    tl.fromTo("#ring", { opacity: 1, scale: 0.4 }, { opacity: 0, duration: 0.5 }, 10);
+    window.__timelines.main = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find(
+      (candidate) => candidate.code === "gsap_repeated_fromto_without_baseline",
+    );
+
+    expect(finding?.severity).toBe("warning");
+  });
+
+  it("gsap_repeated_fromto_without_baseline: rejects a later incomplete standalone set", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"><div id="ring"></div></div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#ring", { opacity: 0, scale: 1 }, { opacity: 1, duration: 0.5 }, 5);
+    tl.fromTo("#ring", { opacity: 1, scale: 0.4 }, { opacity: 0, duration: 0.5 }, 10);
+    gsap.set("#ring", { x: 0 });
+    window.__timelines.main = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find(
+      (candidate) => candidate.code === "gsap_repeated_fromto_without_baseline",
+    );
+
+    expect(finding?.severity).toBe("warning");
+  });
+
+  it("gsap_repeated_fromto_without_baseline: does not guess that a later standalone set is a timeline baseline", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"><div id="ring"></div></div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#ring", { opacity: 0, scale: 1 }, { opacity: 1, duration: 0.5 }, 5);
+    tl.fromTo("#ring", { opacity: 1, scale: 0.4 }, { opacity: 0, duration: 0.5 }, 10);
+    gsap.set("#ring", { opacity: 0, scale: 1 });
+    window.__timelines.main = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find(
+      (candidate) => candidate.code === "gsap_repeated_fromto_without_baseline",
+    );
+
+    expect(finding?.severity).toBe("warning");
+  });
+
+  it("gsap_repeated_fromto_without_baseline: does not treat a deferred callback set as baseline", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080">
+    <div id="ring"></div><button id="reset"></button>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    document.getElementById("reset").addEventListener("click", () => {
+      gsap.set("#ring", { opacity: 0, scale: 1 });
+    });
+    tl.fromTo("#ring", { opacity: 0 }, { opacity: 1, duration: 0.5 }, 5);
+    tl.fromTo("#ring", { opacity: 1 }, { opacity: 0, duration: 0.5 }, 10);
+    window.__timelines.main = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find(
+      (candidate) => candidate.code === "gsap_repeated_fromto_without_baseline",
+    );
+
+    expect(finding?.severity).toBe("warning");
+  });
+
+  it("gsap_repeated_fromto_without_baseline: requires a timeline baseline to be authored first", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"><div id="ring"></div></div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#ring", { opacity: 0 }, { opacity: 1, duration: 0.5 }, 5);
+    tl.fromTo("#ring", { opacity: 1 }, { opacity: 0, duration: 0.5 }, 10);
+    tl.set("#ring", { opacity: 0 }, 0);
+    window.__timelines.main = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find(
+      (candidate) => candidate.code === "gsap_repeated_fromto_without_baseline",
+    );
+
+    expect(finding?.severity).toBe("warning");
+  });
+
+  it("gsap_repeated_fromto_without_baseline: accepts one future fromTo writer", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080"><div id="ring"></div></div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#ring", { opacity: 0 }, { opacity: 1, duration: 0.5 }, 5);
+    window.__timelines.main = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+
+    expect(
+      result.findings.find(
+        (candidate) => candidate.code === "gsap_repeated_fromto_without_baseline",
+      ),
+    ).toBeUndefined();
+  });
+
+  it("gsap_repeated_fromto_without_baseline: keeps different selectors independent", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="main" data-width="1920" data-height="1080">
+    <div id="ring-a"></div><div id="ring-b"></div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    tl.fromTo("#ring-a", { opacity: 0 }, { opacity: 1, duration: 0.5 }, 5);
+    tl.fromTo("#ring-b", { opacity: 1 }, { opacity: 0, duration: 0.5 }, 10);
+    window.__timelines.main = tl;
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+
+    expect(
+      result.findings.find(
+        (candidate) => candidate.code === "gsap_repeated_fromto_without_baseline",
+      ),
+    ).toBeUndefined();
+  });
+
+  // ── svg_round_cap_hidden_dash ──────────────────────────────────────────────
+
+  const hiddenDashHtml = (pathAttrs: string) => `<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080">
+    <svg><path d="M 0 0 C 100 0 100 100 200 100" fill="none" stroke="#fff" ${pathAttrs}/></svg>
+  </div>
+  <script>window.__timelines = {}; const tl = gsap.timeline({ paused: true }); window.__timelines["c1"] = tl;</script>
+</body></html>`;
+  const roundCapFinding = async (pathAttrs: string) =>
+    (await lintHyperframeHtml(hiddenDashHtml(pathAttrs))).findings.find(
+      (f) => f.code === "svg_round_cap_hidden_dash",
+    );
+
+  it.each([
+    ["round", 'pathLength="100" stroke-dasharray="100" stroke-dashoffset="100"'],
+    ["square", 'pathLength="100" stroke-dasharray="100 100" stroke-dashoffset="100"'],
+    ["round", 'pathLength="100" style="stroke-dasharray: 100; stroke-dashoffset: 100"'],
+    ["round", 'pathLength="1" stroke-dasharray="1" stroke-dashoffset="1"'],
+    ["round", 'pathLength="100" stroke-dasharray="100" stroke-dashoffset="300"'],
+  ])(
+    "svg_round_cap_hidden_dash: warns for a %s cap hidden at the path end (%s)",
+    async (cap, attrs) => {
+      const finding = await roundCapFinding(`stroke-linecap="${cap}" ${attrs}`);
+      expect(finding?.severity).toBe("warning");
+      expect(finding?.fixHint).toContain("visibility:hidden");
+    },
+  );
+
+  it.each([
+    [
+      "the safe form",
+      'stroke-linecap="round" pathLength="100" stroke-dasharray="100 120" stroke-dashoffset="110"',
+    ],
+    [
+      "a butt cap",
+      'stroke-linecap="butt" pathLength="100" stroke-dasharray="100" stroke-dashoffset="100"',
+    ],
+    ["no cap set", 'pathLength="100" stroke-dasharray="100" stroke-dashoffset="100"'],
+    [
+      "a drawn path",
+      'stroke-linecap="round" pathLength="100" stroke-dasharray="100" stroke-dashoffset="0"',
+    ],
+    [
+      "a partly drawn path",
+      'stroke-linecap="round" pathLength="100" stroke-dasharray="100" stroke-dashoffset="40"',
+    ],
+    ["no pathLength", 'stroke-linecap="round" stroke-dasharray="100" stroke-dashoffset="100"'],
+    [
+      "a decorative dash",
+      'stroke-linecap="round" pathLength="100" stroke-dasharray="4 6" stroke-dashoffset="0"',
+    ],
+  ])("svg_round_cap_hidden_dash: does NOT warn for %s", async (_name, attrs) => {
+    expect(await roundCapFinding(attrs)).toBeUndefined();
   });
 
   // ── svg_measure_before_path_d ──────────────────────────────────────────────
@@ -3117,5 +3943,334 @@ describe("SVG draw-on rules", () => {
     const result = await lintHyperframeHtml(html);
     const finding = result.findings.find((f) => f.code === "svg_measure_before_path_d");
     expect(finding).toBeUndefined();
+  });
+
+  describe("gsap_fullscreen_overlay_starts_visible — a scene child hidden through a scoped query", () => {
+    const scene = (hide: string) => `
+<html><body>
+  <div data-composition-id="scene" data-width="1920" data-height="1080">
+    <div class="ov" style="position:absolute;inset:0;background:#fff"></div>
+  </div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const root = document.querySelector('[data-composition-id="scene"]');
+    ${hide}
+    const tl = gsap.timeline({ paused: true });
+    tl.to(".ov", { opacity: 1, duration: 0.5 }, 1).to(".ov", { opacity: 0, duration: 0.5 }, 3);
+    window.__timelines["scene"] = tl;
+  </script>
+</body></html>`;
+    const flagged = async (html: string) =>
+      (await lintHyperframeHtml(html)).findings.some(
+        (f) => f.code === "gsap_fullscreen_overlay_starts_visible",
+      );
+
+    it("accepts gsap.set on a querySelector call with a literal selector", async () => {
+      expect(await flagged(scene('gsap.set(root.querySelector(".ov"), { opacity: 0 });'))).toBe(
+        false,
+      );
+    });
+
+    it("accepts gsap.set on a variable bound to a querySelector call", async () => {
+      expect(
+        await flagged(scene('const ov = root.querySelector(".ov"); gsap.set(ov, { opacity: 0 });')),
+      ).toBe(false);
+    });
+
+    it("accepts a descendant selector inside the query", async () => {
+      expect(
+        await flagged(
+          scene(
+            'gsap.set(document.querySelector("[data-composition-id=scene] .ov"), { opacity: 0 });',
+          ),
+        ),
+      ).toBe(false);
+    });
+
+    it("accepts a querySelector variable written without semicolons", async () => {
+      expect(
+        await flagged(
+          scene('const ov = root.querySelector(".ov")\n    gsap.set(ov, { opacity: 0 })'),
+        ),
+      ).toBe(false);
+    });
+
+    it("still flags an overlay nothing hides at zero", async () => {
+      expect(await flagged(scene(""))).toBe(true);
+    });
+  });
+
+  describe("gsap_fullscreen_overlay_starts_visible — the from() shape is not a defect", () => {
+    const overlay = (style: string, script: string) => `
+<html><body>
+  <div id="root" data-composition-id="c1" data-width="1920" data-height="1080" data-start="0" data-duration="10">
+    <div id="flash" style="position:fixed;inset:0;background:#000;${style}"></div>
+  </div>
+  <script src="gsap.min.js"></script>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    ${script}
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+
+    it("does not flag a from() reveal, which already seats opacity 0 at t=0", async () => {
+      // This used to error, and BOTH its fixHints (authored CSS opacity:0, or an
+      // immediate gsap.set) produce gsap_from_opacity_noop — whose own fixHint says
+      // to remove exactly what was just added. Applying either hint looped forever.
+      const result = await lintHyperframeHtml(
+        overlay("", `tl.from("#flash", { opacity: 0, duration: 1 }, 2);`),
+      );
+      expect(
+        result.findings.find((f) => f.code === "gsap_fullscreen_overlay_starts_visible"),
+      ).toBeUndefined();
+    });
+
+    it("still flags an overlay that is revealed and later hidden again", async () => {
+      const result = await lintHyperframeHtml(
+        overlay(
+          "",
+          `tl.to("#flash", { opacity: 1, duration: 1 }, 2);\n    tl.to("#flash", { opacity: 0, duration: 1 }, 5);`,
+        ),
+      );
+      expect(
+        result.findings.find((f) => f.code === "gsap_fullscreen_overlay_starts_visible"),
+      ).toBeDefined();
+    });
+
+    it("does not flag a fromTo() at 0 whose from-vars are hidden, which also seats at t=0", async () => {
+      const result = await lintHyperframeHtml(
+        overlay(
+          "",
+          `tl.fromTo("#flash", { opacity: 0, scale: 1.04 }, { opacity: 1, scale: 1, duration: 1.15 }, 0);\n    tl.to("#flash", { opacity: 0, duration: 0.42 }, 4);`,
+        ),
+      );
+      expect(
+        result.findings.find((f) => f.code === "gsap_fullscreen_overlay_starts_visible"),
+      ).toBeUndefined();
+    });
+
+    it("does not flag an overlay hidden by an aliased standalone gsap.set", async () => {
+      const result = await lintHyperframeHtml(
+        overlay(
+          "",
+          `const flash = "#flash";\n    gsap.set(flash, { opacity: 0 });\n    tl.to("#flash", { opacity: 1, duration: 1 }, 2);\n    tl.to("#flash", { opacity: 0, duration: 1 }, 5);`,
+        ),
+      );
+      expect(
+        result.findings.find((f) => f.code === "gsap_fullscreen_overlay_starts_visible"),
+      ).toBeUndefined();
+    });
+  });
+  describe("gsap_timeline_return_used_as_tween", () => {
+    const composition = (body: string) => `
+<html><body>
+  <div data-composition-id="c1" data-width="1080" data-height="1920"></div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    ${body}
+    window.__timelines["c1"] = tl;
+  </script>
+</body></html>`;
+
+    it("errors when a rebuild collects tl.to() returns to kill them later", async () => {
+      // The real shape this exists for: a caret-follow scroll rebuilt on document.fonts.ready.
+      // Every pushed value is `tl`, so the rebuild called kill() on the master timeline 49 times
+      // and then stacked its new keyframes on top of the ones it meant to replace.
+      const result = await lintHyperframeHtml(
+        composition(`
+    let scrollTweens = [];
+    const layout = () => {
+      scrollTweens.forEach((tw) => tw.kill());
+      scrollTweens = [];
+      scrollTweens.push(tl.to("#typed", { x: -40, duration: 0.08 }, 1));
+    };
+    layout();
+    document.fonts.ready.then(layout);`),
+      );
+      const finding = result.findings.find((f) => f.code === "gsap_timeline_return_used_as_tween");
+      expect(finding).toBeDefined();
+      expect(finding?.severity).toBe("error");
+      expect(finding?.message).toContain("returns THE TIMELINE ITSELF");
+    });
+
+    it("errors when a bound tl.to() return is killed", async () => {
+      const result = await lintHyperframeHtml(
+        composition(`
+    const fade = tl.to("#card", { opacity: 1, duration: 0.5 }, 0);
+    document.fonts.ready.then(() => fade.kill());`),
+      );
+      expect(
+        result.findings.find((f) => f.code === "gsap_timeline_return_used_as_tween"),
+      ).toBeDefined();
+    });
+
+    it("accepts a nested timeline, which is what the fix hint prescribes", async () => {
+      // A nested child is a real object: killing it replaces exactly its own keyframes and
+      // cannot reach the parent. Adding it at 0 keeps every child's absolute time.
+      const result = await lintHyperframeHtml(
+        composition(`
+    let caretTl = null;
+    const layout = () => {
+      if (caretTl) caretTl.kill();
+      caretTl = gsap.timeline();
+      caretTl.to("#typed", { x: -40, duration: 0.08 }, 1);
+      tl.add(caretTl, 0);
+    };
+    layout();
+    document.fonts.ready.then(layout);`),
+      );
+      expect(
+        result.findings.find((f) => f.code === "gsap_timeline_return_used_as_tween"),
+      ).toBeUndefined();
+    });
+
+    it("accepts gsap.to(), which really does return a tween", async () => {
+      const result = await lintHyperframeHtml(
+        composition(`
+    const tween = gsap.to("#card", { opacity: 1, duration: 0.5, paused: true });
+    tl.add(tween, 0);
+    document.fonts.ready.then(() => tween.kill());`),
+      );
+      expect(
+        result.findings.find((f) => f.code === "gsap_timeline_return_used_as_tween"),
+      ).toBeUndefined();
+    });
+
+    it("does not flag Array.from or a chained tl.to() that is never captured", async () => {
+      const result = await lintHyperframeHtml(
+        composition(`
+    const words = Array.from(document.querySelectorAll(".w"));
+    tl.to(words, { opacity: 1, duration: 0.3 }, 0).to(words, { y: 0, duration: 0.3 }, 0.3);`),
+      );
+      expect(
+        result.findings.find((f) => f.code === "gsap_timeline_return_used_as_tween"),
+      ).toBeUndefined();
+    });
+
+    it("does not flag a bound return that is never treated as a tween", async () => {
+      // Pointless but harmless: the value is just `tl` again, and nothing tween-scoped is
+      // aimed at it. Flagging this would be noise.
+      const result = await lintHyperframeHtml(
+        composition(`
+    const chain = tl.to("#card", { opacity: 1, duration: 0.5 }, 0);
+    chain.to("#card2", { opacity: 1, duration: 0.5 }, 1);`),
+      );
+      expect(
+        result.findings.find((f) => f.code === "gsap_timeline_return_used_as_tween"),
+      ).toBeUndefined();
+    });
+  });
+});
+
+describe("audio_reactive_single_tween_per_group", () => {
+  it("warns when an audio-reactive caption uses a single peak tween per group", async () => {
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+  <style>.caption, .caption-group, .caption-line, .cg-1 { color: white; }</style>
+</head>
+<body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080">
+    <div class="caption">Test</div>
+  </div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    window.__timelines["c1"] = tl;
+
+    const AUDIO = getAudioData();
+    captions.forEach(group => {
+      // Missing inner loop, only tweens once at group.start
+      gsap.to(group.element, { scale: peakBass, duration: 0.1 }, group.start);
+    });
+  </script>
+</body>
+</html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "audio_reactive_single_tween_per_group");
+    expect(finding).toBeDefined();
+    expect(finding?.severity).toBe("warning");
+  });
+
+  it("does not warn when the group contains an inner sampling loop", async () => {
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+  <style>.caption, .caption-group, .caption-line, .cg-1 { color: white; }</style>
+</head>
+<body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080">
+    <div class="caption">Test</div>
+  </div>
+  <script>
+    window.__timelines = window.__timelines || {};
+    const tl = gsap.timeline({ paused: true });
+    window.__timelines["c1"] = tl;
+
+    const AUDIO = getAudioData();
+    captions.forEach(group => {
+      // Inner sampling loop prevents the warning
+      for (var at = group.start; at < group.end; at += 0.1) {
+        gsap.to(group.element, { scale: peakBass, duration: 0.1 }, at);
+      }
+    });
+  </script>
+</body>
+</html>`;
+    const result = await lintHyperframeHtml(html);
+    expect(result.findings.some((f) => f.code === "audio_reactive_single_tween_per_group")).toBe(
+      false,
+    );
+  });
+});
+
+describe("gsap_group_selector_keyframes", () => {
+  it("warns when a tween uses a group selector and keyframes", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"></div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    // Selector has a comma, and config has keyframes
+    tl.to(".box1, .box2", { keyframes: [{ x: 100 }, { x: 200 }] });
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    const finding = result.findings.find((f) => f.code === "gsap_group_selector_keyframes");
+    expect(finding).toBeDefined();
+    expect(finding?.severity).toBe("warning");
+    expect(finding?.message).toContain("shared keyframes");
+  });
+
+  it("does not warn when a tween uses a single selector with keyframes", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"></div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    // No comma in selector
+    tl.to(".box1", { keyframes: [{ x: 100 }, { x: 200 }] });
+    tl.to(".box2", { keyframes: [{ x: 100 }, { x: 200 }] });
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    expect(result.findings.some((f) => f.code === "gsap_group_selector_keyframes")).toBe(false);
+  });
+
+  it("does not warn when a tween uses a group selector without keyframes", async () => {
+    const html = `
+<html><body>
+  <div data-composition-id="c1" data-width="1920" data-height="1080"></div>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+    // Group selector, but standard properties instead of keyframes
+    tl.to(".box1, .box2", { x: 100, y: 100 });
+  </script>
+</body></html>`;
+    const result = await lintHyperframeHtml(html);
+    expect(result.findings.some((f) => f.code === "gsap_group_selector_keyframes")).toBe(false);
   });
 });

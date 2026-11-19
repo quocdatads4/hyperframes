@@ -1,8 +1,9 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, mock } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
+import { _setDownloadFetchForTests } from "@hyperframes/engine";
 import { parseRenderOptions, prepareRenderBody } from "./server.js";
 
 describe("parseRenderOptions — variables", () => {
@@ -38,11 +39,57 @@ describe("parseRenderOptions — outputResolution", () => {
   });
 });
 
+describe("parseRenderOptions — encoder options", () => {
+  it("forwards crf, videoBitrate and videoFrameFormat from a valid body", () => {
+    expect(parseRenderOptions({ crf: 12, format: "webm", videoFrameFormat: "png" })).toMatchObject({
+      crf: 12,
+      videoFrameFormat: "png",
+    });
+    expect(parseRenderOptions({ videoBitrate: "10M" }).videoBitrate).toBe("10M");
+  });
+
+  it("drops every encoder override when any of them is invalid, and for mov rate control", () => {
+    expect(parseRenderOptions({ crf: 52 }).crf).toBeUndefined();
+    expect(parseRenderOptions({ crf: 12, videoBitrate: "10M" })).toMatchObject({
+      crf: undefined,
+      videoBitrate: undefined,
+    });
+    expect(parseRenderOptions({ crf: 12, format: "mov" }).crf).toBeUndefined();
+  });
+});
+
 describe("parseRenderOptions — render strictness", () => {
   it("preserves best-effort compatibility and requires an explicit strict opt-in", () => {
     expect(parseRenderOptions({}).strictness).toBe("best-effort");
     expect(parseRenderOptions({ bestEffort: true }).strictness).toBe("best-effort");
     expect(parseRenderOptions({ bestEffort: false }).strictness).toBe("strict");
+  });
+});
+
+describe("parseRenderOptions — outputDynamicRange", () => {
+  it.each(["auto", "hdr", "sdr"] as const)("forwards %s", (outputDynamicRange) => {
+    expect(parseRenderOptions({ outputDynamicRange }).outputDynamicRange).toBe(outputDynamicRange);
+  });
+
+  it("drops invalid values from the lenient parser", () => {
+    expect(
+      parseRenderOptions({ outputDynamicRange: "force-sdr" }).outputDynamicRange,
+    ).toBeUndefined();
+    expect(parseRenderOptions({ outputDynamicRange: true }).outputDynamicRange).toBeUndefined();
+  });
+
+  it.each([
+    ["auto", "auto"],
+    ["force-hdr", "hdr"],
+    ["force-sdr", "sdr"],
+  ] as const)("maps legacy hdrMode %s to %s", (hdrMode, outputDynamicRange) => {
+    expect(parseRenderOptions({ hdrMode }).outputDynamicRange).toBe(outputDynamicRange);
+  });
+
+  it("prefers the canonical field when both equivalent fields are present", () => {
+    expect(
+      parseRenderOptions({ outputDynamicRange: "sdr", hdrMode: "force-sdr" }).outputDynamicRange,
+    ).toBe("sdr");
   });
 });
 
@@ -67,6 +114,41 @@ describe("prepareRenderBody — validation", () => {
     expect((result as { error: string }).error).toContain("variables must be a JSON object");
   });
 
+  it("rejects an explicitly-supplied invalid outputDynamicRange", async () => {
+    const result = await prepareRenderBody({
+      outputDynamicRange: "force-sdr",
+      html: "<html></html>",
+    });
+    expect(result).toHaveProperty("error");
+    expect((result as { error: string }).error).toContain(
+      'outputDynamicRange must be one of: "auto", "hdr", "sdr"',
+    );
+  });
+
+  it("rejects an out-of-range crf with the studio-server message", async () => {
+    const result = await prepareRenderBody({ format: "webm", crf: 64, html: "<html></html>" });
+    expect((result as { error: string }).error).toBe(
+      "crf must be an integer from 0 to 63 for webm",
+    );
+  });
+
+  it("rejects crf together with videoBitrate", async () => {
+    const result = await prepareRenderBody({ crf: 12, videoBitrate: "10M", html: "<html></html>" });
+    expect((result as { error: string }).error).toBe("use either crf or videoBitrate, not both");
+  });
+
+  it("rejects conflicting canonical and legacy policies", async () => {
+    const result = await prepareRenderBody({
+      outputDynamicRange: "sdr",
+      hdrMode: "force-hdr",
+      html: "<html></html>",
+    });
+    expect(result).toHaveProperty("error");
+    expect((result as { error: string }).error).toContain(
+      "outputDynamicRange and legacy hdrMode must describe the same output policy",
+    );
+  });
+
   it("rejects an explicitly-supplied invalid outputResolution", async () => {
     const result = await prepareRenderBody({ outputResolution: "8k", html: "<html></html>" });
     expect(result).toHaveProperty("error");
@@ -79,15 +161,16 @@ describe("prepareRenderBody — validation", () => {
     expect((result as { error: string }).error).toContain("must be a string preset");
   });
 
-  it("rejects outputResolution combined with an alpha format (webm/mov)", async () => {
+  it("accepts outputResolution with an alpha format (webm/mov)", async () => {
     for (const format of ["webm", "mov"]) {
       const result = await prepareRenderBody({
         outputResolution: "4k",
         format,
         html: "<html></html>",
       });
-      expect(result).toHaveProperty("error");
-      expect((result as { error: string }).error).toContain("can't supersample");
+      expect(result).toHaveProperty("prepared");
+      const { input } = (result as { prepared: { input: Record<string, unknown> } }).prepared;
+      expect(input.outputResolution).toBe("landscape-4k");
     }
   });
 
@@ -105,5 +188,55 @@ describe("prepareRenderBody — validation", () => {
     const { input } = (result as { prepared: { input: Record<string, unknown> } }).prepared;
     expect(input.variables).toEqual({ title: "Q4" });
     expect(input.outputResolution).toBe("landscape-4k");
+  });
+});
+
+describe("prepareRenderBody — previewUrl", () => {
+  const stubFetch = (impl: () => Promise<Response>) => {
+    const spy = mock(impl);
+    _setDownloadFetchForTests(spy as unknown as Parameters<typeof _setDownloadFetchForTests>[0]);
+    return spy;
+  };
+  afterEach(() => {
+    _setDownloadFetchForTests();
+  });
+
+  it.each([
+    "http://169.254.169.254/latest/meta-data/",
+    "https://169.254.169.254/latest/meta-data/",
+    "https://localhost:8080/index.html",
+    "https://[::1]/index.html",
+    "file:///etc/passwd",
+  ])("refuses %s without fetching it", async (previewUrl) => {
+    const fetchSpy = stubFetch(async () => new Response("secret"));
+
+    const result = await prepareRenderBody({ previewUrl });
+
+    expect(result).toHaveProperty("error");
+    expect((result as { error: string }).error).toContain("Failed to fetch previewUrl");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("refuses a public URL that redirects to a metadata address", async () => {
+    const fetchSpy = stubFetch(
+      async () =>
+        new Response(null, {
+          status: 302,
+          headers: { location: "https://169.254.169.254/latest/meta-data/" },
+        }),
+    );
+
+    const result = await prepareRenderBody({ previewUrl: "https://example.com/index.html" });
+
+    expect(result).toHaveProperty("error");
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders the HTML of a public URL", async () => {
+    stubFetch(async () => new Response("<html><body>ok</body></html>"));
+
+    const result = await prepareRenderBody({ previewUrl: "https://example.com/index.html" });
+
+    expect(result).toHaveProperty("prepared");
   });
 });

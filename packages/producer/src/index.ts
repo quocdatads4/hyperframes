@@ -6,10 +6,20 @@
  * or any web content via configurable page contracts and hooks.
  */
 
+export {
+  REFERENCE_BACKGROUND_FIELD,
+  referenceBackgroundResult,
+  createReferenceBackgroundRecorder,
+  readReferenceBackground,
+  type ReferenceBackground,
+  type ReferenceBackgroundResult,
+} from "@hyperframes/engine";
+
 // ── Main rendering pipeline ─────────────────────────────────────────────────
 export {
   createRenderJob,
   executeRenderJob,
+  resolveRenderDebugDir,
   RenderCancelledError,
   RenderQualityError,
   applyRenderWarningPolicy,
@@ -23,6 +33,19 @@ export {
   type RenderPerfSummary,
   type ProgressCallback,
 } from "./services/renderOrchestrator.js";
+export {
+  renderSpan,
+  RenderSpanUnsupportedError,
+  spanFrameRange,
+  type RenderSpanResult,
+} from "./services/distributed/renderSpan.js";
+export { extractSafeRenderErrorCode } from "./services/safeRenderErrorCode.js";
+export {
+  RENDER_JOB_DIR,
+  createOwnedRenderDir,
+  listAbandonedRenderDirs,
+} from "./services/render/renderDirOwner.js";
+export type { MissingPathFacts } from "./services/render/missingPath.js";
 export {
   RENDER_REQUEST_VERSION,
   createRenderRequest,
@@ -64,8 +87,8 @@ export {
   getCompositionDuration,
   getCapturePerfSummary,
   // Transient-vs-genuine init failure classifier — re-exported so standalone
-  // skill helpers (animation-map, contrast-report) can reuse the render
-  // pipeline's canonical retry gating instead of re-deriving it.
+  // helpers can reuse the render pipeline's canonical retry gating instead of
+  // re-deriving it.
   isTransientBrowserError,
   prepareCaptureSessionForReuse,
   type CaptureOptions,
@@ -82,8 +105,12 @@ export {
   type FileServerHandle,
 } from "./services/fileServer.js";
 
+export { prepareAnimatedGifInputs } from "./services/animatedGifPrep.js";
+export { prepareHeifImageInputs } from "./services/heifImagePrep.js";
+
 // ── Video frame injection (Hyperframes-specific hook) ───────────────────────
 export { createVideoFrameInjector } from "@hyperframes/engine";
+export { isBlockedNetworkHost, onRenderRefusal, type RefusedHostClass } from "@hyperframes/engine";
 
 // ── Configuration ───────────────────────────────────────────────────────────
 export { resolveConfig, DEFAULT_CONFIG, type ProducerConfig } from "./config.js";
@@ -108,15 +135,23 @@ export {
 
 // ── Utilities ───────────────────────────────────────────────────────────────
 export { normalizeErrorMessage } from "./utils/errorMessage.js";
+export { collectRenderMedia, type RenderMedia } from "./services/renderMediaCollector.js";
+export { mediaProfileMatchesElementType } from "./services/assetMediaType.js";
 // Font localization: fetch + embed @font-face rules for requested families
 // (including those declared only via a remote <link>) so a bundled composition
 // renders with the real font instead of a fallback, regardless of network
 // timing. The render pipeline runs this in its compile stage; the CLI audit
 // paths (snapshot/check) reuse it so their captures match the render.
 export {
+  FONT_FETCH_FAILED,
+  FONT_FETCH_UNAVAILABLE,
+  FontFetchError,
+  FontFetchUnavailableError,
   injectDeterministicFontFaces,
+  type FontFetchErrorCode,
+  type FontFetchRetryPolicy,
   type InjectDeterministicFontFacesOptions,
-} from "./services/deterministicFonts.js";
+} from "@hyperframes/core/fonts/embed";
 export { quantizeTimeToFrame } from "./utils/parityContract.js";
 export { resolveRenderPaths, type RenderPaths } from "./utils/paths.js";
 
@@ -133,10 +168,41 @@ export {
 // separate subpath import.
 export {
   assemble,
-  plan,
+  assembleV2,
+  PLAN_PROTOCOL_V2,
+  PLAN_PROTOCOL_UNSUPPORTED,
+  PLAN_V2_ARTIFACT_LAYOUT,
+  PLAN_V2_HASH_SCHEMA,
+  PLAN_V2_INTEGRITY_UNRECOVERABLE,
+  PLAN_V2_MATERIALIZATION_MARKER,
+  PLAN_V2_SCHEMA_VERSION,
+  createPlanV2FromExecutionPlan,
+  getPlanV2ExecutionPlanHash,
+  listPlanV2ArtifactsForTarget,
+  materializePlanV2Target,
+  planV2,
+  planV2WithPublisher,
+  PlanV2IntegrityError,
+  PlanProtocolUnsupportedError,
+  readPlanV2Manifest,
+  publishPlanV2FromExecutionPlan,
   renderChunk,
+  renderChunkV2,
+  validatePlanV2MaterializedTarget,
   type AssembleResult,
+  type ChunkRenderer,
   type ChunkResult,
+  type EffectiveChunkResult,
   type DistributedRenderConfig,
-  type PlanResult,
+  type PlanProtocolDescriptor,
+  type PlanProtocolV2Descriptor,
+  type PlanV2Artifact,
+  type PlanV2Limitations,
+  type PlanV2Manifest,
+  type PlanV2MaterializationResult,
+  type PlanV2MaterializationTarget,
+  type PlanV2Result,
+  type PlanV2WithPublisherOptions,
+  type PlanV2ArtifactPublisher,
+  type PlanV2PublishBlob,
 } from "./distributed.js";

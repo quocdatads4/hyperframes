@@ -13,33 +13,78 @@
  * sibling), the original `<video>` path is used unchanged.
  */
 
+import { findInjectedRenderFrame } from "../renderFrameSibling.js";
+import { isImageElement, isVideoElement } from "../domRealm";
+import { getPausedExternalVideoFrame, getPausedVideoFrame } from "../pausedVideoFrames";
+
 /**
  * Resolve the decoded render-frame `<img>` for a source `<video>`, if the
  * engine has injected one and it has decoded pixels. Returns null in preview
  * mode or before the frame is decoded, so callers fall back to the video.
  *
  * The injector inserts the `<img>` as the video's immediate next sibling and
- * also gives it the id `__render_frame_<videoId>__`; we check the sibling
+ * also gives it the id `__render_frame_<renderId>__`; we check the sibling
  * first (cheap) and fall back to an id lookup in case a node was inserted
  * between them.
  */
-function resolveRenderFrameImage(video: HTMLVideoElement): HTMLImageElement | null {
+function resolveRenderFrameImage(
+  video: HTMLVideoElement,
+): HTMLImageElement | HTMLCanvasElement | null {
   const sibling = video.nextElementSibling;
   if (
-    sibling instanceof HTMLImageElement &&
+    isImageElement(sibling) &&
     sibling.classList.contains("__render_frame__") &&
     sibling.complete &&
     sibling.naturalWidth > 0
   ) {
     return sibling;
   }
-  if (video.id) {
-    const byId = document.getElementById(`__render_frame_${video.id}__`);
-    if (byId instanceof HTMLImageElement && byId.complete && byId.naturalWidth > 0) {
-      return byId;
-    }
+  const byId = findInjectedRenderFrame(video);
+  if (byId && byId.complete && byId.naturalWidth > 0) {
+    return byId;
   }
-  return null;
+  return getPausedVideoFrame(video);
+}
+
+export function patchCanvasVideoFrameCompat(): void {
+  for (const ctor of [
+    globalThis.CanvasRenderingContext2D,
+    globalThis.OffscreenCanvasRenderingContext2D,
+  ]) {
+    if (!ctor?.prototype?.drawImage) continue;
+    const original = ctor.prototype.drawImage as ((...args: unknown[]) => void) & {
+      __hfVideoPatched?: boolean;
+    };
+    if (original.__hfVideoPatched) continue;
+    const patched = function (this: unknown, ...args: unknown[]) {
+      if (isVideoElement(args[0])) args[0] = getPausedVideoFrame(args[0]) ?? args[0];
+      original.apply(this, args);
+    };
+    patched.__hfVideoPatched = true;
+    ctor.prototype.drawImage = patched;
+  }
+}
+
+export function patchExternalVideoTextureCompat(): void {
+  const ctor = (globalThis as Record<string, unknown>).GPUDevice as
+    | {
+        prototype: {
+          importExternalTexture?: ((source: Record<string, unknown>) => unknown) & {
+            __hfVideoPatched?: boolean;
+          };
+        };
+      }
+    | undefined;
+  const original = ctor?.prototype.importExternalTexture;
+  if (!ctor || typeof original !== "function" || original.__hfVideoPatched) return;
+  const patched = function (this: unknown, descriptor: Record<string, unknown>) {
+    const frame = isVideoElement(descriptor.source)
+      ? getPausedExternalVideoFrame(descriptor.source)
+      : null;
+    return original.call(this, frame ? { ...descriptor, source: frame } : descriptor);
+  };
+  patched.__hfVideoPatched = true;
+  ctor.prototype.importExternalTexture = patched;
 }
 
 export function patchVideoTextureCompat(): void {
@@ -60,7 +105,7 @@ export function patchVideoTextureCompat(): void {
     destination: unknown,
     copySize: unknown,
   ) {
-    if (source?.source instanceof HTMLVideoElement) {
+    if (isVideoElement(source?.source)) {
       const img = resolveRenderFrameImage(source.source);
       if (img) {
         return orig.call(this, { ...source, source: img }, destination, copySize);
@@ -98,7 +143,7 @@ export function patchWebGLVideoTextureCompat(): void {
       const patched = function (this: unknown, ...args: unknown[]) {
         const lastIndex = args.length - 1;
         const last = args[lastIndex];
-        if (last instanceof HTMLVideoElement) {
+        if (isVideoElement(last)) {
           const img = resolveRenderFrameImage(last);
           if (img) args[lastIndex] = img;
         }

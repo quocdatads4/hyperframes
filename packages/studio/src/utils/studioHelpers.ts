@@ -1,7 +1,11 @@
+import { buildProjectApiPath } from "./projectRouting";
+import { isTypingTarget } from "@hyperframes/core/typing-target";
 import type { TimelineElement } from "../player/store/playerStore";
 import type { DomEditSelection } from "../components/editor/domEditing";
 import type { TimelineAssetKind } from "./timelineAssetDrop";
 import { roundToCenti } from "./rounding";
+import { studioApiFetch } from "./studioApiFetch";
+import { encodeUrlPath } from "@hyperframes/parsers";
 
 export interface EditingFile {
   path: string;
@@ -19,14 +23,8 @@ export type RightPanelTab =
   | "renders"
   | "block-params"
   | "slideshow"
-  | "variables";
-export type RightInspectorPane = "layers" | "design";
-
-export interface RightInspectorPanes {
-  layers: boolean;
-  design: boolean;
-}
-
+  | "variables"
+  | "motionBlur";
 export interface AgentModalAnchorPoint {
   x: number;
   y: number;
@@ -96,51 +94,85 @@ export function isImageBackgroundValue(value: string): boolean {
   return /^url\(/i.test(value.trim());
 }
 
+export function cssPropertyName(property: string): string {
+  if (property.startsWith("--")) return property;
+  return property.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`).replace(/^ms-/, "-ms-");
+}
+
 export function isManualGeometryStyleProperty(property: string): boolean {
   return property === "left" || property === "top" || property === "width" || property === "height";
 }
 
-export function getEventTargetElement(target: EventTarget | null): HTMLElement | null {
-  if (!target || typeof target !== "object") return null;
-  const maybeNode = target as {
-    nodeType?: number;
-    parentElement?: Element | null;
-  };
-  if (maybeNode.nodeType === 1) return target as HTMLElement;
-  if (maybeNode.nodeType === 3 && maybeNode.parentElement) {
-    return maybeNode.parentElement as HTMLElement;
-  }
-  return null;
-}
-
 export function shouldIgnoreHistoryShortcut(target: EventTarget | null): boolean {
-  const el = getEventTargetElement(target);
-  if (!el) return false;
-  return Boolean(
-    el.closest("input, textarea, select, [contenteditable='true'], [role='textbox'], .cm-editor"),
-  );
+  return isTypingTarget(target);
 }
 
-export function getHistoryShortcutLabel(action: "undo" | "redo"): string {
+function getHistoryShortcutLabel(action: "undo" | "redo"): string {
   const isMac =
     typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/i.test(navigator.platform);
   const modifier = isMac ? "Cmd" : "Ctrl";
   return action === "undo" ? `${modifier}+Z` : `${modifier}+Shift+Z`;
 }
 
-type ElementMatchSelection = Pick<
+/** The Undo / Redo tooltip: the shortcut always, the last action's name when there is one. */
+export function historyTooltipLabel(
+  action: "undo" | "redo",
+  lastAction: string | null | undefined,
+): string {
+  const shortcut = getHistoryShortcutLabel(action);
+  const verb = action === "undo" ? "Undo" : "Redo";
+  return lastAction ? `${verb} ${lastAction} (${shortcut})` : `${verb} (${shortcut})`;
+}
+
+export type ElementMatchSelection = Pick<
   DomEditSelection,
-  "id" | "selector" | "selectorIndex" | "sourceFile" | "compositionSrc" | "isCompositionHost"
->;
+  | "id"
+  | "hfId"
+  | "selector"
+  | "selectorIndex"
+  | "sourceFile"
+  | "compositionSrc"
+  | "isCompositionHost"
+> &
+  Partial<Pick<DomEditSelection, "handle">>;
+
+function matchesByClipId(
+  selection: ElementMatchSelection,
+  element: TimelineElement,
+  file: string,
+  value: string | undefined,
+  clipIdScope: string | undefined,
+) {
+  if (!clipIdScope || !selection.handle) return false;
+  if (element.domId || element.hfId || element.selector) return false;
+  return element.id === value && (element.sourceFile || clipIdScope) === file;
+}
 
 function matchesByDomId(
   selection: ElementMatchSelection,
   element: TimelineElement,
   selectionSourceFile: string,
+  clipIdScope?: string,
 ): boolean {
   if (!selection.id) return false;
+  if (matchesByClipId(selection, element, selectionSourceFile, selection.id, clipIdScope))
+    return true;
   return (
     element.domId === selection.id && (element.sourceFile || "index.html") === selectionSourceFile
+  );
+}
+
+function matchesByHfId(
+  selection: ElementMatchSelection,
+  element: TimelineElement,
+  selectionSourceFile: string,
+  clipIdScope?: string,
+): boolean {
+  if (!selection.hfId) return false;
+  if (matchesByClipId(selection, element, selectionSourceFile, selection.hfId, clipIdScope))
+    return true;
+  return (
+    element.hfId === selection.hfId && (element.sourceFile || "index.html") === selectionSourceFile
   );
 }
 
@@ -161,9 +193,11 @@ function matchesBySelector(selection: ElementMatchSelection, element: TimelineEl
   );
 }
 
+/** `clipIdScope` matches opaque picks to clip-id-only rows, which have no patch target: select/seek only. */
 export function findMatchingTimelineElementId(
   selection: ElementMatchSelection,
   elements: TimelineElement[],
+  clipIdScope?: string,
 ): string | null {
   const selectionSourceFile = selection.sourceFile || "index.html";
   // Priority matters, not just "any of the three": a composition-host
@@ -174,13 +208,21 @@ export function findMatchingTimelineElementId(
   // scan let `.find()` stop at an EARLIER, unrelated host that merely shares
   // the compositionSrc, before the scan ever reached the correct id/selector
   // match further down the list — collapsing every repeated host to the
-  // first one. Try id, then selector, across the WHOLE list first; only fall
-  // back to the coarser compositionSrc-only match when neither identifies a
-  // specific element.
+  // first one. Try id, then hfId, then selector, across the WHOLE list
+  // first; only fall back to the coarser compositionSrc-only match when
+  // none of them identifies a specific element.
   const byId = selection.id
-    ? elements.find((el) => matchesByDomId(selection, el, selectionSourceFile))
+    ? elements.find((el) => matchesByDomId(selection, el, selectionSourceFile, clipIdScope))
     : undefined;
   if (byId) return byId.key ?? byId.id;
+
+  // hfId is the stable content-hash id every element gets regardless of
+  // whether it has a real DOM id — the only correlator for an element like
+  // an ungroup child that has neither an authored id nor a selector.
+  const byHfId = selection.hfId
+    ? elements.find((el) => matchesByHfId(selection, el, selectionSourceFile, clipIdScope))
+    : undefined;
+  if (byHfId) return byHfId.key ?? byHfId.id;
 
   const bySelector = selection.selector
     ? elements.find((el) => matchesBySelector(selection, el))
@@ -198,6 +240,17 @@ export function findMatchingTimelineElementId(
   }
 
   return null;
+}
+
+// The element's track: authored if given, else the runtime's already-resolved
+// fallback — always rounded to an integer index either way. Shared by the
+// group/ungroup and razor-split flows so they can't drift out of sync again.
+export function resolveElementTrack(
+  element: Pick<TimelineElement, "authoredTrack" | "track">,
+): number {
+  return Math.round(
+    Number.isFinite(element.authoredTrack) ? (element.authoredTrack as number) : element.track,
+  );
 }
 
 /**
@@ -235,9 +288,11 @@ export function resolveTimelineIdForSelection(
   selection: DomEditSelection,
   elements: TimelineElement[],
   activeCompPath: string | null,
+  byClipId = false,
 ): string | null {
+  const clipIdScope = byClipId ? activeCompPath || "index.html" : undefined;
   return (
-    findMatchingTimelineElementId(selection, elements) ??
+    findMatchingTimelineElementId(selection, elements, clipIdScope) ??
     findTimelineIdByAncestor(
       selection.element,
       elements,
@@ -309,7 +364,7 @@ export async function resolveDroppedAssetDuration(
 
   const media = document.createElement(kind === "video" ? "video" : "audio");
   media.preload = "metadata";
-  media.src = `/api/projects/${projectId}/preview/${assetPath}`;
+  media.src = buildProjectApiPath(projectId, `/preview/${encodeUrlPath(assetPath)}`);
 
   const duration = await new Promise<number>((resolve) => {
     const timeout = window.setTimeout(() => resolve(DEFAULT_TIMELINE_ASSET_DURATION[kind]), 3000);
@@ -340,38 +395,70 @@ export async function resolveDroppedAssetDuration(
   return duration;
 }
 
+export function mediaMetadataUrl(projectId: string, assetPath: string): string {
+  return `/api/projects/${encodeURIComponent(projectId)}/media/metadata?path=${encodeURIComponent(assetPath)}`;
+}
+
+/** Dropped video audio stream from the metadata endpoint. Failure answers false so the drop still lands muted. */
+export async function resolveDroppedAssetHasAudio(
+  projectId: string,
+  assetPath: string,
+  kind: TimelineAssetKind,
+): Promise<boolean> {
+  if (kind !== "video") return false;
+  return (await resolveAssetHasAudio(projectId, assetPath)) === true;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+/** An asset's audio stream from the metadata endpoint: null when the probe can't tell. */
+export async function resolveAssetHasAudio(
+  projectId: string,
+  assetPath: string,
+): Promise<boolean | null> {
+  try {
+    const response = await studioApiFetch(mediaMetadataUrl(projectId, assetPath));
+    if (!response.ok) return null;
+    const data: unknown = await response.json();
+    const metadata = isPlainRecord(data) ? data.metadata : undefined;
+    const hasAudio = isPlainRecord(metadata) ? metadata.hasAudio : undefined;
+    return typeof hasAudio === "boolean" ? hasAudio : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function resolveDroppedAssetDimensions(
   projectId: string,
   assetPath: string,
   kind: TimelineAssetKind,
 ): Promise<{ width: number; height: number } | null> {
   if (kind === "audio") return null;
-  const src = `/api/projects/${projectId}/preview/${assetPath}`;
+  const src = buildProjectApiPath(projectId, `/preview/${encodeUrlPath(assetPath)}`);
 
   if (kind === "image") {
     return new Promise((resolve) => {
       const img = new Image();
-      const timeout = window.setTimeout(() => resolve(null), 3000);
-      img.addEventListener(
-        "load",
-        () => {
-          window.clearTimeout(timeout);
-          resolve(
-            img.naturalWidth > 0 && img.naturalHeight > 0
-              ? { width: img.naturalWidth, height: img.naturalHeight }
-              : null,
-          );
-        },
-        { once: true },
-      );
-      img.addEventListener(
-        "error",
-        () => {
-          window.clearTimeout(timeout);
-          resolve(null);
-        },
-        { once: true },
-      );
+      let settled = false;
+      const finalize = (value: { width: number; height: number } | null) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timeout);
+        img.onload = null;
+        img.onerror = null;
+        img.src = "";
+        resolve(value);
+      };
+      const timeout = window.setTimeout(() => finalize(null), 3000);
+      img.onload = () =>
+        finalize(
+          img.naturalWidth > 0 && img.naturalHeight > 0
+            ? { width: img.naturalWidth, height: img.naturalHeight }
+            : null,
+        );
+      img.onerror = () => finalize(null);
       img.src = src;
     });
   }
@@ -379,25 +466,25 @@ export async function resolveDroppedAssetDimensions(
   return new Promise((resolve) => {
     const video = document.createElement("video");
     video.preload = "metadata";
-    const timeout = window.setTimeout(() => resolve(null), 3000);
+    let settled = false;
     const finalize = (value: { width: number; height: number } | null) => {
+      if (settled) return;
+      settled = true;
       window.clearTimeout(timeout);
+      video.onloadedmetadata = null;
+      video.onerror = null;
       video.src = "";
       video.load();
       resolve(value);
     };
-    video.addEventListener(
-      "loadedmetadata",
-      () => {
-        finalize(
-          video.videoWidth > 0 && video.videoHeight > 0
-            ? { width: video.videoWidth, height: video.videoHeight }
-            : null,
-        );
-      },
-      { once: true },
-    );
-    video.addEventListener("error", () => finalize(null), { once: true });
+    const timeout = window.setTimeout(() => finalize(null), 3000);
+    video.onloadedmetadata = () =>
+      finalize(
+        video.videoWidth > 0 && video.videoHeight > 0
+          ? { width: video.videoWidth, height: video.videoHeight }
+          : null,
+      );
+    video.onerror = () => finalize(null);
     video.src = src;
   });
 }

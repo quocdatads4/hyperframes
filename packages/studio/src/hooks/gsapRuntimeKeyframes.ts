@@ -8,9 +8,18 @@
  * `toAbsoluteTime` + the element's clip start/duration. `scanAllRuntimeKeyframes`
  * does that conversion itself when given a `clipById` map.
  */
-import { buildArcPath, type ArcPathConfig } from "@hyperframes/core/gsap-parser-acorn";
+import type { ArcPathConfig } from "@hyperframes/core/gsap-parser-acorn";
 import { parsePercentageKeyframes, toAbsoluteTime } from "./gsapShared";
+import { timeAtProgress } from "../utils/gsapKeyframeEases";
+import { readMotionPathTween } from "./gsapRuntimeMotionPath";
 import { roundTo3 } from "../utils/rounding";
+import { matchesElement, tweensTargeting } from "./gsapRuntimeTweenIndex";
+import { keyframeVarsCarryChannel } from "@hyperframes/core/runtime/patch-tween";
+import { withParsedStart } from "./gsapParsedTween";
+import { BOX_SIZE_STYLE_PROPS } from "../components/editor/manualEditsDomPatches";
+import { gsapRendersTransform } from "../components/editor/gsapAnimatesProperty";
+import { previewFrameOpaque } from "../player/lib/previewChannel";
+import { frameQuery, frameTarget, frameTimelines } from "./gsapFrameSnapshot";
 
 /**
  * A GSAP tween's `vars` object — intentionally open: it mixes channel values
@@ -40,8 +49,15 @@ export interface RuntimeTimeline {
   to?: (targets: Element[], vars: GsapVars, position?: number) => RuntimeTween;
 }
 
-type Pct = { percentage: number; properties: Record<string, number | string> };
-export type ReadTween = { keyframes: Pct[]; easeEach?: string; arcPath?: ArcPathConfig };
+type Pct = { percentage: number; properties: Record<string, number | string>; step?: number };
+export type ReadTween = {
+  keyframes: Pct[];
+  easeEach?: string;
+  arcPath?: ArcPathConfig;
+  runEase?: string;
+  /** GSAP's start values when the first keyframe is after 0%. */
+  start?: Record<string, number>;
+};
 
 export interface RuntimeKeyframeEntry {
   keyframes: Pct[];
@@ -83,8 +99,18 @@ function timelinesOf(iframe: HTMLIFrameElement | null): Record<string, RuntimeTi
   }
 }
 
-function isXY(p: unknown): p is { x: number; y: number } {
-  return !!p && typeof (p as any).x === "number" && typeof (p as any).y === "number";
+/** A sealed frame reads from its snapshot. */
+function readableTimelines(iframe: HTMLIFrameElement | null) {
+  return iframe && previewFrameOpaque(iframe) ? frameTimelines(iframe) : timelinesOf(iframe);
+}
+
+function readableTarget(iframe: HTMLIFrameElement | null, selector: string): Element | null {
+  if (iframe && previewFrameOpaque(iframe)) return frameQuery(iframe, selector);
+  try {
+    return iframe?.contentDocument?.querySelector(selector) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -96,31 +122,6 @@ function isXY(p: unknown): p is { x: number; y: number } {
  */
 function isZeroDurationSet(duration: number): boolean {
   return !(duration > 0);
-}
-
-/** Coordinates + curviness from a live `vars.motionPath` value (object or array form), or null. */
-function coordsFromMotionPath(mp: unknown): {
-  coords: Array<{ x: number; y: number }>;
-  curviness: number;
-  autoRotate: boolean | number;
-  isCubic: boolean;
-} | null {
-  if (!mp || typeof mp !== "object") return null;
-  const obj = mp as Record<string, unknown>;
-  const pathVal = Array.isArray(mp) ? mp : obj.path;
-  if (!Array.isArray(pathVal)) return null;
-  const coords = pathVal.filter(isXY).map((p) => ({ x: p.x, y: p.y }));
-  if (coords.length < 2) return null;
-  const curviness = typeof obj.curviness === "number" ? obj.curviness : 1;
-  const autoRotate = typeof obj.autoRotate === "number" ? obj.autoRotate : obj.autoRotate === true;
-  return { coords, curviness, autoRotate, isCubic: obj.type === "cubic" };
-}
-
-/** Build an arcPath config from a live `vars.motionPath` value. */
-export function arcPathFromMotionPathValue(mp: unknown): ArcPathConfig | undefined {
-  const parsed = coordsFromMotionPath(mp);
-  if (!parsed) return undefined;
-  return buildArcPath(parsed.coords, parsed.curviness, parsed.autoRotate, parsed.isCubic)?.arcPath;
 }
 
 function flatTweenKeyframes(vars: Record<string, unknown>): Pct[] | null {
@@ -137,34 +138,20 @@ function flatTweenKeyframes(vars: Record<string, unknown>): Pct[] | null {
   ];
 }
 
+const stringOr = (value: unknown) => (typeof value === "string" ? value : undefined);
+
 /** Tween-relative keyframes + optional arcPath for one live tween, or null. */
 function readTween(vars: Record<string, unknown>): ReadTween | null {
+  const runEase = stringOr(vars.ease);
   if (vars.keyframes && typeof vars.keyframes === "object") {
     const parsed = parsePercentageKeyframes(vars.keyframes as Record<string, unknown>);
-    if (parsed) return parsed;
+    const keyframesEase = stringOr((vars.keyframes as { ease?: unknown }).ease);
+    if (parsed) return { ...parsed, runEase: keyframesEase ?? runEase };
   }
-  const mp = coordsFromMotionPath(vars.motionPath);
-  if (mp) {
-    const shape = buildArcPath(mp.coords, mp.curviness, mp.autoRotate, mp.isCubic);
-    if (shape) {
-      const n = shape.waypoints.length;
-      const keyframes = shape.waypoints.map((wp, i) => ({
-        percentage: n > 1 ? Math.round((i / (n - 1)) * 100) : 0,
-        properties: { x: wp.x, y: wp.y },
-      }));
-      return { keyframes, arcPath: shape.arcPath };
-    }
-  }
+  const path = readMotionPathTween(vars, runEase);
+  if (path) return path;
   const flat = flatTweenKeyframes(vars);
   return flat ? { keyframes: flat } : null;
-}
-
-function matchesElement(tween: RuntimeTween, el: Element): boolean {
-  if (!tween.targets) return false;
-  for (const t of tween.targets()) {
-    if (t === el || (el.id && (t as Element).id === el.id)) return true;
-  }
-  return false;
 }
 
 function tweenTiming(tween: RuntimeTween): { start: number; duration: number } {
@@ -174,127 +161,6 @@ function tweenTiming(tween: RuntimeTween): { start: number; duration: number } {
     start: Number.isFinite(rawStart) ? rawStart : 0,
     duration: Number.isFinite(rawDur) ? rawDur : 0,
   };
-}
-
-export interface ResolvedRuntimeTween {
-  /** The live GSAP tween targeting the selector. */
-  tween: RuntimeTween;
-  /** The composition timeline that owns it. */
-  timeline: RuntimeTimeline;
-}
-
-/**
- * Whether a tween's `vars` carry at least one of `channels` as an OWN property.
- * Used to disambiguate co-located `set`s: an element can have separate
- * `tl.set("#el",{x,y})` and `tl.set("#el",{rotation})` tweens, and a position
- * patch must land on the {x,y} set — never the rotation-only one.
- */
-function varsCarryChannel(vars: Record<string, unknown> | undefined, channels: string[]): boolean {
-  if (!vars) return false;
-  for (const ch of channels) {
-    if (Object.prototype.hasOwnProperty.call(vars, ch)) return true;
-  }
-  return false;
-}
-
-/**
- * Like `varsCarryChannel` but for a keyframe tween: the channels live inside the
- * keyframe steps (`vars.keyframes`), not as own props of `vars`. Handles the object
- * form (`{ "0%": {...} }`) and the array form (`[{...}, ...]`).
- */
-function keyframeVarsCarryChannel(
-  vars: Record<string, unknown> | undefined,
-  channels: string[],
-): boolean {
-  const kf = vars?.keyframes;
-  if (!kf || typeof kf !== "object") return false;
-  const steps = Array.isArray(kf) ? kf : Object.values(kf);
-  return steps.some(
-    (step) =>
-      step != null &&
-      typeof step === "object" &&
-      channels.some((ch) => Object.prototype.hasOwnProperty.call(step, ch)),
-  );
-}
-
-/**
- * Resolve the live tween targeting `selector` using the SAME all-timelines scan
- * `readRuntimeKeyframes` uses, so read and write agree on "which tween". With
- * `kind: "keyframe"` it skips zero-duration `set`s and prefers the tween whose
- * range contains the playhead (matching the reader). With `kind: "set"` it picks
- * the zero-duration `set`/hold instead. Returns null when none matches.
- *
- * `channels` disambiguates co-located `set`s (CHANNEL-BLIND otherwise): when
- * provided with `kind: "set"`, a set carrying ONE of those channels wins, and a
- * set carrying ONLY disjoint channels is skipped (so patching {x,y} never lands
- * on a rotation-only set). With no channel-matching set, it falls back to the
- * first matching set (back-compat). `channels` is ignored for `kind: "keyframe"`.
- */
-// fallow-ignore-next-line complexity
-export function resolveRuntimeTween(
-  iframe: HTMLIFrameElement | null,
-  selector: string,
-  kind: "keyframe" | "set",
-  compositionId?: string,
-  channels?: string[],
-  // fallow-ignore-next-line code-duplication
-): ResolvedRuntimeTween | null {
-  const timelines = timelinesOf(iframe);
-  if (!timelines) return null;
-
-  let targetEl: Element | null = null;
-  try {
-    targetEl = iframe?.contentDocument?.querySelector(selector) ?? null;
-  } catch {
-    return null;
-  }
-  if (!targetEl) return null;
-
-  const tlIds = compositionId
-    ? [compositionId]
-    : Object.keys(timelines).filter((k) => typeof timelines[k]?.getChildren === "function");
-
-  // Channels disambiguate co-located tweens for BOTH kinds: a `set` carries them as
-  // own vars props, a keyframe tween carries them inside its keyframe steps. An
-  // element can have a rotation keyframe tween AND a position keyframe tween; a
-  // rotation edit must land on the former. The reader passes no channels, so its
-  // playhead-containment path below is unchanged.
-  const wantChannels = channels && channels.length > 0 ? channels : null;
-
-  let first: ResolvedRuntimeTween | null = null;
-  // fallow-ignore-next-line code-duplication
-  let channelMatch: ResolvedRuntimeTween | null = null;
-  for (const tlId of tlIds) {
-    const timeline = timelines[tlId];
-    if (!timeline?.getChildren) continue;
-    const now = typeof timeline.time === "function" ? timeline.time() : null;
-    for (const tween of timeline.getChildren(true)) {
-      if (!tween.vars || !matchesElement(tween, targetEl)) continue;
-      const dur = typeof tween.duration === "function" ? tween.duration() : 0;
-      const isSet = !(dur > 0);
-      if (kind === "set" ? !isSet : isSet) continue;
-      if (wantChannels) {
-        const carries =
-          kind === "set"
-            ? varsCarryChannel(tween.vars, wantChannels)
-            : keyframeVarsCarryChannel(tween.vars, wantChannels);
-        if (carries) {
-          if (channelMatch === null) channelMatch = { tween, timeline };
-        } else if (first === null) {
-          // A tween carrying only disjoint channels: remember as last-resort
-          // fallback, but never prefer it over a channel-matching one.
-          first = { tween, timeline };
-        }
-        continue;
-      }
-      if (first === null) first = { tween, timeline };
-      if (kind === "keyframe" && now != null) {
-        const start = typeof tween.startTime === "function" ? tween.startTime() : 0;
-        if (now >= start - 1e-3 && now <= start + dur + 1e-3) return { tween, timeline };
-      }
-    }
-  }
-  return channelMatch ?? first;
 }
 
 /** Whether a read carries at least one of `channels` as a keyframe property. */
@@ -320,15 +186,10 @@ export function readRuntimeKeyframes(
   requireChannels?: string[],
   // fallow-ignore-next-line code-duplication
 ): ReadTween | null {
-  const timelines = timelinesOf(iframe);
+  const timelines = readableTimelines(iframe);
   if (!timelines) return null;
 
-  let targetEl: Element | null = null;
-  try {
-    targetEl = iframe?.contentDocument?.querySelector(selector) ?? null;
-  } catch {
-    return null;
-  }
+  const targetEl = readableTarget(iframe, selector);
   if (!targetEl) return null;
 
   // Search the element's OWN composition timeline. With inlined subcompositions the
@@ -361,11 +222,11 @@ export function readRuntimeKeyframes(
       const read = readTween(tween.vars);
       if (!read) continue;
       if (requireChannels && !readCarriesChannel(read, requireChannels)) continue;
-      if (firstRead === null) firstRead = read;
+      if (firstRead === null) firstRead = withParsedStart(read, tween);
       // Prefer the tween whose [start, start+dur] contains the playhead.
       if (now != null) {
         const start = typeof tween.startTime === "function" ? tween.startTime() : 0;
-        if (now >= start - 1e-3 && now <= start + dur + 1e-3) return read;
+        if (now >= start - 1e-3 && now <= start + dur + 1e-3) return withParsedStart(read, tween);
       }
     }
   }
@@ -375,8 +236,9 @@ export function readRuntimeKeyframes(
 }
 
 /**
- * Whether the live timeline has at least one NON-HOLD tween (non-zero duration,
- * not the studio position-hold `set`) targeting `selector`. Stricter than a
+ * Whether any live timeline has at least one NON-HOLD tween (non-zero duration,
+ * not the studio position-hold `set`) targeting `selector`. Every timeline is read:
+ * a soft reload re-adds the rebuilt composition's key last. Stricter than a
  * truthy `readRuntimeKeyframes`: that returns a flat read for any property-bearing
  * tween, so it can't distinguish a real animation from a leftover hold/marker.
  * The drag's stale-parse guard needs this exact distinction — after a delete-all
@@ -387,51 +249,156 @@ export function readRuntimeKeyframes(
  * rotation/scale tween doesn't make a static position hold enter the keyframe
  * branch.
  */
-// fallow-ignore-next-line complexity
 export function hasNonHoldTweenForElement(
   iframe: HTMLIFrameElement | null,
   selector: string,
   compositionId?: string,
   channels?: string[],
 ): boolean {
-  const timelines = timelinesOf(iframe);
+  const targetEl = readableTarget(iframe, selector);
+  return (
+    !!targetEl && hasNonHoldTween(readableTimelines(iframe), targetEl, channels, compositionId)
+  );
+}
+
+// A sibling rotation/scale tween must never push a static position hold into the keyframe branch.
+export const POSITION_CHANNELS: string[] = [
+  "x",
+  "y",
+  "xPercent",
+  "yPercent",
+  "left",
+  "top",
+  // readTween reads the authored translateX/Y; GSAP normalizes them to x/y only at play time.
+  "translateX",
+  "translateY",
+];
+const MOVE_CHANNELS = [...POSITION_CHANNELS, "motionPath"];
+
+export const GSAP_TRANSFORM_KEYS = new Set(
+  "x,y,z,scale,scaleX,scaleY,xPercent,yPercent,rotation,rotationX,rotationY,skewX,skewY,transformOrigin,svgOrigin,force3D,smoothOrigin,transformPerspective,translateX,translateY,translateZ,rotate,rotationZ,rotateZ,rotateX,rotateY".split(
+    ",",
+  ),
+);
+const TRANSFORM_CHANNELS = [...MOVE_CHANNELS, ...GSAP_TRANSFORM_KEYS];
+
+/** Sealed `!editsPlainCss(el, "move")`: the frame snapshot's tweens move or transform `el`. */
+export function sealedGsapRendersTransform(iframe: HTMLIFrameElement, el: Element): boolean {
+  const target = frameTarget(iframe, el);
+  return !!target && timelinesWriteChannels(frameTimelines(iframe), target, TRANSFORM_CHANNELS);
+}
+
+/** Whether a live timeline tween or hold writes any of `channels` on `el`. Sync, no fetch. */
+export function gsapWritesChannels(el: Element, channels: string[]): boolean {
+  const win = el.ownerDocument.defaultView as { __timelines?: Record<string, RuntimeTimeline> };
+  return timelinesWriteChannels(win?.__timelines ?? null, el, channels);
+}
+
+function timelinesWriteChannels(
+  timelines: Record<string, RuntimeTimeline> | null,
+  el: Element,
+  channels: string[],
+): boolean {
+  return Object.values(timelines ?? {}).some((tl) =>
+    tweensTargeting(tl, el).some(
+      (tween) =>
+        !!tween.vars &&
+        (channels.some((ch) => ch in tween.vars!) ||
+          keyframeVarsCarryChannel(tween.vars, channels)),
+    ),
+  );
+}
+
+// GSAP's CSSPlugin also takes rotate, rotateX/Y/Z for rotation.
+export const ROTATION_CHANNELS: string[] = [
+  ...["rotation", "rotationX", "rotationY", "rotationZ"],
+  ...["rotate", "rotateX", "rotateY", "rotateZ"],
+];
+
+/** GSAP owns this element's position: a tween or hold writes it, or GSAP already renders its
+ *  transform (a CSS translate would then apply twice). Everything else moves by plain CSS. */
+function gsapWritesPosition(el: Element): boolean {
+  return gsapRendersTransform(el) || gsapWritesChannels(el, MOVE_CHANNELS);
+}
+
+/** `gsapWritesPosition` for a rotate: everything else turns by its own CSS `rotate`. */
+function gsapWritesRotation(el: Element): boolean {
+  return gsapRendersTransform(el) || gsapWritesChannels(el, ROTATION_CHANNELS);
+}
+
+export function gsapHoldsTranslate(el: Element): boolean {
+  const cache = (el as { _gsap?: Record<string, unknown> })._gsap;
+  return ["x", "y", "xPercent", "yPercent"].some(
+    (key) => !!Number.parseFloat(String(cache?.[key])),
+  );
+}
+
+const BOX_CHANNELS = [
+  ...BOX_SIZE_STYLE_PROPS.map((prop) =>
+    prop.replace(/-([a-z])/g, (_, c: string) => c.toUpperCase()),
+  ),
+  "scaleX",
+  "scaleY",
+];
+
+/** GSAP owns this element's box: its position, or any property the CSS box writer sets. Else a resize writes CSS. */
+function gsapWritesBox(el: Element): boolean {
+  return gsapWritesPosition(el) || gsapWritesChannels(el, BOX_CHANNELS);
+}
+
+export type EditGesture = "move" | "resize" | "rotate";
+const GSAP_OWNS: Record<EditGesture, (el: Element) => boolean> = {
+  move: gsapWritesPosition,
+  resize: gsapWritesBox,
+  rotate: gsapWritesRotation,
+};
+
+/** The one GSAP-or-CSS route decision. Make it when an edit starts and carry it: mid-gesture
+ *  writes make GSAP render the element, so asking again at commit can flip the route. */
+export function editsPlainCss(el: Element, gesture: EditGesture): boolean {
+  return !GSAP_OWNS[gesture](el);
+}
+
+/** `hasNonHoldTweenForElement` for an element in hand, read from its own window's timelines. */
+export function elementHasNonHoldTween(el: Element, channels?: string[]): boolean {
+  const win = el.ownerDocument.defaultView as {
+    __timelines?: Record<string, RuntimeTimeline>;
+  } | null;
+  return hasNonHoldTween(win?.__timelines ?? null, el, channels);
+}
+
+// fallow-ignore-next-line complexity
+function hasNonHoldTween(
+  timelines: Record<string, RuntimeTimeline> | null,
+  targetEl: Element,
+  channels?: string[],
+  compositionId?: string,
+): boolean {
   if (!timelines) return false;
-  const tlId =
-    compositionId ||
-    Object.keys(timelines).find((k) => typeof timelines[k]?.getChildren === "function");
-  if (!tlId) return false;
-  const timeline = timelines[tlId];
-  if (!timeline?.getChildren) return false;
-
-  let targetEl: Element | null = null;
-  try {
-    targetEl = iframe?.contentDocument?.querySelector(selector) ?? null;
-  } catch {
-    return false;
-  }
-  if (!targetEl) return false;
-
-  // fallow-ignore-next-line code-duplication
-  for (const tween of timeline.getChildren(true)) {
-    if (!tween.vars || !matchesElement(tween, targetEl)) continue;
-    const dur = typeof tween.duration === "function" ? tween.duration() : 0;
-    if (isZeroDurationSet(dur)) continue; // skip hold/set tweens (see isZeroDurationSet)
-    const read = readTween(tween.vars);
-    if (read && (!channels || readCarriesChannel(read, channels))) return true;
+  for (const tlId of compositionId ? [compositionId] : Object.keys(timelines)) {
+    for (const tween of tweensTargeting(timelines[tlId], targetEl)) {
+      if (!tween.vars) continue;
+      const dur = typeof tween.duration === "function" ? tween.duration() : 0;
+      if (isZeroDurationSet(dur)) continue; // skip hold/set tweens (see isZeroDurationSet)
+      if (channels && keyframeVarsCarryChannel(tween.vars, channels)) return true;
+      const read = readTween(tween.vars);
+      if (read && (!channels || readCarriesChannel(read, channels))) return true;
+    }
   }
   return false;
 }
 
 /** Convert tween-relative keyframes to clip-relative % using the element's clip dims. */
 function toClipRelative(
-  keyframes: Pct[],
+  read: ReadTween,
   tweenStart: number,
   tweenDuration: number,
   clip: { start: number; duration: number } | undefined,
 ): Pct[] {
+  const { keyframes, runEase } = read;
   if (!clip || clip.duration <= 0) return keyframes;
   return keyframes.map((kf) => {
-    const abs = toAbsoluteTime(tweenStart, tweenDuration, kf.percentage);
+    const abs = toAbsoluteTime(tweenStart, tweenDuration, timeAtProgress(runEase, kf.percentage));
     return { ...kf, percentage: Math.round(((abs - clip.start) / clip.duration) * 100000) / 1000 };
   });
 }
@@ -443,7 +410,7 @@ function buildEntry(
   clip: { start: number; duration: number } | undefined,
 ): RuntimeKeyframeEntry {
   return {
-    keyframes: toClipRelative(read.keyframes, start, duration, clip),
+    keyframes: toClipRelative(read, start, duration, clip),
     tweenStart: start,
     tweenDuration: duration,
     ...(read.easeEach ? { easeEach: read.easeEach } : {}),
@@ -479,7 +446,7 @@ export function scanAllRuntimeKeyframes(
   clipById?: ClipDims,
 ): Map<string, RuntimeKeyframeEntry> {
   const result = new Map<string, RuntimeKeyframeEntry>();
-  const timelines = timelinesOf(iframe);
+  const timelines = readableTimelines(iframe);
   if (!timelines) return result;
   for (const timeline of Object.values(timelines)) {
     if (!timeline?.getChildren) continue;

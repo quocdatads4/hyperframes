@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -97,7 +97,31 @@ describe("insertCompositionIntoSource", () => {
     );
 
     expect(result.hostId).toBe("headline_2");
-    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toEqual(["main", "headline", "headline"]);
+  });
+
+  it("mounts a project whose root shares the parent root's id under its own host id", () => {
+    const dir = project();
+    const cliRoot = (title: string) => `<!doctype html><html><body>
+      <div id="root" data-composition-id="main" data-width="1920" data-height="1080" data-duration="6">${title}</div>
+    </body></html>`;
+    writeFileSync(join(dir, "index.html"), cliRoot("Host"));
+    writeFileSync(join(dir, "scene.html"), cliRoot("Scene"));
+
+    const result = insertCompositionIntoSource({
+      projectDir: dir,
+      targetPath: "index.html",
+      sourcePath: "scene.html",
+      parentSource: cliRoot("Host"),
+      start: 0,
+      desiredTrack: 0,
+    });
+    const host = parseHTML(result.html).document.querySelector("[data-composition-src]");
+
+    expect(result.hostId).not.toBe("main");
+    expect(result.hostId).not.toBe("root");
+    expect(host?.id).toBe(result.hostId);
+    expect(host?.getAttribute("data-composition-id")).toBe("main");
   });
 
   it("ignores nested composition internals when resolving a parent track collision", () => {
@@ -143,6 +167,50 @@ describe("insertCompositionIntoSource", () => {
     expect(result.html).toContain('data-duration="5.9"');
   });
 
+  // fails without the fix: inserting into an open scene wrote the path from that scene's folder ("b.html"), which the
+  // renderer and the preview read from the project root, so the export said the scene was missing.
+  it("names the source from the project root when inserting into a scene in a folder", () => {
+    const dir = project();
+    const scene = `<template><div data-composition-id="a" data-width="1920" data-height="1080" data-duration="2"></div></template>`;
+    mkdirSync(join(dir, "compositions"));
+    mkdirSync(join(dir, "scenes"));
+    writeFileSync(join(dir, "compositions/a.html"), scene);
+    writeFileSync(join(dir, "compositions/b.html"), child);
+    writeFileSync(join(dir, "scenes/c.html"), child.replace('"headline"', '"other"'));
+    const insert = (sourcePath: string) =>
+      insertCompositionIntoSource({
+        projectDir: dir,
+        targetPath: "compositions/a.html",
+        sourcePath,
+        parentSource: scene,
+        start: 0,
+        desiredTrack: 0,
+      }).html;
+
+    expect(insert("compositions/b.html")).toContain('data-composition-src="compositions/b.html"');
+    expect(insert("scenes/c.html")).toContain('data-composition-src="scenes/c.html"');
+  });
+
+  // fails without the fix: a source naming its own scene from the root was refused as missing.
+  it("follows a source's own scenes from the project root", () => {
+    const dir = project();
+    writeFixture(dir);
+    mkdirSync(join(dir, "compositions"));
+    const nested = `<template><div data-composition-id="wrap" data-width="1920" data-height="1080" data-duration="3"><div data-composition-src="compositions/inner.html"></div></div></template>`;
+    writeFileSync(join(dir, "compositions/wrap.html"), nested);
+    writeFileSync(join(dir, "compositions/inner.html"), child);
+
+    const result = insertCompositionIntoSource({
+      projectDir: dir,
+      targetPath: "index.html",
+      sourcePath: "compositions/wrap.html",
+      parentSource: parent,
+      start: 0,
+      desiredTrack: 0,
+    });
+    expect(result.html).toContain('data-composition-src="compositions/wrap.html"');
+  });
+
   it("rejects self-nesting, transitive cycles, missing files, and invalid durations", () => {
     const dir = project();
     writeFixture(dir);
@@ -173,5 +241,43 @@ describe("insertCompositionIntoSource", () => {
     expect(() => insert("missing.html")).toThrow(CompositionInsertionError);
     expect(() => insert("invalid.html")).toThrow(/valid data-composition-duration/);
     expect(() => insert("../outside.html")).toThrow(CompositionInsertionError);
+  });
+
+  it("rejects a source, or a source's dependency, that is a folder", () => {
+    const dir = project();
+    writeFixture(dir);
+    mkdirSync(join(dir, "intro"));
+    writeFileSync(
+      join(dir, "wraps-folder.html"),
+      `<div data-composition-id="wrap" data-width="1" data-height="1" data-duration="1"><div data-composition-src="intro"></div></div>`,
+    );
+    const insert = (sourcePath: string) =>
+      insertCompositionIntoSource({
+        projectDir: dir,
+        targetPath: "index.html",
+        sourcePath,
+        parentSource: parent,
+        start: 0,
+        desiredTrack: 0,
+      });
+
+    expect(() => insert("intro")).toThrow(/folder, not an HTML file/);
+    expect(() => insert("wraps-folder.html")).toThrow(/folder, not an HTML file/);
+  });
+
+  it("says the project folder is gone rather than that the source escapes it", () => {
+    const dir = project();
+    rmSync(dir, { recursive: true });
+    const insert = () =>
+      insertCompositionIntoSource({
+        projectDir: dir,
+        targetPath: "index.html",
+        sourcePath: "headline.html",
+        parentSource: parent,
+        start: 0,
+        desiredTrack: 0,
+      });
+
+    expect(insert).toThrow(expect.objectContaining({ name: "ProjectRootMissingError" }));
   });
 });

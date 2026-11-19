@@ -1,12 +1,13 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { writeFileSync, readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { Script } from "node:vm";
+import { Window } from "happy-dom";
 import {
   loadTranscript,
   detectFormat,
   patchCaptionHtml,
-  stripBeforeOnset,
   formatSrt,
   formatVtt,
   wordsToCues,
@@ -14,8 +15,7 @@ import {
 import { detectSpeechOnset } from "./transcribe.js";
 
 function tmpFile(name: string, content: string): string {
-  const dir = join(tmpdir(), `hf-normalize-test-${Date.now()}`);
-  mkdirSync(dir, { recursive: true });
+  const dir = mkdtempSync(join(tmpdir(), "hf-normalize-test-"));
   dirs.push(dir);
   const path = join(dir, name);
   writeFileSync(path, content);
@@ -38,6 +38,14 @@ describe("detectFormat", () => {
   it("detects VTT by extension", () => {
     const path = tmpFile("test.vtt", "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\n");
     expect(detectFormat(path)).toBe("vtt");
+  });
+
+  it("detects a JSON transcript saved with a UTF-8 BOM", () => {
+    const path = tmpFile(
+      "bom.json",
+      `\uFEFF${JSON.stringify({ transcription: [{ offsets: { from: 0, to: 1000 }, text: " Hi", tokens: [{ text: " Hi", offsets: { from: 0, to: 1000 }, p: 0.9 }] }] })}`,
+    );
+    expect(detectFormat(path)).toBe("whisper-cpp");
   });
 
   it("detects whisper-cpp JSON", () => {
@@ -85,6 +93,72 @@ describe("detectFormat", () => {
 });
 
 describe("loadTranscript", () => {
+  it.each([
+    ["00:00:01.000", "00:00:03.500", "align:start"],
+    ["00:01.000", "00:03.500", "align:start"],
+    ["00:00:01.000", "00:00:03.500", "line:90% position:50%,center size:80% align:center"],
+    ["00:01.000", "00:03.500", "\tvertical:rl\tline:0"],
+    ["00:00:01.000", "00:00:03.500", "region:captions"],
+  ])("retains VTT end time before cue settings: %s --> %s %s", (start, end, settings) => {
+    const source = `WEBVTT\n\nfirst\n${start} --> ${end} ${settings}\nFirst phrase\n\nsecond\n00:04.000 --> 00:06.000\nSecond phrase\n`;
+    const { words } = loadTranscript(tmpFile("settings.vtt", source));
+    expect(words).toEqual([
+      { text: "First phrase", start: 1, end: 3.5, id: "w0" },
+      { text: "Second phrase", start: 4, end: 6, id: "w1" },
+    ]);
+    expect(formatSrt(words, { preGrouped: true })).toBe(
+      "1\n00:00:01,000 --> 00:00:03,500\nFirst phrase\n\n2\n00:00:04,000 --> 00:00:06,000\nSecond phrase\n",
+    );
+  });
+
+  it("reads an empty word list as a transcript with no words", () => {
+    expect(loadTranscript(tmpFile("transcript.json", "[]"))).toEqual({
+      words: [],
+      format: "words-json",
+    });
+  });
+
+  it("still rejects a JSON array that is not a word list", () => {
+    expect(() => loadTranscript(tmpFile("transcript.json", '[{"foo":1}]'))).toThrow(
+      /Unrecognized JSON transcript format/,
+    );
+  });
+
+  it("reads whisper-cli output whose floats are nan, -nan, inf or MSVC's -nan(ind)", () => {
+    // Token objects as whisper.cpp's cli.cpp writes them: tab-indented, floats via iostream.
+    const token = (text: string, from: number, to: number, p: string) =>
+      [
+        "\t\t\t{",
+        `\t\t\t\t"text": "${text}",`,
+        `\t\t\t\t"timestamps": {`,
+        `\t\t\t\t\t"from": "00:00:00.000",`,
+        `\t\t\t\t\t"to": "00:00:00.500"`,
+        `\t\t\t\t},`,
+        `\t\t\t\t"offsets": {`,
+        `\t\t\t\t\t"from": ${from},`,
+        `\t\t\t\t\t"to": ${to}`,
+        `\t\t\t\t},`,
+        `\t\t\t\t"id": 50364,`,
+        `\t\t\t\t"p": ${p},`,
+        `\t\t\t\t"t_dtw": -1`,
+        "\t\t\t}",
+      ].join("\n");
+    const raw = `{\n\t"transcription": [\n\t\t{\n\t\t\t"tokens": [\n${[
+      token(" nan", 0, 500, "nan"),
+      token(" world", 600, 1200, "-nan"),
+      token(" again", 1300, 1800, "inf"),
+      token(" later", 1900, 2400, "-nan(ind)"),
+    ].join(",\n")}\n\t\t\t]\n\t\t}\n\t]\n}\n`;
+    const { words, format } = loadTranscript(tmpFile("transcript.json", raw));
+    expect(format).toBe("whisper-cpp");
+    expect(words).toEqual([
+      { text: "nan", start: 0, end: 0.5, id: "w0" },
+      { text: "world", start: 0.6, end: 1.2, id: "w1" },
+      { text: "again", start: 1.3, end: 1.8, id: "w2" },
+      { text: "later", start: 1.9, end: 2.4, id: "w3" },
+    ]);
+  });
+
   it("parses whisper-cpp JSON with punctuation merging", () => {
     const path = tmpFile(
       "transcript.json",
@@ -104,8 +178,8 @@ describe("loadTranscript", () => {
     const { words, format } = loadTranscript(path);
     expect(format).toBe("whisper-cpp");
     expect(words).toEqual([
-      { text: "Hello,", start: 0, end: 0.55 },
-      { text: "world.", start: 0.6, end: 1.25 },
+      { text: "Hello,", start: 0, end: 0.55, id: "w0" },
+      { text: "world.", start: 0.6, end: 1.25, id: "w1" },
     ]);
   });
 
@@ -143,8 +217,8 @@ describe("loadTranscript", () => {
     const { words, format } = loadTranscript(path);
     expect(format).toBe("openai");
     expect(words).toEqual([
-      { text: "Hello", start: 0, end: 0.5 },
-      { text: "world", start: 0.6, end: 1.2 },
+      { text: "Hello", start: 0, end: 0.5, id: "w0" },
+      { text: "world", start: 0.6, end: 1.2, id: "w1" },
     ]);
   });
 
@@ -184,6 +258,24 @@ How are you
     ]);
   });
 
+  it.each([
+    ["ALICE: Hello there", "ALICE: Hello there"],
+    ["ALICE: Hello\nBOB: Welcome", "ALICE: Hello BOB: Welcome"],
+    ["Hello there\nALICE: Welcome", "Hello there ALICE: Welcome"],
+    ["ALICE: Hello\nWelcome back", "ALICE: Hello Welcome back"],
+    ["HOST-NAME: Welcome", "HOST-NAME: Welcome"],
+    ["Alice: Hello there", "Alice: Hello there"],
+  ])("preserves the VTT cue payload %j", (payload, text) => {
+    const vtt = `WEBVTT\nX-TIMESTAMP-MAP:LOCAL:00:00:00.000,MPEGTS:900000\n\n00:00:01.000 --> 00:00:03.500\n${payload}\n\n00:00:04.000 --> 00:00:06.000\nHow are you\n`;
+    const { words } = loadTranscript(tmpFile("speaker.vtt", vtt));
+    expect(words).toEqual([
+      { text, start: 1, end: 3.5, id: "w0" },
+      { text: "How are you", start: 4, end: 6, id: "w1" },
+    ]);
+    expect(loadTranscript(tmpFile("speaker-roundtrip.vtt", formatVtt(words))).words).toEqual(words);
+    expect(loadTranscript(tmpFile("speaker-roundtrip.srt", formatSrt(words))).words).toEqual(words);
+  });
+
   it("parses VTT with short timestamps (MM:SS.mmm)", () => {
     const vtt = `WEBVTT
 
@@ -206,7 +298,7 @@ Short format
     expect(words[0]?.text).toBe("Bold and italic");
   });
 
-  it("passes through normalized word arrays", () => {
+  it("assigns w{index} ids to normalized word arrays", () => {
     const input = [
       { text: "Hello", start: 0.0, end: 0.5 },
       { text: "world", start: 0.6, end: 1.2 },
@@ -215,13 +307,92 @@ Short format
     const { words, format } = loadTranscript(path);
     expect(format).toBe("words-json");
     expect(words).toEqual([
-      { text: "Hello", start: 0, end: 0.5, id: "" },
+      { text: "Hello", start: 0, end: 0.5, id: "w0" },
+      { text: "world", start: 0.6, end: 1.2, id: "w1" },
+    ]);
+  });
+
+  it("preserves existing ids and repairs empty-string ids from legacy files", () => {
+    const input = [
+      { text: "Hello", start: 0.0, end: 0.5, id: "keep-me" },
       { text: "world", start: 0.6, end: 1.2, id: "" },
+      { text: "again", start: 1.3, end: 1.8 },
+    ];
+    const path = tmpFile("legacy.json", JSON.stringify(input));
+    const { words } = loadTranscript(path);
+    expect(words.map((w) => w.id)).toEqual(["keep-me", "w1", "w2"]);
+  });
+});
+
+describe("subtitle line endings", () => {
+  it.each([
+    ["srt", "\r\n"],
+    ["srt", "\r"],
+    ["vtt", "\r\n"],
+    ["vtt", "\r"],
+  ])("keeps separate %s cues with %j line endings", (ext, newline) => {
+    const timestamp = ext === "srt" ? "," : ".";
+    const lines = [
+      ...(ext === "vtt" ? ["WEBVTT", ""] : []),
+      "1",
+      `00:00:01${timestamp}000 --> 00:00:03${timestamp}500`,
+      "<b>Hello</b> world",
+      "Again",
+      "",
+      "2",
+      `00:00:04${timestamp}000 --> 00:00:06${timestamp}000`,
+      "How are you",
+      "",
+    ];
+    const { words, format } = loadTranscript(tmpFile(`captions.${ext}`, lines.join(newline)));
+    expect(format).toBe(ext);
+    expect(words).toEqual([
+      { text: "Hello world Again", start: 1, end: 3.5, id: "w0" },
+      { text: "How are you", start: 4, end: 6, id: "w1" },
+    ]);
+    expect(formatSrt(words, { preGrouped: true })).toBe(
+      "1\n00:00:01,000 --> 00:00:03,500\nHello world Again\n\n2\n00:00:04,000 --> 00:00:06,000\nHow are you\n",
+    );
+  });
+
+  it("preserves WebVTT cues when newline forms are mixed", () => {
+    const source =
+      "WEBVTT\r\n\r\n00:01.000 --> 00:02.000\rFirst phrase\r\r00:03.000 --> 00:04.000\nSecond phrase\n";
+    expect(loadTranscript(tmpFile("mixed.vtt", source)).words).toEqual([
+      { text: "First phrase", start: 1, end: 2, id: "w0" },
+      { text: "Second phrase", start: 3, end: 4, id: "w1" },
     ]);
   });
 });
 
 describe("caption formatting", () => {
+  it.each([
+    ["R&D <config> next", "R&amp;D &lt;config&gt; next"],
+    ["Literal &lt; &amp; references", "Literal &amp;lt; &amp;amp; references"],
+    ["3 < 4 and 5 > 2", "3 &lt; 4 and 5 &gt; 2"],
+    ["R&D --> next", "R&amp;D --&gt; next"],
+  ])("preserves literal WebVTT text %j on export and reimport", (text, payload) => {
+    const words = [{ text, start: 1, end: 2, id: "w0" }];
+    const output = formatVtt(words);
+    expect(output).toBe(`WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n${payload}\n`);
+    expect(loadTranscript(tmpFile("literal.vtt", output)).words).toEqual(words);
+  });
+
+  it.each([
+    ["R&amp;D &lt;config&gt; next", "R&D <config> next"],
+    ["&quot;quoted&quot; &apos;text&apos;", "\"quoted\" 'text'"],
+    ["&#38; &#x3c; &#60;", "& < <"],
+    ["Literal &amp;lt; &amp;amp; references", "Literal &lt; &amp; references"],
+    ["<b>R&amp;D</b> &lt;config&gt;", "R&D <config>"],
+    ["A&nbsp;B&lrm;&rlm;", "A\u00a0B\u200e\u200f"],
+    ["Keep &unknown;", "Keep &unknown;"],
+  ])("decodes the WebVTT cue payload %j once", (payload, text) => {
+    const input = `WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n${payload}\n`;
+    expect(loadTranscript(tmpFile("entities.vtt", input)).words).toEqual([
+      { text, start: 1, end: 2, id: "w0" },
+    ]);
+  });
+
   it("round-trips SRT cues through normalized words", () => {
     const srt = `1
 00:00:01,000 --> 00:00:03,500
@@ -293,6 +464,53 @@ Render video. Built for agents.
     expect(cues).toEqual([{ text: "你好世界", start: 0, end: 1 }]);
   });
 
+  it("keeps phrase-level CJK entries as separate cues", () => {
+    // Chinese has no inter-word spaces, so the whitespace test cannot see
+    // that these are phrases; they used to collapse into one cue spanning
+    // the whole transcript.
+    const cues = wordsToCues([
+      { text: "这是第一个句子", start: 0, end: 2 },
+      { text: "这是第二个句子", start: 2, end: 4 },
+      { text: "这是第三个句子", start: 4, end: 6 },
+    ]);
+    expect(cues).toHaveLength(3);
+    expect(cues[0]).toEqual({
+      text: "这是第一个句子",
+      start: 0,
+      end: 2,
+    });
+  });
+
+  it("keeps phrase-level Thai entries as separate cues", () => {
+    const cues = wordsToCues([
+      { text: "สวัสดีครับ", start: 0, end: 2 },
+      { text: "ยินดีต้อนรับ", start: 2, end: 4 },
+    ]);
+    expect(cues).toHaveLength(2);
+  });
+
+  it("treats entries at the length threshold as phrases", () => {
+    // Four characters is the boundary: at or above it the entries are read as
+    // phrase-level cues, below it as word-level tokens.
+    const cues = wordsToCues([
+      { text: "你好世界", start: 0, end: 2 },
+      { text: "谢谢大家", start: 2, end: 4 },
+    ]);
+    expect(cues).toHaveLength(2);
+  });
+
+  it("still groups word-level CJK tokens into cues", () => {
+    // The mirror of the case above: short per-token entries are word-level
+    // whisper output and must still be joined.
+    const cues = wordsToCues([
+      { text: "你", start: 0, end: 0.3 },
+      { text: "好", start: 0.3, end: 0.6 },
+      { text: "世", start: 0.6, end: 0.9 },
+      { text: "界", start: 0.9, end: 1.2 },
+    ]);
+    expect(cues).toEqual([{ text: "你好世界", start: 0, end: 1.2 }]);
+  });
+
   it("preserves single-word cue boundaries when preGrouped", () => {
     // Phrase-level cues without internal whitespace (one-word or CJK captions)
     // must not merge — auto-detection can't see them, so the caller forces it.
@@ -329,9 +547,9 @@ describe("whisper-cpp contraction merging", () => {
     );
     const { words } = loadTranscript(path);
     expect(words).toEqual([
-      { text: "I", start: 0, end: 0.2 },
-      { text: "didn't", start: 0.2, end: 0.7 },
-      { text: "know", start: 0.7, end: 1 },
+      { text: "I", start: 0, end: 0.2, id: "w0" },
+      { text: "didn't", start: 0.2, end: 0.7, id: "w1" },
+      { text: "know", start: 0.7, end: 1, id: "w2" },
     ]);
   });
 
@@ -417,6 +635,89 @@ describe("whisper-cpp fragment merging", () => {
   });
 });
 
+describe("whisper-cpp CJK tokens", () => {
+  const token = (text: string, from: number, to: number) => ({ text, offsets: { from, to } });
+
+  // Shaped like whisper-cli --output-json-full on Mandarin speech: no token
+  // carries a leading space, not even the first one of a segment.
+  function chineseTranscript(): string {
+    return tmpFile(
+      "transcript.json",
+      JSON.stringify({
+        transcription: [
+          {
+            offsets: { from: 0, to: 3990 },
+            text: "大家好,今天用AI剪輯。",
+            tokens: [
+              token("[_BEG_]", 0, 0),
+              token("大家好", 10, 730),
+              token(",", 1110, 1290),
+              token("今天", 1360, 1680),
+              token("用", 1680, 2010),
+              token("AI", 2010, 2500),
+              token("剪", 2970, 3460),
+              token("輯", 3460, 3830),
+              token("。", 3830, 3990),
+            ],
+          },
+          {
+            offsets: { from: 4000, to: 5600 },
+            text: "謝謝觀看。",
+            tokens: [
+              token("謝謝", 4000, 4500),
+              token("觀", 4500, 4900),
+              token("看", 4900, 5300),
+              token("。", 5300, 5600),
+              token("[_TT_280]", 5600, 5600),
+            ],
+          },
+        ],
+      }),
+    );
+  }
+
+  it("keeps each CJK token as its own timed word", () => {
+    const { words } = loadTranscript(chineseTranscript());
+    expect(words.map((w) => [w.text, w.start, w.end])).toEqual([
+      ["大家好,", 0.01, 1.29],
+      ["今天", 1.36, 1.68],
+      ["用", 1.68, 2.01],
+      ["AI", 2.01, 2.5],
+      ["剪", 2.97, 3.46],
+      ["輯。", 3.46, 3.99],
+      ["謝謝", 4, 4.5],
+      ["觀", 4.5, 4.9],
+      ["看。", 4.9, 5.6],
+    ]);
+  });
+
+  it("splits Japanese kana tokens and merges full-width punctuation", () => {
+    const path = tmpFile(
+      "transcript.json",
+      JSON.stringify({
+        transcription: [
+          {
+            tokens: [
+              token("こんにち", 0, 400),
+              token("は", 400, 600),
+              token("、", 600, 700),
+              token("世界", 700, 1200),
+              token("！", 1200, 1300),
+            ],
+          },
+        ],
+      }),
+    );
+    const { words } = loadTranscript(path);
+    expect(words.map((w) => w.text)).toEqual(["こんにち", "は、", "世界！"]);
+  });
+
+  it("ends a cue at a CJK sentence mark", () => {
+    const { words } = loadTranscript(chineseTranscript());
+    expect(wordsToCues(words).map((c) => c.text)).toEqual(["大家好,今天用AI剪輯。", "謝謝觀看。"]);
+  });
+});
+
 describe("whisper-cpp zero-duration interpolation", () => {
   it("interpolates a cluster of zero-duration words", () => {
     const path = tmpFile(
@@ -477,9 +778,60 @@ describe("whisper-cpp zero-duration interpolation", () => {
 });
 
 describe("patchCaptionHtml", () => {
+  it.each(["script", "TRANSCRIPT"])(
+    "replaces the complete %s array when old caption text contains an array terminator",
+    (name) => {
+      const dir = mkdtempSync(join(tmpdir(), "hf-patch-test-"));
+      dirs.push(dir);
+      const file = join(dir, "captions.html");
+      const oldWords = [{ text: "items[i];", start: 0, end: 1 }];
+      const prefix = `const ${name} = `;
+      const suffix = ";\nconst sentinel = true;";
+      writeFileSync(file, `<script>${prefix}${JSON.stringify(oldWords)}${suffix}</script>`);
+      const words = [{ id: "w0", text: "Replacement caption", start: 0, end: 1 }];
+
+      patchCaptionHtml(dir, words);
+
+      const html = readFileSync(file, "utf8");
+      const source = html.slice("<script>".length, -"</script>".length);
+      expect(() => new Script(source)).not.toThrow();
+      expect(source.endsWith(suffix)).toBe(true);
+      expect(JSON.parse(source.slice(prefix.length, -suffix.length))).toEqual(words);
+    },
+  );
+
+  it.each([
+    "</ScRiPt><span data-unexpected>caption</span>",
+    "</script\t><span data-unexpected>caption</span>",
+    "</script/><span data-unexpected>caption</span>",
+    "<!--<script>caption",
+    "$&",
+    "$`",
+    "$'",
+    "$$",
+    'quotes " and \\ and > & \u2028 \u2029 🎥',
+  ])("preserves literal caption text in the HTML script: %s", (text) => {
+    const dir = mkdtempSync(join(tmpdir(), "hf-patch-test-"));
+    dirs.push(dir);
+    const file = join(dir, "captions.html");
+    const html =
+      '<html><body><span id="caption"></span><script>const TRANSCRIPT = [];</script></body></html>';
+    writeFileSync(file, html);
+    const words = [{ id: `word-${text}`, text, start: 0, end: 1 }];
+
+    patchCaptionHtml(dir, words);
+
+    const template = new Window().document.createElement("template");
+    template.innerHTML = readFileSync(file, "utf-8");
+    expect(template.content.querySelectorAll("script")).toHaveLength(1);
+    expect(template.content.querySelector("[data-unexpected]")).toBeNull();
+    const source = template.content.querySelector("script")?.textContent ?? "";
+    const json = source.slice("const TRANSCRIPT = ".length, -1);
+    expect(JSON.parse(json)).toEqual(words);
+  });
+
   it("replaces const script = [] in HTML files", () => {
-    const dir = join(tmpdir(), `hf-patch-test-${Date.now()}`);
-    mkdirSync(dir, { recursive: true });
+    const dir = mkdtempSync(join(tmpdir(), "hf-patch-test-"));
     dirs.push(dir);
 
     const html = `<html><body><script>
@@ -501,8 +853,7 @@ describe("patchCaptionHtml", () => {
   });
 
   it("replaces const TRANSCRIPT = [] variant", () => {
-    const dir = join(tmpdir(), `hf-patch-test-${Date.now()}`);
-    mkdirSync(dir, { recursive: true });
+    const dir = mkdtempSync(join(tmpdir(), "hf-patch-test-"));
     dirs.push(dir);
 
     const html = `<script>const TRANSCRIPT = [];</script>`;
@@ -516,8 +867,7 @@ describe("patchCaptionHtml", () => {
   });
 
   it("does not modify HTML files without matching script patterns", () => {
-    const dir = join(tmpdir(), `hf-patch-test-${Date.now()}`);
-    mkdirSync(dir, { recursive: true });
+    const dir = mkdtempSync(join(tmpdir(), "hf-patch-test-"));
     dirs.push(dir);
 
     const html = `<html><body><script>console.log("hello");</script></body></html>`;
@@ -530,8 +880,7 @@ describe("patchCaptionHtml", () => {
   });
 
   it("skips empty word arrays", () => {
-    const dir = join(tmpdir(), `hf-patch-test-${Date.now()}`);
-    mkdirSync(dir, { recursive: true });
+    const dir = mkdtempSync(join(tmpdir(), "hf-patch-test-"));
     dirs.push(dir);
 
     const html = `<script>const script = [];</script>`;
@@ -572,9 +921,10 @@ describe("detectSpeechOnset", () => {
       const amplitude = energyFn(t);
       buf.writeInt16LE(Math.round(amplitude * 32767), 44 + i * 2);
     }
-    const path = join(tmpdir(), `hf-wav-test-${Date.now()}-${Math.floor(Math.random() * 1e6)}.wav`);
+    const dir = mkdtempSync(join(tmpdir(), "hf-wav-test-"));
+    dirs.push(dir);
+    const path = join(dir, "tone.wav");
     writeFileSync(path, buf);
-    dirs.push(path);
     return path;
   }
 
@@ -602,46 +952,5 @@ describe("detectSpeechOnset", () => {
     const wavPath = makeSyntheticWav(16000, 10, (t) => (t < 1 ? 0.01 : 0.8));
     const onset = detectSpeechOnset(wavPath);
     expect(onset).toBeNull();
-  });
-});
-
-describe("stripBeforeOnset", () => {
-  it("removes words before onset time", () => {
-    const words = [
-      { text: "ghost", start: 0.5, end: 2.0 },
-      { text: "alone", start: 3.0, end: 5.0 },
-      { text: "Given", start: 19.0, end: 19.5 },
-      { text: "the", start: 19.5, end: 20.0 },
-    ];
-    const result = stripBeforeOnset(words, 18.5);
-    expect(result).toHaveLength(2);
-    expect(result[0]!.text).toBe("Given");
-  });
-
-  it("keeps words within 0.5s tolerance of onset", () => {
-    const words = [
-      { text: "hello", start: 18.2, end: 18.8 },
-      { text: "world", start: 19.0, end: 19.5 },
-    ];
-    const result = stripBeforeOnset(words, 18.5);
-    expect(result).toHaveLength(2);
-  });
-
-  it("keeps everything when onset is 0", () => {
-    const words = [
-      { text: "hello", start: 0.1, end: 0.5 },
-      { text: "world", start: 0.6, end: 1.0 },
-    ];
-    const result = stripBeforeOnset(words, 0);
-    expect(result).toHaveLength(2);
-  });
-
-  it("returns empty array when all words are before onset", () => {
-    const words = [
-      { text: "ghost", start: 0.5, end: 2.0 },
-      { text: "alone", start: 3.0, end: 5.0 },
-    ];
-    const result = stripBeforeOnset(words, 20.0);
-    expect(result).toHaveLength(0);
   });
 });

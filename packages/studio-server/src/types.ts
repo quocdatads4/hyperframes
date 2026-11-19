@@ -1,5 +1,7 @@
 import type { CanvasResolution } from "@hyperframes/parsers";
 import type { RegistryItem } from "@hyperframes/core";
+import type { BundleOptions } from "@hyperframes/core/compiler";
+import type { ProjectHistory } from "./history/projectHistory.js";
 
 /** Resolved info about a single project. */
 export interface ResolvedProject {
@@ -17,12 +19,13 @@ export interface RenderJobState {
   stage?: string;
   outputPath: string;
   error?: string;
+  audioLoweredDb?: number;
   /**
    * Optional abort hook set by the adapter. The cancel route calls this to
    * stop an in-flight render; adapters that can't abort may omit it (the
    * route still marks the job cancelled so the SSE stream terminates).
    */
-  cancel?: () => void;
+  cancel?: () => void | Promise<void>;
 }
 
 export interface MediaProcessingJobState {
@@ -45,11 +48,16 @@ export interface MediaProcessingJobState {
 /** Lint result from the core linter. */
 export interface LintResult {
   findings: Array<{
+    code?: string;
     severity: string;
     message: string;
     file?: string;
     fixHint?: string;
   }>;
+}
+
+export interface ProjectLintResult {
+  results: Array<{ file: string; result: LintResult }>;
 }
 
 export interface StudioSelectionTextField {
@@ -89,6 +97,19 @@ export interface StudioSelectionResponse {
   updatedAt: string | null;
 }
 
+export type StudioRefusalWhy =
+  | "nul"
+  | "outside_project"
+  | "protected_path"
+  | "another_site"
+  | "cross_origin_write"
+  | "other";
+
+export interface StudioRefusal {
+  route: string;
+  why: StudioRefusalWhy;
+}
+
 /**
  * Adapter interface — injected by each consumer to handle host-specific behavior.
  * The shared API module calls these methods; each host (vite dev, CLI embedded)
@@ -101,17 +122,47 @@ export interface StudioApiAdapter {
   /** Resolve a project ID (or session ID) to its directory. Returns null if not found. */
   resolveProject(id: string): Promise<ResolvedProject | null> | ResolvedProject | null;
 
-  /** Bundle a project directory into a single HTML string. Returns null if unavailable. */
-  bundle(projectDir: string): Promise<string | null>;
+  /**
+   * Optional: the project's current history. A history refuses every call once its folder is replaced (a
+   * deleted `.hyperframes`, a new project there), so keep them in `historyCache`, which reopens. Else routes 404.
+   */
+  history?: (project: ResolvedProject) => Promise<ProjectHistory | null> | ProjectHistory | null;
 
-  /** Optional: cached signature for project files that should invalidate preview frame caches. */
-  getProjectSignature?: (projectDir: string) => string;
+  /** Bundle a project directory into a single HTML string, forwarding `options` over the host's own. */
+  bundle(
+    projectDir: string,
+    options?: Pick<BundleOptions, "stampHfIds" | "onRead" | "privateFiles">,
+  ): Promise<string | null>;
+
+  /** Optional: a cached `createProjectSignature(dir)`; preview caching checks builds against it. */
+  getProjectSignature?: (projectDir: string) => string | Promise<string>;
+  invalidateProjectSignature?: (projectDir: string) => void;
+
+  loadSharp?: () => Promise<typeof import("sharp").default>;
 
   /** Lint a single HTML string. */
-  lint(html: string, opts?: { filePath?: string }): Promise<LintResult> | LintResult;
+  lint(
+    html: string,
+    opts?: { filePath?: string; isSubComposition?: boolean; compSrcPath?: string },
+  ): Promise<LintResult> | LintResult;
+
+  /**
+   * Lint the complete project, including relationships between files. Official
+   * adapters provide this; the single-file method remains as a compatibility
+   * fallback for third-party adapters compiled against older releases.
+   */
+  lintProject?: (
+    projectDir: string,
+    signal?: AbortSignal,
+  ) => Promise<ProjectLintResult> | ProjectLintResult;
 
   /** URL to the hyperframe runtime JS (injected into preview HTML). */
   runtimeUrl: string;
+
+  /** Hears each 403 as the endpoint's route pattern and the server's reason code (`other` if none); never a path. */
+  onRefusal?: (refusal: StudioRefusal) => void;
+
+  gsapLocalRoot?: `/${string}`;
 
   /**
    * Optional: post-process preview HTML before Studio augments it.
@@ -133,7 +184,7 @@ export interface StudioApiAdapter {
   startRender(opts: {
     project: ResolvedProject;
     outputPath: string;
-    format: "mp4" | "webm" | "mov";
+    format: "mp4" | "webm" | "mov" | "gif";
     /**
      * Frame rate as an exact rational. The HTTP layer (POST
      * `/projects/:id/render`) accepts either a JSON number (integer fps,
@@ -143,7 +194,25 @@ export interface StudioApiAdapter {
      */
     fps: import("@hyperframes/core").Fps;
     quality: string;
+    gifLoop?: number;
+    crf?: number;
+    videoBitrate?: string;
+    keyframeIntervalSeconds?: number;
+    maxBitrate?: string;
+    bufferSize?: string;
+    videoFrameFormat?: "auto" | "jpg" | "png";
+    hdrMode?: "auto" | "force-hdr" | "force-sdr";
+    proresProfile?: "4444" | "hq" | "422" | "lt" | "proxy";
+    chromaSubsampling?: "420" | "444";
     jobId: string;
+    /**
+     * The triggering browser profile has telemetry disabled (localStorage
+     * opt-out, DNT, dev build...). The CLI cannot observe any of that, so the
+     * browser has to say so — without it the server emitted render outcomes
+     * for a user who had opted out, under the CLI's own policy.
+     */
+    telemetryOptOut?: boolean;
+    pageMotionBlur?: "off";
     /**
      * Optional output resolution preset. See `resolveDeviceScaleFactor` in
      * the producer for the integer-scale + aspect + HDR constraints.
@@ -157,6 +226,7 @@ export interface StudioApiAdapter {
      * the same channel `hyperframes render --variables` uses.
      */
     variables?: Record<string, unknown>;
+    useGpu?: boolean;
     /**
      * Telemetry id of the browser user who triggered the render. Lets the
      * adapter attribute the server-emitted render_complete/render_error to
@@ -179,17 +249,22 @@ export interface StudioApiAdapter {
     jobId: string;
   }) => MediaProcessingJobState;
 
-  /** Optional: generate a JPEG thumbnail via Puppeteer or similar. */
+  serverOrigin?: () => string | undefined;
+
+  /** Optional: generate a thumbnail at the route's explicit output dimensions. */
   generateThumbnail?: (opts: {
     project: ResolvedProject;
     compPath: string;
     seekTime: number;
     width: number;
     height: number;
+    outputWidth: number;
+    outputHeight: number;
     previewUrl: string;
     selector?: string;
     format?: "jpeg" | "png";
     selectorIndex?: number;
+    signal: AbortSignal;
   }) => Promise<Buffer | null>;
 
   /** Optional: resolve session ID to project (multi-project mode). */

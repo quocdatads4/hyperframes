@@ -6,12 +6,13 @@ import {
   readFileSync,
   writeFileSync,
   copyFileSync,
+  mkdtempSync,
   rmSync,
   statSync,
   cpSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, resolve, join } from "node:path";
+import { dirname, resolve, join, extname } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
@@ -24,7 +25,7 @@ import {
   compareAudioEnvelopes,
   computeAudioResidualRmsDb,
 } from "./utils/audioRegression.js";
-import { parseFps, fpsToNumber } from "@hyperframes/core";
+import { type DistributedFps, parseFps, fpsToNumber } from "@hyperframes/core";
 import {
   checkDistributedSupport,
   type HarnessMode,
@@ -147,6 +148,8 @@ type TestMetadata = {
      * `--mode=in-process`. Default is the plan's own default (16).
      */
     maxParallelChunks?: number;
+    /** Render as a trusted local caller (CLI, Studio) that may import files outside `src/`. */
+    allowOutsideProjectAssets?: boolean;
   };
 };
 
@@ -178,7 +181,7 @@ type TestResult = {
   passed: boolean;
   /**
    * Set when `--mode=distributed-simulated` skips a fixture that the
-   * distributed pipeline can't run (HDR, NTSC fps, fps∉{24,30,60}).
+   * distributed pipeline can't run (HDR, NTSC fps, fps outside DISTRIBUTED_FPS).
    * `passed` is `true` for skipped fixtures — skipping is a clean outcome,
    * not a failure — but the summary distinguishes them.
    */
@@ -391,6 +394,12 @@ function validateMetadata(meta: unknown): TestMetadata {
   if (rc.hdr !== undefined && typeof rc.hdr !== "boolean") {
     throw new Error("meta.json: 'renderConfig.hdr' must be a boolean (or omit for false)");
   }
+  if (
+    rc.allowOutsideProjectAssets !== undefined &&
+    typeof rc.allowOutsideProjectAssets !== "boolean"
+  ) {
+    throw new Error("meta.json: 'renderConfig.allowOutsideProjectAssets' must be a boolean");
+  }
   if (rc.experimentalFastCapture !== undefined && typeof rc.experimentalFastCapture !== "boolean") {
     throw new Error(
       "meta.json: 'renderConfig.experimentalFastCapture' must be a boolean (or omit for false)",
@@ -429,7 +438,7 @@ function validateMetadata(meta: unknown): TestMetadata {
   return m as TestMetadata;
 }
 
-function discoverTestSuites(
+export function discoverTestSuites(
   testsDir: string,
   filterNames: string[],
   excludeTags: string[] = [],
@@ -538,11 +547,17 @@ function copyFixtureSupportFiles(suite: TestSuite, tempRoot: string): void {
 
 // ── FFmpeg Utilities ─────────────────────────────────────────────────────────
 
-function runFfmpeg(args: string[], label: string): { stdout: Buffer; stderr: string } {
+function runFfmpeg(
+  args: string[],
+  label: string,
+  cwd?: string,
+): { stdout: Buffer; stderr: string } {
   const result = spawnSync("ffmpeg", args, {
+    cwd,
     stdio: ["ignore", "pipe", "pipe"],
     maxBuffer: 256 * 1024 * 1024,
     encoding: "buffer",
+    windowsHide: true,
   });
   const stderr = result.stderr.toString("utf-8");
   if (result.status !== 0) {
@@ -576,42 +591,135 @@ function extractFrameAsImage(
   );
 }
 
-function psnrAtCheckpoint(
+/** The frame a checkpoint time samples. Shared so selection and lookup agree. */
+export function frameIndexForCheckpoint(checkpointSec: number, fps: number): number {
+  return Math.max(0, Math.round(checkpointSec * fps));
+}
+
+const STATS_FILE_NAME = "psnr.log";
+
+/**
+ * PSNR for a set of frame indices, in a single ffmpeg pass.
+ *
+ * The original implementation spawned one ffmpeg per checkpoint, each
+ * selecting its frame with `select='eq(n,N)'`. That filter has no index, so
+ * ffmpeg decoded from frame 0 every time — checkpoint 99 decoded 99% of both
+ * videos to read a single frame. Across 100 checkpoints that is roughly 50
+ * full decodes of each video, and it dominated regression runtime (27% of
+ * total suite work; 60-80% on short fixtures).
+ *
+ * This keeps the original `select` semantics exactly and only collapses the
+ * spawns: both inputs are filtered to the same frame indices, chosen **by
+ * decode index, independently per input**, then compared pairwise.
+ *
+ * Selecting by index is load-bearing, not incidental. Handing the streams to
+ * `psnr` directly (`[0:v][1:v]psnr`) instead makes ffmpeg's framesync align
+ * them by presentation timestamp, and rendered output does not carry the same
+ * PTS as its golden baseline. That pairs frames which do not correspond: on
+ * style-3-prod it moved 80 of 100 checkpoints by more than 2 dB and turned
+ * three exactly-identical frames into 82/38/51 dB.
+ *
+ * `settb=1/1,setpts=N` after each `select` renumbers both selected streams to
+ * the same synthetic one-tick-per-frame timeline, so framesync pairs the Nth
+ * selected frame of one input with the Nth of the other. The timebase is
+ * pinned rather than derived (`setpts=N/FRAME_RATE/TB` is not enough) because
+ * `FRAME_RATE` is per-input: if the two videos report different rates, that
+ * form hands framesync two different timelines again and it silently emits a
+ * different number of rows than frames requested.
+ *
+ * Returns a 0-based frame index -> PSNR map. `stats_file` reports `psnr_avg`
+ * to two decimals where the old stderr parse had full float precision;
+ * thresholds are integers and fixtures pass with dB of margin, so the 0.005 dB
+ * rounding is not material.
+ */
+export function psnrAtFrames(
   renderedVideo: string,
   snapshotVideo: string,
+  frameIndices: number[],
+): Map<number, number> {
+  // Several checkpoints land on one frame when a fixture has fewer frames than
+  // checkpoints, and `select` emits such a frame once. Deduplicate so the
+  // filter output length is predictable and position-addressable.
+  const wanted = [...new Set(frameIndices)].sort((left, right) => left - right);
+  if (wanted.length === 0) return new Map();
+
+  const statsDir = mkdtempSync(join(tmpdir(), "hf-psnr-"));
+  const statsFile = join(statsDir, STATS_FILE_NAME);
+  try {
+    const selectExpr = wanted.map((frame) => `eq(n\\,${frame})`).join("+");
+    const stream = (index: number, label: string) =>
+      `[${index}:v]select='${selectExpr}',settb=1/1,setpts=N[${label}]`;
+    runFfmpeg(
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        resolve(renderedVideo),
+        "-i",
+        resolve(snapshotVideo),
+        "-filter_complex",
+        // shortest=1:repeatlast=0 makes framesync stop at the first stream to
+        // end instead of holding its last frame. Without them, an input that
+        // runs out of selected frames has its final frame repeated to pad the
+        // pairing, so ffmpeg still writes one row per requested frame and the
+        // count check below cannot tell that the tail rows compare a stale
+        // frame. Verified: 60-frame vs 30-frame inputs asking for frames
+        // [0,15,45] emit 3 rows under the defaults (row 3 comparing frame 45
+        // against a repeated frame 15, 16.65 dB) and 2 rows with these set.
+        `${stream(0, "rv")};${stream(1, "gv")};` +
+          `[rv][gv]psnr=shortest=1:repeatlast=0:stats_file=${STATS_FILE_NAME}`,
+        "-f",
+        "null",
+        "-",
+      ],
+      "Checkpoint PSNR",
+      // A bare name in cwd keeps every path out of the filtergraph and its escaping rules.
+      statsDir,
+    );
+
+    const values: number[] = [];
+    for (const line of readFileSync(statsFile, "utf-8").split("\n")) {
+      const psnrMatch = line.match(/(?:^|\s)psnr_avg:(\S+)/);
+      if (!psnrMatch) continue;
+      const raw = (psnrMatch[1] ?? "").trim().toLowerCase();
+      if (raw === "inf" || raw === "infinite") {
+        values.push(Number.POSITIVE_INFINITY);
+        continue;
+      }
+      const parsed = Number(raw);
+      if (!Number.isFinite(parsed)) {
+        throw new Error(`Invalid PSNR value in ffmpeg stats output: ${psnrMatch[1]}`);
+      }
+      values.push(parsed);
+    }
+
+    // A short count means an input ran out of frames, so every later pairing
+    // would be silently offset. The per-checkpoint implementation also failed
+    // loudly here; keep it that way rather than reporting PSNR for frames that
+    // were never compared.
+    if (values.length !== wanted.length) {
+      throw new Error(
+        `Expected PSNR for ${wanted.length} frames but ffmpeg reported ${values.length}. ` +
+          "The rendered output and baseline likely differ in frame count.",
+      );
+    }
+
+    return new Map(wanted.map((frame, position) => [frame, values[position] as number]));
+  } finally {
+    rmSync(statsDir, { recursive: true, force: true });
+  }
+}
+
+export function psnrAtCheckpoint(
+  psnrByFrame: Map<number, number>,
   checkpointSec: number,
   fps: number,
 ): number {
-  const frameIndex = Math.max(0, Math.round(checkpointSec * fps));
-  const filter = `[0:v]select='eq(n\\,${frameIndex})',setpts=PTS-STARTPTS[rv];[1:v]select='eq(n\\,${frameIndex})',setpts=PTS-STARTPTS[gv];[rv][gv]psnr`;
-  const args = [
-    "-hide_banner",
-    "-loglevel",
-    "info",
-    "-i",
-    renderedVideo,
-    "-i",
-    snapshotVideo,
-    "-filter_complex",
-    filter,
-    "-frames:v",
-    "1",
-    "-f",
-    "null",
-    "-",
-  ];
-  const { stderr } = runFfmpeg(args, `Frame PSNR at ${checkpointSec}s`);
-  const match = stderr.match(/average:\s*([^\s]+)/i);
-  if (!match) {
-    throw new Error(`Unable to parse PSNR output at ${checkpointSec}s`);
-  }
-  const rawValue = (match[1] ?? "").trim().toLowerCase();
-  if (rawValue === "inf" || rawValue === "infinite") {
-    return Number.POSITIVE_INFINITY;
-  }
-  const parsedValue = Number(rawValue);
-  if (!Number.isFinite(parsedValue)) {
-    throw new Error(`Invalid PSNR value at ${checkpointSec}s: ${match[1]}`);
+  const frameIndex = frameIndexForCheckpoint(checkpointSec, fps);
+  const parsedValue = psnrByFrame.get(frameIndex);
+  if (parsedValue === undefined) {
+    throw new Error(`Unable to parse PSNR output at ${checkpointSec}s (frame ${frameIndex})`);
   }
   return parsedValue;
 }
@@ -663,6 +771,10 @@ function saveFailureDetails(
 ): void {
   const failuresDir = join(suite.dir, "failures");
   mkdirSync(failuresDir, { recursive: true });
+
+  if (result.visual && existsSync(renderedVideoPath) && statSync(renderedVideoPath).isFile()) {
+    copyFileSync(renderedVideoPath, join(failuresDir, `actual${extname(renderedVideoPath)}`));
+  }
 
   // Save compilation failures
   if (result.compilation && !result.compilation.passed) {
@@ -869,7 +981,11 @@ export async function checkStreamDurationParity(
 
 // ── Test Execution ───────────────────────────────────────────────────────────
 
-async function runTestSuite(
+export function createRegressionTempRoot(suiteId: string, parent: string = tmpdir()): string {
+  return mkdtempSync(join(parent, `hyperframes-test-${suiteId}-`));
+}
+
+export async function runTestSuite(
   suite: TestSuite,
   options: {
     update: boolean;
@@ -877,17 +993,7 @@ async function runTestSuite(
     mode: HarnessMode;
   },
 ): Promise<TestResult> {
-  // Use predictable temp location: /tmp/hyperframes-tests/{test-id}/
-  const testsRoot = join(tmpdir(), "hyperframes-tests");
-  if (!existsSync(testsRoot)) {
-    mkdirSync(testsRoot, { recursive: true });
-  }
-
-  const tempRoot = join(testsRoot, suite.id);
-  if (existsSync(tempRoot)) {
-    rmSync(tempRoot, { recursive: true, force: true });
-  }
-  mkdirSync(tempRoot, { recursive: true });
+  const tempRoot = createRegressionTempRoot(suite.id);
 
   const tempDownloadDir = join(tempRoot, "downloads");
   const outputFormat = suite.meta.renderConfig.format ?? "mp4";
@@ -1020,10 +1126,10 @@ async function runTestSuite(
         result.skipped = { reason: support.reason };
         return result;
       }
-      // `checkDistributedSupport` already narrowed fps to {24,30,60}; the
+      // `checkDistributedSupport` already narrowed fps to DISTRIBUTED_FPS; the
       // cast surfaces that guarantee to TS. webm is now distributed-
       // supported via closed-GOP concat-copy, so the format passes through.
-      const fpsNum = suite.meta.renderConfig.fps.num as 24 | 30 | 60;
+      const fpsNum = suite.meta.renderConfig.fps.num as DistributedFps;
       const distributedInput = {
         projectDir: tempSrcDir,
         tempRoot,
@@ -1034,6 +1140,7 @@ async function runTestSuite(
         chunkSize: suite.meta.renderConfig.chunkSize,
         maxParallelChunks: suite.meta.renderConfig.maxParallelChunks,
         variables: suite.meta.renderConfig.variables,
+        allowOutsideProjectAssets: suite.meta.renderConfig.allowOutsideProjectAssets,
       };
       if (options.mode === "lambda-local") {
         const runLambdaLocalRender = await loadLambdaLocalRender();
@@ -1068,6 +1175,7 @@ async function runTestSuite(
           debug: false,
           hdrMode: suite.meta.renderConfig.hdr ? "force-hdr" : "force-sdr",
           variables: suite.meta.renderConfig.variables,
+          allowOutsideProjectAssets: suite.meta.renderConfig.allowOutsideProjectAssets,
         });
 
         await executeRenderJob(job, tempSrcDir, renderedOutputPath);
@@ -1211,9 +1319,15 @@ async function runTestSuite(
       const sampleDuration = Math.max(0, videoDuration - 1 / fps);
 
       const minPsnrForMode = resolveMinPsnrForMode(options.mode, suite.meta.minPsnr);
+      const checkpointTimes = Array.from({ length: 100 }, (_, i) => (sampleDuration * i) / 100);
+      const psnrByFrame = psnrAtFrames(
+        renderedOutputPath,
+        snapshotVideoPath,
+        checkpointTimes.map((time) => frameIndexForCheckpoint(time, fps)),
+      );
       for (let i = 0; i < 100; i++) {
-        const time = (sampleDuration * i) / 100;
-        const psnr = psnrAtCheckpoint(renderedOutputPath, snapshotVideoPath, time, fps);
+        const time = checkpointTimes[i] as number;
+        const psnr = psnrAtCheckpoint(psnrByFrame, time, fps);
         visualCheckpoints.push({
           time,
           psnr,
@@ -1272,7 +1386,16 @@ async function runTestSuite(
       const renderedAudio = extractMonoPcm16(renderedOutputPath);
       const snapshotAudio = extractMonoPcm16(snapshotVideoPath);
 
-      if (renderedAudio.length > 0 && snapshotAudio.length > 0) {
+      const renderedHasAudio = renderedAudio.length > 0;
+      const snapshotHasAudio = snapshotAudio.length > 0;
+      if (renderedHasAudio !== snapshotHasAudio) {
+        audioPassed = false;
+        audioCorrelation = -1;
+        logPretty(
+          `Audio stream mismatch: rendered=${renderedHasAudio ? "present" : "missing"}, snapshot=${snapshotHasAudio ? "present" : "missing"}`,
+          "✗",
+        );
+      } else if (renderedHasAudio && snapshotHasAudio) {
         const renderedEnvelope = buildRmsEnvelope(renderedAudio);
         const snapshotEnvelope = buildRmsEnvelope(snapshotAudio);
         const audio = compareAudioEnvelopes(

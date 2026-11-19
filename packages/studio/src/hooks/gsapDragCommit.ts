@@ -4,52 +4,61 @@
  */
 import type { GsapAnimation } from "@hyperframes/core/gsap-parser";
 import type { DomEditSelection } from "../components/editor/domEditingTypes";
-import {
-  STUDIO_ORIGINAL_WIDTH_ATTR,
-  STUDIO_ORIGINAL_HEIGHT_ATTR,
-} from "../components/editor/manualEditsTypes";
 import { usePlayerStore } from "../player/store/playerStore";
-import { readRuntimeKeyframes, scanAllRuntimeKeyframes } from "./gsapRuntimeKeyframes";
-import { resolveTweenStart, resolveTweenDuration } from "../utils/globalTimeCompiler";
-import { roundTo3 } from "../utils/rounding";
-import { computeElementPercentage } from "./gsapShared";
-import { computeDraggedGsapPosition } from "./draggedGsapPosition";
-import type { RuntimeTweenChange } from "./gsapRuntimePatch";
+import {
+  percentageToAbsoluteForAnimation,
+  resolveTweenStart,
+  resolveTweenDuration,
+} from "../utils/globalTimeCompiler";
+import { roundTo3, roundToLayoutPx } from "../utils/rounding";
+import { computeElementPercentage, keyframeEases, writeTargetSelector } from "./gsapShared";
+import {
+  computeDraggedGsapPosition,
+  readDragStamp,
+  restoreDragOffset,
+  type DragStamp,
+} from "./draggedGsapPosition";
+import type { CommitMutation } from "./gsapScriptCommitTypes";
 import { isGestureTransactionCommit, runGestureTransaction } from "./gestureTransaction";
 import { setPatchFromUpdateProperty } from "./gsapDragStaticSetHelpers";
+import { GsapEditBlockedError, type PlayheadEditRefusal } from "./gsapEditOutcome";
+import { isTweenConfigKey } from "@hyperframes/parsers/gsap-constants";
 export {
   findExistingPositionWrite,
   findRotationSetAnimation,
   findSizeSetAnimation,
 } from "./gsapDragStaticSetHelpers";
 export interface GsapDragCommitCallbacks {
-  commitMutation: (
-    selection: DomEditSelection,
-    mutation: Record<string, unknown>,
-    options: {
-      label: string;
-      coalesceKey?: string;
-      softReload?: boolean;
-      skipReload?: boolean;
-      beforeReload?: () => void;
-      /**
-       * Value-only fast path: when set, `runCommit` patches the changed tween in
-       * the preview runtime in place (instant, no re-run) and only falls back to
-       * the soft reload if the patch can't be safely applied. Attached only to
-       * value-only `set` commits; structural/keyframe commits omit it.
-       */
-      instantPatch?: { selector: string; change: RuntimeTweenChange };
-    },
-  ) => Promise<void>;
+  commitMutation: CommitMutation;
   fetchAnimations?: () => Promise<GsapAnimation[]>;
+  /** The gesture's drag stamp, when its commit can outlive it; else read from the element. */
+  stamp?: DragStamp;
+}
+
+/**
+ * The target for a tween these helpers are about to CREATE. Callers derive
+ * `selector` with `selectorFromSelection`, which hands back a bare class for an
+ * id-less element: authoring that widens a one-element drag/resize/rotate into a
+ * write over every sibling sharing the class. Retargets of an EXISTING tween
+ * must NOT come through here (they keep `anim.targetSelector`, so a tween the
+ * author aimed at a group stays aimed at it).
+ *
+ * Null means no one-element form exists, and every caller drops the commit
+ * rather than falling back to `selector` (see writeTargetSelector): the drag
+ * reverts on the next reload, which is recoverable, where a `.group` write is
+ * not.
+ */
+function newTweenTarget(selection: DomEditSelection): string | null {
+  return writeTargetSelector(selection);
 }
 
 // Re-export for backward compatibility with existing imports.
 export function computeCurrentPercentage(
   selection: DomEditSelection,
   animation?: GsapAnimation,
+  time = usePlayerStore.getState().currentTime,
 ): number {
-  return computeElementPercentage(usePlayerStore.getState().currentTime, selection, animation);
+  return computeElementPercentage(time, selection, animation);
 }
 
 // When a drag edits a SELECTED keyframe, park the playhead on that keyframe's exact
@@ -57,25 +66,25 @@ export function computeCurrentPercentage(
 // 1.2 start), so the post-commit reseek renders the element's base pose and the edit
 // looks like it snapped away. Keeping the playhead on the edited keyframe avoids that.
 export function parkPlayheadOnKeyframe(anim: GsapAnimation, pct: number): void {
-  const ts = resolveTweenStart(anim);
-  const td = resolveTweenDuration(anim);
-  if (ts == null || !td || td <= 0) return;
-  usePlayerStore.getState().requestSeek(roundTo3(ts + (pct / 100) * td));
+  const time = percentageToAbsoluteForAnimation(pct, anim);
+  if (time === null || resolveTweenDuration(anim) <= 0) return;
+  usePlayerStore.getState().requestSeek(roundTo3(time));
 }
 
 async function replaceKeyframedPositionHold(
   selection: DomEditSelection,
-  selector: string,
   existingSet: GsapAnimation,
   properties: { x: number; y: number },
   commitMutation: GsapDragCommitCallbacks["commitMutation"],
 ): Promise<void> {
+  const target = newTweenTarget(selection);
+  if (!target) throw new GsapEditBlockedError("no-selector");
   const persist = async (commit: GsapDragCommitCallbacks["commitMutation"]) => {
     await commit(
       selection,
       {
         type: "add",
-        targetSelector: selector,
+        targetSelector: target,
         method: "set",
         position: 0,
         properties,
@@ -112,40 +121,42 @@ export async function materializeIfDynamic(
   selection: DomEditSelection,
 ): Promise<string | void> {
   if (!anim.hasUnresolvedKeyframes && !anim.hasUnresolvedSelector) return;
+  // Geometry commits must never rewrite runtime/computed source implicitly.
+  // The explicit Unroll action owns that source-destructive transition.
+  void iframe;
+  void commitMutation;
+  void selection;
+  throw new GsapEditBlockedError("source-uneditable", "geometry-unresolved-source");
+}
 
-  if (anim.hasUnresolvedSelector) {
-    const allScanned = scanAllRuntimeKeyframes(iframe);
-    if (allScanned.size === 0) return;
-    const allElements = Array.from(allScanned.entries()).map(([id, data]) => ({
-      selector: `#${id}`,
-      keyframes: data.keyframes,
-      easeEach: data.easeEach,
-    }));
-    await commitMutation(
-      selection,
-      {
-        type: "materialize-keyframes",
-        animationId: anim.id,
-        keyframes: allScanned.get(selection.id ?? "")?.keyframes ?? [],
-        allElements,
-      },
-      { label: "Unroll dynamic animations", skipReload: true },
-    );
-    return `${anim.targetSelector}-to-0`;
-  }
+/** Why a percentage keyframe can't stand in for this array step entry, or null when it can. */
+function stepBlock([key, value]: [string, number | string]): PlayheadEditRefusal | null {
+  if (key === "delay") return "array-step-delay";
+  if (/^on[A-Z]/.test(key)) return "array-step-callback";
+  if (isTweenConfigKey(key)) return "array-step-config";
+  if (typeof value === "number") return null;
+  return STEP_VALUE_BLOCKS.find(([pattern]) => pattern.test(value))?.[1] ?? null;
+}
 
-  const runtime = readRuntimeKeyframes(iframe, anim.targetSelector);
-  if (!runtime || runtime.keyframes.length === 0) return;
-  await commitMutation(
-    selection,
-    {
-      type: "materialize-keyframes",
-      animationId: anim.id,
-      keyframes: runtime.keyframes,
-      easeEach: runtime.easeEach,
-    },
-    { label: "Materialize dynamic keyframes", skipReload: true },
-  );
+/** First match wins: code is computed, even when it calls random(). */
+const STEP_VALUE_BLOCKS: Array<[RegExp, PlayheadEditRefusal]> = [
+  [/^__raw:/, "array-step-computed"],
+  [/random\(/, "array-step-random"],
+  [/[-+*/]=/, "array-step-relative"],
+];
+
+/** Why a step list can't be rewritten as percentage keyframes, or null. */
+export function stepListBlock(anim: GsapAnimation): PlayheadEditRefusal | null {
+  const data = anim.keyframes;
+  if (data?.format !== "object-array") return null;
+  const entries = data.keyframes.flatMap((kf) => Object.entries(kf.properties));
+  return entries.map(stepBlock).find(Boolean) ?? null;
+}
+
+/** Whole-offset writers rewrite every step as a keyframe; refuse a list that holds more than values. */
+export function refuseStepListRewrite(anim: GsapAnimation): void {
+  const step = stepListBlock(anim);
+  if (step) throw new GsapEditBlockedError("keyframes-uneditable", step);
 }
 
 // ── Drag → GSAP position math ──────────────────────────────────────────────
@@ -166,7 +177,12 @@ export async function commitStaticGsapPosition(
   existingSet: GsapAnimation | null,
   callbacks: GsapDragCommitCallbacks,
 ): Promise<void> {
-  const { newX, newY } = computeDraggedGsapPosition(selection.element, studioOffset, gsapPos);
+  const { newX, newY } = computeDraggedGsapPosition(
+    selection.element,
+    studioOffset,
+    gsapPos,
+    callbacks.stamp,
+  );
   if (existingSet) {
     if (existingSet.keyframes) {
       // Keyframed zero-duration hold (drag-path corruption): can't update-property
@@ -174,7 +190,6 @@ export async function commitStaticGsapPosition(
       // least one hold on disk, then delete the corrupt tween in one transaction.
       await replaceKeyframedPositionHold(
         selection,
-        selector,
         existingSet,
         { x: newX, y: newY },
         callbacks.commitMutation,
@@ -199,11 +214,15 @@ export async function commitStaticGsapPosition(
   }
   // New static hold → a base `gsap.set` (off-timeline, no 0% keyframe marker), with
   // an instant patch so the first nudge shows immediately (no soft-reload flash).
+  // The patch reuses the WRITTEN target so the runtime moves exactly the element
+  // the source write names.
+  const target = newTweenTarget(selection);
+  if (!target) throw new GsapEditBlockedError("no-selector");
   await callbacks.commitMutation(
     selection,
     {
       type: "add",
-      targetSelector: selector,
+      targetSelector: target,
       method: "set",
       position: 0,
       properties: { x: newX, y: newY },
@@ -212,7 +231,10 @@ export async function commitStaticGsapPosition(
     {
       label: "Move layer",
       softReload: true,
-      instantPatch: { selector, change: { kind: "global-set", props: { x: newX, y: newY } } },
+      instantPatch: {
+        selector: target,
+        change: { kind: "global-set", props: { x: newX, y: newY } },
+      },
     },
   );
 }
@@ -252,11 +274,13 @@ export async function commitStaticGsapRotation(
     return;
   }
   // New static hold → off-timeline `gsap.set` (no 0% keyframe marker) + instant patch.
+  const target = newTweenTarget(selection);
+  if (!target) throw new GsapEditBlockedError("no-selector");
   await callbacks.commitMutation(
     selection,
     {
       type: "add",
-      targetSelector: selector,
+      targetSelector: target,
       method: "set",
       position: 0,
       properties: { rotation: newRotation },
@@ -265,20 +289,18 @@ export async function commitStaticGsapRotation(
     {
       label: "Rotate layer",
       softReload: true,
-      instantPatch: { selector, change: { kind: "global-set", props: { rotation: newRotation } } },
+      instantPatch: {
+        selector: target,
+        change: { kind: "global-set", props: { rotation: newRotation } },
+      },
     },
   );
 }
 
 /**
- * Commit a STATIC element resize as a `tl.set("#el",{width,height})` — the
- * single-source size channel for elements with no size animation (mirrors
- * `commitStaticGsapPosition`). Use this instead of a single-stop `keyframes`
- * tween: one keyframe at the playhead % renders NaN/0 at every other frame, so
- * the element collapses/disappears (worst when resized off the 0% mark). A `set`
- * holds the size at all times. Re-resizing an element that already has a size
- * `set` UPDATES it in place with one `update-properties`; a new element
- * gets one `add` with `method:"set"`.
+ * A static resize as `tl.set("#el",{width,height})`, only where the script already writes the size
+ * (else it is CSS). A set, not a one-stop keyframe tween, which renders NaN/0 off its keyframe.
+ * Updates an existing size set in place, else adds one.
  */
 export async function commitStaticGsapSize(
   selection: DomEditSelection,
@@ -287,8 +309,8 @@ export async function commitStaticGsapSize(
   existingSet: GsapAnimation | null,
   callbacks: GsapDragCommitCallbacks,
 ): Promise<void> {
-  const width = Math.round(size.width);
-  const height = Math.round(size.height);
+  const width = roundToLayoutPx(size.width);
+  const height = roundToLayoutPx(size.height);
   if (existingSet) {
     await callbacks.commitMutation(
       selection,
@@ -301,113 +323,19 @@ export async function commitStaticGsapSize(
     );
     return;
   }
+  const target = newTweenTarget(selection);
+  if (!target) throw new GsapEditBlockedError("no-selector");
   await callbacks.commitMutation(
     selection,
     {
       type: "add",
-      targetSelector: selector,
+      targetSelector: target,
       method: "set",
       position: 0,
       properties: { width, height },
     },
     { label: "Resize layer", softReload: true },
   );
-}
-
-/** Rounded `n` when it's a positive finite number, else `fallback`. */
-function positiveOr(n: number, fallback: number): number {
-  return Number.isFinite(n) && n > 0 ? Math.round(n) : fallback;
-}
-
-/**
- * Prior size for a keyframed resize: the existing global set's value, else the
- * element's pre-resize size (the draft saved it on the element before mutating
- * el.style.width/height). Falls back to the new size when neither is available.
- */
-function resolvePriorSize(
-  sizeSet: GsapAnimation | null,
-  el: Element | null | undefined,
-  fallbackW: number,
-  fallbackH: number,
-): { width: number; height: number } {
-  if (sizeSet) {
-    return {
-      width: positiveOr(Number(sizeSet.properties.width), fallbackW),
-      height: positiveOr(Number(sizeSet.properties.height), fallbackH),
-    };
-  }
-  const ow = Number.parseFloat(el?.getAttribute(STUDIO_ORIGINAL_WIDTH_ATTR) ?? "");
-  const oh = Number.parseFloat(el?.getAttribute(STUDIO_ORIGINAL_HEIGHT_ATTR) ?? "");
-  return { width: positiveOr(ow, fallbackW), height: positiveOr(oh, fallbackH) };
-}
-
-/**
- * Resize an *animated* element by keyframing its size at the current playhead,
- * instead of a global `gsap.set` hold. Builds a width/height keyframe tween
- * aligned to the element's existing animation: every base keyframe keeps the
- * prior size, only the keyframe nearest the playhead gets the new size — so
- * resizing one keyframe leaves the others unchanged. Replaces any prior global
- * size set. Returns false when there's no usable range (caller falls back to the
- * static set).
- */
-export async function commitKeyframedSizeFromResize(
-  selection: DomEditSelection,
-  size: { width: number; height: number },
-  selector: string,
-  sizeSet: GsapAnimation | null,
-  animatedTween: GsapAnimation,
-  callbacks: GsapDragCommitCallbacks,
-): Promise<boolean> {
-  const ts = resolveTweenStart(animatedTween) ?? 0;
-  const td = resolveTweenDuration(animatedTween);
-  if (!(td > 0)) return false;
-
-  const newW = Math.round(size.width);
-  const newH = Math.round(size.height);
-  const prior = resolvePriorSize(sizeSet, selection.element, newW, newH);
-
-  const ct = usePlayerStore.getState().currentTime;
-  const pct = Math.max(0, Math.min(100, Math.round(((ct - ts) / td) * 1000) / 10));
-
-  // Base keyframe percentages from the animated tween (flat tween → 0 & 100),
-  // plus the endpoints and the playhead. Each keeps the prior size except the
-  // keyframe at the playhead, which gets the new size.
-  const pcts = new Set<number>(
-    animatedTween.keyframes?.keyframes.map((k) => k.percentage) ?? [0, 100],
-  );
-  pcts.add(0);
-  pcts.add(100);
-  pcts.add(pct);
-  const keyframes = Array.from(pcts)
-    .sort((a, b) => a - b)
-    .map((p) => ({
-      percentage: p,
-      properties: Math.abs(p - pct) < 0.05 ? { width: newW, height: newH } : { ...prior },
-    }));
-
-  // Add the size keyframe tween FIRST, then delete the old global hold. The gesture
-  // transport applies both in one ordered batch; a plain commit fallback keeps the
-  // same recoverable ordering. Only the transaction's result triggers the reload.
-  const addLabel = `Resize (size keyframe ${pct.toFixed(0)}%)`;
-  await callbacks.commitMutation(
-    selection,
-    {
-      type: "add-with-keyframes",
-      targetSelector: selector,
-      position: roundTo3(ts),
-      duration: roundTo3(td),
-      keyframes,
-    },
-    sizeSet ? { label: addLabel, skipReload: true } : { label: addLabel, softReload: true },
-  );
-  if (sizeSet) {
-    await callbacks.commitMutation(
-      selection,
-      { type: "delete", animationId: sizeSet.id },
-      { label: "Resize layer", softReload: true },
-    );
-  }
-  return true;
 }
 
 // ── Whole-path offset (plain drag on animated element) ──────────────────
@@ -429,33 +357,28 @@ export async function commitWholePathOffset(
   callbacks: GsapDragCommitCallbacks,
 ): Promise<void> {
   const el = selection.element;
+  const stamp = callbacks.stamp ?? readDragStamp(el);
   const { newX, newY, baseGsapX, baseGsapY } = computeDraggedGsapPosition(
     el,
     studioOffset,
     gsapPos,
+    stamp,
   );
   const deltaX = newX - baseGsapX;
   // fallow-ignore-next-line code-duplication
   const deltaY = newY - baseGsapY;
-  const origX = Number.parseFloat(el.getAttribute("data-hf-drag-initial-offset-x") ?? "") || 0;
-  const origY = Number.parseFloat(el.getAttribute("data-hf-drag-initial-offset-y") ?? "") || 0;
-  const restoreOffset = () => {
-    el.style.setProperty("--hf-studio-offset-x", `${origX}px`);
-    el.style.setProperty("--hf-studio-offset-y", `${origY}px`);
-    el.removeAttribute("data-hf-drag-initial-offset-x");
-    el.removeAttribute("data-hf-drag-initial-offset-y");
-  };
+  const restoreOffset = () => restoreDragOffset(el, stamp);
 
   // fallow-ignore-next-line code-duplication
   let effectiveAnim = anim;
   if (anim.keyframes) {
+    refuseStepListRewrite(anim);
     const newId = await materializeIfDynamic(anim, iframe, callbacks.commitMutation, selection);
     if (newId) effectiveAnim = { ...anim, id: newId };
   }
 
   const ts = resolveTweenStart(effectiveAnim);
   const td = resolveTweenDuration(effectiveAnim);
-  const ease = effectiveAnim.keyframes?.easeEach ?? effectiveAnim.ease;
 
   let kfs = effectiveAnim.keyframes?.keyframes ?? [];
   if (kfs.length === 0) {
@@ -492,7 +415,7 @@ export async function commitWholePathOffset(
       position: roundTo3(ts ?? 0),
       duration: roundTo3(td || 1),
       keyframes: shifted,
-      ease,
+      ...keyframeEases(effectiveAnim),
     },
     { label: "Move animation path", softReload: true, beforeReload: restoreOffset },
   );

@@ -4,16 +4,31 @@
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as tar from "tar";
 import { asStorage, FakeGcs } from "./__fixtures__/fakeGcs.js";
 import {
   downloadGcsObjectToFile,
+  downloadGcsObjectToFileVerified,
   formatGcsUri,
   parseGcsUri,
+  sha256File,
   tarDirectory,
   untarDirectory,
+  uploadContentAddressedFileToGcs,
   uploadFileToGcs,
 } from "./gcsTransport.js";
 
@@ -86,6 +101,50 @@ describe("tarDirectory / untarDirectory", () => {
     expect(existsSync(join(dest, "stale.txt"))).toBe(false);
     expect(readFileSync(join(dest, "keep.txt"), "utf8")).toBe("new");
   });
+
+  it("untar leaves out symbolic links and unpacks hard links as separate plain files", async () => {
+    const src = mkTmp("hf-tar-links-");
+    const outside = mkTmp("hf-tar-outside-");
+    writeFileSync(join(outside, "secret.txt"), "OUTSIDE");
+    writeFileSync(join(src, "a.txt"), "shared");
+    linkSync(join(src, "a.txt"), join(src, "b.txt"));
+    symlinkSync(join(outside, "secret.txt"), join(src, "..x"));
+    symlinkSync(outside, join(src, "..dir"), "dir");
+    const work = mkTmp("hf-tar-work3-");
+    const tarball = join(work, "links.tar");
+    // Packed without following links, so the archive holds the links themselves.
+    tar.create({ file: tarball, cwd: src, sync: true }, ["."]);
+
+    const dest = join(work, "extracted");
+    await untarDirectory(tarball, dest);
+    const types: string[] = [];
+    tar.list({ file: tarball, sync: true, onReadEntry: (entry) => types.push(entry.type) });
+    expect(types).toEqual(expect.arrayContaining(["Link", "SymbolicLink"]));
+    expect(readdirSync(dest).sort()).toEqual(["a.txt", "b.txt"]);
+    for (const name of ["a.txt", "b.txt"]) {
+      expect(readFileSync(join(dest, name), "utf8")).toBe("shared");
+      expect(lstatSync(join(dest, name)).nlink).toBe(1);
+    }
+  });
+
+  it("untar unpacks hard links whose names are near the filesystem limit", async () => {
+    const src = mkTmp("hf-tar-long-");
+    const first = `${"a".repeat(236)}.txt`;
+    const second = `${"b".repeat(236)}.txt`;
+    writeFileSync(join(src, first), "shared");
+    linkSync(join(src, first), join(src, second));
+    const work = mkTmp("hf-tar-work4-");
+    const tarball = join(work, "long.tar");
+    tar.create({ file: tarball, cwd: src, sync: true }, ["."]);
+
+    const dest = join(work, "extracted");
+    await untarDirectory(tarball, dest);
+    expect(readdirSync(dest).sort()).toEqual([first, second]);
+    for (const name of [first, second]) {
+      expect(readFileSync(join(dest, name), "utf8")).toBe("shared");
+      expect(lstatSync(join(dest, name)).nlink).toBe(1);
+    }
+  });
 });
 
 describe("download/upload bridge", () => {
@@ -110,5 +169,73 @@ describe("download/upload bridge", () => {
     await expect(uploadFileToGcs(asStorage(gcs), "/no/such/file", "gs://b/k")).rejects.toThrow(
       /upload source missing/,
     );
+  });
+});
+
+describe("content-addressed v2 artifacts", () => {
+  it("uploads once and reuses an object with matching digest metadata", async () => {
+    const gcs = new FakeGcs();
+    const source = join(mkTmp("hf-cas-upload-"), "artifact.bin");
+    writeFileSync(source, "immutable bytes");
+    const digest = await sha256File(source);
+    const uri = `gs://bucket/v2/artifacts/sha256/${digest.slice(0, 2)}/${digest}`;
+
+    expect(await uploadContentAddressedFileToGcs(asStorage(gcs), source, uri, digest)).toBe(
+      "uploaded",
+    );
+    expect(await uploadContentAddressedFileToGcs(asStorage(gcs), source, uri, digest)).toBe(
+      "reused",
+    );
+    expect(gcs.ops.filter((op) => op.kind === "upload")).toHaveLength(1);
+    expect(gcs.metadata.get(uri)?.sha256).toBe(digest);
+  });
+
+  it("refuses to overwrite an immutable key with conflicting metadata", async () => {
+    const gcs = new FakeGcs();
+    const source = join(mkTmp("hf-cas-conflict-"), "artifact.bin");
+    writeFileSync(source, "expected bytes");
+    const digest = await sha256File(source);
+    const uri = `gs://bucket/v2/artifacts/sha256/${digest.slice(0, 2)}/${digest}`;
+    gcs.seed(uri, Buffer.from("same length!!!"));
+    gcs.metadata.set(uri, { sha256: "0".repeat(64) });
+
+    await expect(
+      uploadContentAddressedFileToGcs(asStorage(gcs), source, uri, digest),
+    ).rejects.toMatchObject({ name: "PLAN_ARTIFACT_DIGEST_MISMATCH" });
+    expect(gcs.ops.some((op) => op.kind === "upload")).toBe(false);
+  });
+
+  it("reuses an identical object that wins the create-only generation race", async () => {
+    const gcs = new FakeGcs();
+    const source = join(mkTmp("hf-cas-race-"), "artifact.bin");
+    writeFileSync(source, "racing bytes");
+    const digest = await sha256File(source);
+    const uri = `gs://bucket/v2/artifacts/sha256/${digest.slice(0, 2)}/${digest}`;
+    gcs.beforeUpload = (uploadUri) => {
+      gcs.beforeUpload = undefined;
+      gcs.seed(uploadUri, readFileSync(source));
+      gcs.metadata.set(uploadUri, { sha256: digest });
+    };
+
+    expect(await uploadContentAddressedFileToGcs(asStorage(gcs), source, uri, digest)).toBe(
+      "reused",
+    );
+    expect(gcs.ops.some((op) => op.kind === "upload")).toBe(false);
+  });
+
+  it("deletes a downloaded artifact when digest verification fails", async () => {
+    const gcs = new FakeGcs();
+    const work = mkTmp("hf-cas-download-");
+    const expectedSource = join(work, "expected.bin");
+    const destination = join(work, "download.bin");
+    writeFileSync(expectedSource, "expected");
+    const expected = await sha256File(expectedSource);
+    const uri = "gs://bucket/v2/artifacts/corrupt";
+    gcs.seed(uri, Buffer.from("corrupt"));
+
+    await expect(
+      downloadGcsObjectToFileVerified(asStorage(gcs), uri, destination, expected),
+    ).rejects.toMatchObject({ name: "PLAN_ARTIFACT_DIGEST_MISMATCH" });
+    expect(existsSync(destination)).toBe(false);
   });
 });

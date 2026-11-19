@@ -127,7 +127,7 @@ export function OffCanvasIndicators({
                 aria-label={`Select off-canvas element ${r.key}`}
                 className="pointer-events-auto absolute inset-0 border-2 border-dashed border-studio-accent/10 rounded-md cursor-pointer hover:border-studio-accent hover:bg-studio-accent/10 transition-colors"
                 style={clipOutside ? { clipPath: clipOutside } : undefined}
-                title={`Off-canvas: ${r.key} — click to select`}
+                title={`Off-canvas: ${r.key}. Click to select`}
                 onClick={handleClick}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" || e.key === " ") {
@@ -140,6 +140,44 @@ export function OffCanvasIndicators({
             </div>
           );
         })}
+    </>
+  );
+}
+
+/**
+ * The dashed outlines around a selected element's children.
+ *
+ * Extracted from the canvas overlay, which is at its 600-line limit, and it
+ * sits here rather than in its own file because it is the same kind of thing:
+ * a passive, non-interactive mark the overlay draws over the composition.
+ */
+export function ChildRectOutlines({
+  rects,
+}: {
+  rects: ReadonlyArray<{
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+    angle?: number;
+  }>;
+}) {
+  return (
+    <>
+      {rects.map((rect, index) => (
+        <div
+          key={index}
+          className="pointer-events-none absolute border border-dashed border-white/20 rounded-xs"
+          style={{
+            left: rect.left,
+            top: rect.top,
+            width: rect.width,
+            height: rect.height,
+            // A child outline is drawn ON the child, so it rotates with it.
+            transform: rect.angle ? `rotate(${rect.angle}deg)` : undefined,
+          }}
+        />
+      ))}
     </>
   );
 }

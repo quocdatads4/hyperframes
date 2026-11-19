@@ -4,46 +4,42 @@
  * Extracted from useDomEditSession to keep file sizes under the 600-line limit.
  */
 import { useEffect, useRef } from "react";
-import { STUDIO_INSPECTOR_PANELS_ENABLED } from "../components/editor/manualEditingAvailability";
-import { findElementForSelection, type DomEditSelection } from "../components/editor/domEditing";
+import type { DomEditSelection } from "../components/editor/domEditing";
 import { reapplyPositionEditsAfterSeek } from "../components/editor/manualEdits";
-import type { SidebarTab } from "../components/sidebar/LeftSidebar";
+import { useDockLayoutStore } from "../components/dock/dockLayoutStore";
 import type { PatchTarget } from "../utils/sourcePatcher";
+import { onPreviewContentReplaced } from "../player/sceneSwap";
+import { previewFrameOpaque } from "../player/lib/previewChannel";
 
 interface UseDomEditPreviewSyncParams {
   previewIframe: HTMLIFrameElement | null;
-  activeCompPath: string | null;
   captionEditMode: boolean;
   domEditSelectionRef: React.MutableRefObject<DomEditSelection | null>;
   domEditSelection: DomEditSelection | null;
-  applyDomSelection: (
-    selection: DomEditSelection | null,
-    options?: { revealPanel?: boolean; preserveGroup?: boolean },
-  ) => void;
-  buildDomSelectionFromTarget: (element: HTMLElement) => Promise<DomEditSelection | null>;
+  /** Re-resolves the selection against the given preview, unless it was deselected meanwhile. */
+  refreshDomEditSelectionFromPreview: (
+    selection: DomEditSelection,
+    iframe: HTMLIFrameElement,
+  ) => Promise<void>;
   refreshPreviewDocumentVersion: () => void;
-  syncPreviewHistoryHotkey: (iframe: HTMLIFrameElement | null) => void;
+  syncPreviewHotkeys: (iframe: HTMLIFrameElement | null) => void;
   applyStudioManualEditsToPreviewRef: React.MutableRefObject<
     (iframe: HTMLIFrameElement) => Promise<void>
   >;
   openSourceForSelection?: (sourceFile: string, target: PatchTarget) => void;
-  getSidebarTab?: () => SidebarTab;
   gsapCacheVersion?: number;
 }
 
 export function useDomEditPreviewSync({
   previewIframe,
-  activeCompPath,
   captionEditMode,
   domEditSelectionRef,
   domEditSelection,
-  applyDomSelection,
-  buildDomSelectionFromTarget,
+  refreshDomEditSelectionFromPreview,
   refreshPreviewDocumentVersion,
-  syncPreviewHistoryHotkey,
+  syncPreviewHotkeys,
   applyStudioManualEditsToPreviewRef,
   openSourceForSelection,
-  getSidebarTab,
   gsapCacheVersion,
 }: UseDomEditPreviewSyncParams): void {
   // Sync selection from preview document on load / refresh
@@ -53,7 +49,7 @@ export function useDomEditPreviewSync({
 
     // fallow-ignore-next-line complexity
     const syncSelectionFromDocument = async () => {
-      if (!STUDIO_INSPECTOR_PANELS_ENABLED || captionEditMode) return;
+      if (captionEditMode) return;
       const currentSelection = domEditSelectionRef.current;
       if (!currentSelection) return;
       let doc: Document | null = null;
@@ -62,52 +58,31 @@ export function useDomEditPreviewSync({
       } catch {
         return;
       }
-      if (!doc) return;
-
-      reapplyPositionEditsAfterSeek(doc);
-
-      const nextElement = findElementForSelection(doc, currentSelection, activeCompPath);
-      if (!nextElement) {
-        // The selected element no longer resolves in the (re-synced) document
-        // — comp/hot reload, activeCompPath swap, or post-save replacement.
-        // Clear so overlay geometry isn't computed on a stale, detached node.
-        // (Drag-release-in-gray-zone is handled separately by
-        // suppressNextBoxClickRef; the dragged element still resolves here.)
-        applyDomSelection(null, { revealPanel: false });
-        return;
-      }
-
-      const nextSelection = await buildDomSelectionFromTarget(nextElement);
-      if (nextSelection) {
-        applyDomSelection(nextSelection, { revealPanel: false, preserveGroup: true });
-      }
+      if (doc) reapplyPositionEditsAfterSeek(doc);
+      else if (!previewFrameOpaque(previewIframe)) return;
+      await refreshDomEditSelectionFromPreview(currentSelection, previewIframe);
     };
 
-    syncPreviewHistoryHotkey(previewIframe);
+    syncPreviewHotkeys(previewIframe);
     void applyStudioManualEditsToPreviewRef.current(previewIframe);
     void syncSelectionFromDocument();
     refreshPreviewDocumentVersion();
 
     const handleLoad = () => {
-      syncPreviewHistoryHotkey(previewIframe);
+      syncPreviewHotkeys(previewIframe);
       void applyStudioManualEditsToPreviewRef.current(previewIframe);
       void syncSelectionFromDocument();
       refreshPreviewDocumentVersion();
     };
 
-    previewIframe.addEventListener("load", handleLoad);
-    return () => {
-      previewIframe.removeEventListener("load", handleLoad);
-    };
+    return onPreviewContentReplaced(previewIframe, handleLoad);
   }, [
-    activeCompPath,
-    applyDomSelection,
-    buildDomSelectionFromTarget,
     captionEditMode,
     domEditSelectionRef,
     previewIframe,
+    refreshDomEditSelectionFromPreview,
     refreshPreviewDocumentVersion,
-    syncPreviewHistoryHotkey,
+    syncPreviewHotkeys,
     applyStudioManualEditsToPreviewRef,
     gsapCacheVersion,
   ]);
@@ -120,15 +95,15 @@ export function useDomEditPreviewSync({
   useEffect(
     // fallow-ignore-next-line complexity
     () => {
-      if (!domEditSelection || !openSourceRef.current || !getSidebarTab) return;
+      if (!domEditSelection || !openSourceRef.current) return;
       if (!domEditSelection.sourceFile) return;
-      if (getSidebarTab() !== "code") return;
+      if (!useDockLayoutStore.getState().visiblePanels.has("code")) return;
       openSourceRef.current(domEditSelection.sourceFile, {
         id: domEditSelection.id,
         selector: domEditSelection.selector,
         selectorIndex: domEditSelection.selectorIndex,
       });
     },
-    [domEditSelection, getSidebarTab],
+    [domEditSelection],
   );
 }

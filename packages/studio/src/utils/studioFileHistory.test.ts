@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { saveProjectFilesWithHistory } from "./studioFileHistory";
+import { editContextTarget, saveProjectFilesWithHistory } from "./studioFileHistory";
 import { serializeStudioFileMutation } from "./studioFileMutationCoordinator";
 
 describe("saveProjectFilesWithHistory", () => {
@@ -11,8 +11,7 @@ describe("saveProjectFilesWithHistory", () => {
     await saveProjectFilesWithHistory({
       projectId: "project-1",
       label: "Move layer",
-      kind: "manual",
-      files: { "index.html": "after" },
+      files: { "index.html": () => "after" },
       readFile: async (path) => reads[path],
       writeFile: async (path, content) => {
         writes[path] = content;
@@ -23,10 +22,56 @@ describe("saveProjectFilesWithHistory", () => {
     expect(writes).toEqual({ "index.html": "after" });
     expect(recordEdit).toHaveBeenCalledWith({
       label: "Move layer",
-      kind: "manual",
       coalesceKey: undefined,
       files: { "index.html": { before: "before", after: "after" } },
     });
+  });
+
+  /**
+   * Deleting a clip POSTs `remove-element`, which rewrites the file server-side,
+   * and only then saves the duration shrink. Expecting the content read before
+   * the mutation made the server refuse that write as a conflict: the save queue
+   * paused on the 409 and the clip stayed on the timeline until a reload.
+   */
+  it("expects what is on disk, not the undo baseline, when they differ", async () => {
+    const expectations: Record<string, string | undefined> = {};
+    const recordEdit = vi.fn();
+
+    await saveProjectFilesWithHistory({
+      projectId: "project-1",
+      label: "Delete timeline clip",
+      files: { "index.html": () => "removed+shrunk" },
+      readFile: async () => "original",
+      diskContent: { "index.html": "removed" },
+      writeFile: async (path, _content, expectedContent) => {
+        expectations[path] = expectedContent;
+      },
+      recordEdit,
+    });
+
+    expect(expectations["index.html"]).toBe("removed");
+    // Undo still goes all the way back, which is the whole reason the two are
+    // allowed to differ.
+    expect(recordEdit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        files: { "index.html": { before: "original", after: "removed+shrunk" } },
+      }),
+    );
+  });
+
+  it("still expects the undo baseline when nothing says otherwise", async () => {
+    const expectations: Record<string, string | undefined> = {};
+    await saveProjectFilesWithHistory({
+      projectId: "project-1",
+      label: "Move layer",
+      files: { "index.html": () => "after" },
+      readFile: async () => "before",
+      writeFile: async (path, _content, expectedContent) => {
+        expectations[path] = expectedContent;
+      },
+      recordEdit: vi.fn(),
+    });
+    expect(expectations["index.html"]).toBe("before");
   });
 
   it("skips writes and history for unchanged content", async () => {
@@ -36,8 +81,7 @@ describe("saveProjectFilesWithHistory", () => {
     const changedPaths = await saveProjectFilesWithHistory({
       projectId: "project-1",
       label: "Edit layer",
-      kind: "manual",
-      files: { "index.html": "same" },
+      files: { "index.html": () => "same" },
       readFile: async () => "same",
       writeFile,
       recordEdit,
@@ -60,10 +104,9 @@ describe("saveProjectFilesWithHistory", () => {
       saveProjectFilesWithHistory({
         projectId: "project-1",
         label: "Move layer",
-        kind: "manual",
         files: {
-          "index.html": "index-after",
-          "scene.html": "scene-after",
+          "index.html": () => "index-after",
+          "scene.html": () => "scene-after",
         },
         readFile: async (path) => reads[path],
         writeFile: async (path, content) => {
@@ -95,10 +138,9 @@ describe("saveProjectFilesWithHistory", () => {
       saveProjectFilesWithHistory({
         projectId: "project-1",
         label: "Move layer",
-        kind: "manual",
         files: {
-          "index.html": "index-after",
-          "scene.html": "scene-after",
+          "index.html": () => "index-after",
+          "scene.html": () => "scene-after",
         },
         readFile: async (path) => reads[path],
         writeFile: async (path, content) => {
@@ -129,10 +171,9 @@ describe("saveProjectFilesWithHistory", () => {
       saveProjectFilesWithHistory({
         projectId: "project-1",
         label: "Move layer",
-        kind: "manual",
         files: {
-          "index.html": "index-after",
-          "scene.html": "scene-after",
+          "index.html": () => "index-after",
+          "scene.html": () => "scene-after",
         },
         readFile: async (path) => reads[path],
         writeFile: async (path, content) => {
@@ -155,7 +196,7 @@ describe("saveProjectFilesWithHistory", () => {
     ]);
   });
 
-  it("reads and writes after an earlier same-file mutation completes", async () => {
+  it("builds from what the file holds after an earlier same-file mutation completes", async () => {
     let disk = "before";
     let release!: () => void;
     const blocked = new Promise<void>((resolve) => {
@@ -174,8 +215,7 @@ describe("saveProjectFilesWithHistory", () => {
     const save = saveProjectFilesWithHistory({
       projectId: "project-1",
       label: "Edit source",
-      kind: "source",
-      files: { "index.html": "editor-after" },
+      files: { "index.html": (current) => `${current}+editor` },
       readFile,
       writeFile,
       recordEdit,
@@ -187,11 +227,39 @@ describe("saveProjectFilesWithHistory", () => {
     await priorMutation;
     await save;
 
-    expect(disk).toBe("editor-after");
+    expect(disk).toBe("sdk-after+editor");
     expect(recordEdit).toHaveBeenCalledWith(
       expect.objectContaining({
-        files: { "index.html": { before: "sdk-after", after: "editor-after" } },
+        files: { "index.html": { before: "sdk-after", after: "sdk-after+editor" } },
       }),
     );
+  });
+});
+
+describe("editContextTarget", () => {
+  it("names the element by identity and carries the layer name the person saw", () => {
+    expect(
+      editContextTarget("index.html", {
+        id: "title",
+        hfId: "hf-1",
+        selector: ".title",
+        selectorIndex: 0,
+        label: "Title",
+      }),
+    ).toEqual({
+      file: "index.html",
+      id: "title",
+      hfId: "hf-1",
+      selector: ".title",
+      selectorIndex: 0,
+      name: "Title",
+    });
+  });
+
+  it("leaves the name out when the layer has none", () => {
+    expect(editContextTarget("index.html", { id: "title", label: "" })).toEqual({
+      file: "index.html",
+      id: "title",
+    });
   });
 });

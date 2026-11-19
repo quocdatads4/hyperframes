@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { CaptureStageError, getCaptureStageBrowserConsole } from "./captureStageError.js";
+import {
+  CaptureStageError,
+  getCaptureStageBrowserConsole,
+  wrapCaptureStageError,
+} from "./captureStageError.js";
+import { EncoderInterruptedError } from "./encoderInterruption.js";
 import {
   computeCompositionObservabilityHash,
   observeRenderStage,
@@ -7,6 +12,7 @@ import {
   sanitizeObservationMessage,
   summarizeBrowserDiagnostics,
 } from "./observability.js";
+import { createConsoleLogger } from "../../logger.js";
 
 function makeLog() {
   return { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
@@ -82,6 +88,11 @@ describe("sanitizeObservationMessage", () => {
 });
 
 describe("CaptureStageError", () => {
+  it("preserves a typed encoder interruption through capture wrapping", () => {
+    const cause = new EncoderInterruptedError("Streaming encode failed", "private stderr");
+    expect(wrapCaptureStageError(cause, ["console output"])).toBe(cause);
+  });
+
   it("preserves the original message and browser console diagnostics", () => {
     const cause = new Error("Navigation timeout of 60000 ms exceeded");
     const browserConsole = ["[FrameCapture:ERROR] page.goto failed"];
@@ -173,6 +184,129 @@ describe("RenderObservabilityRecorder", () => {
       ),
     ).toHaveLength(3);
     vi.useRealTimers();
+  });
+
+  it("puts where the stage was waiting in its stall message", async () => {
+    vi.useFakeTimers();
+    const recorder = new RenderObservabilityRecorder({
+      pipelineStartMs: Date.now(),
+      log: makeLog(),
+      renderJobId: "render-stall-detail",
+    });
+    const stage = observeRenderStage(
+      recorder,
+      "capture_disk",
+      undefined,
+      () => new Promise<void>(() => {}),
+      {
+        stall: {
+          progress: () => 0,
+          noProgressMs: 10_000,
+          firstProgressMs: 10_000,
+          detail: () => "Last phase per worker: worker 1 session_init.",
+        },
+      },
+    );
+    const caught = stage.catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(((await caught) as Error).message).toBe(
+      "[Render] capture_disk stalled: no progress for 10000ms (stuck at 0). Last phase per worker: worker 1 session_init.",
+    );
+    vi.useRealTimers();
+  });
+
+  it("keeps the first-frame window open while bounded check work goes on, and stalls once it stops", async () => {
+    vi.useFakeTimers();
+    const recorder = new RenderObservabilityRecorder({
+      pipelineStartMs: Date.now(),
+      log: makeLog(),
+      renderJobId: "render-stall-activity",
+    });
+    let activity = 0;
+    const checking = setInterval(() => (activity += 1), 1_000);
+    let outcome: unknown = "pending";
+    const stage = observeRenderStage(
+      recorder,
+      "capture_disk",
+      undefined,
+      () => new Promise<void>(() => {}),
+      {
+        stall: {
+          progress: () => 0,
+          noProgressMs: 10_000,
+          firstProgressMs: 10_000,
+          activity: () => activity,
+        },
+      },
+    );
+    stage.catch((error: unknown) => (outcome = error));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(outcome).toBe("pending");
+    clearInterval(checking);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect((outcome as Error).message).toBe(
+      "[Render] capture_disk stalled: no progress for 10000ms (stuck at 0).",
+    );
+    vi.useRealTimers();
+  });
+
+  describe("the stall watchdog across a system sleep", () => {
+    const watch = () => {
+      const recorder = new RenderObservabilityRecorder({
+        pipelineStartMs: Date.now(),
+        log: makeLog(),
+        renderJobId: "render-stall-sleep",
+      });
+      const outcome: { error?: unknown } = {};
+      observeRenderStage(recorder, "capture_disk", undefined, () => new Promise<void>(() => {}), {
+        stall: { progress: () => 0, noProgressMs: 10_000, firstProgressMs: 10_000 },
+      }).catch((error: unknown) => {
+        outcome.error = error;
+      });
+      return outcome;
+    };
+
+    it("does not read a ten-hour sleep as no progress", async () => {
+      vi.useFakeTimers();
+      const outcome = watch();
+      await vi.advanceTimersByTimeAsync(3_000);
+      vi.setSystemTime(Date.now() + 10 * 3_600_000);
+      await vi.advanceTimersByTimeAsync(9_000);
+      expect(outcome.error).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(outcome.error).toBeInstanceOf(Error);
+      vi.useRealTimers();
+    });
+
+    it("still stalls when the process runs on time and no progress lands", async () => {
+      vi.useFakeTimers();
+      const outcome = watch();
+      await vi.advanceTimersByTimeAsync(11_000);
+      expect((outcome.error as Error).message).toContain("no progress for 10000ms");
+      vi.useRealTimers();
+    });
+  });
+
+  it("tells the stall rule each time a capture attempt opens", async () => {
+    const recorder = new RenderObservabilityRecorder({
+      pipelineStartMs: Date.now(),
+      log: makeLog(),
+      renderJobId: "render-attempt-opened",
+    });
+    const attemptOpened = vi.fn();
+    await observeRenderStage(
+      recorder,
+      "capture_disk",
+      undefined,
+      async (openAttempt) => {
+        openAttempt();
+        openAttempt();
+      },
+      {
+        stall: { progress: () => 0, noProgressMs: 10_000, firstProgressMs: 10_000, attemptOpened },
+      },
+    );
+    expect(attemptOpened).toHaveBeenCalledTimes(2);
   });
 
   it("keeps emitting heartbeats every 120s once the initial ramp is exhausted", async () => {
@@ -405,5 +539,90 @@ describe("RenderObservabilityRecorder", () => {
         status: "error",
       }),
     );
+  });
+});
+
+describe("[Render:trace] on the console", () => {
+  // A plain render parses these lines for progress; --quiet uses the warn level.
+  it("prints at the info level a plain render uses and not at the --quiet warn level", () => {
+    const printed = vi.spyOn(console, "error").mockImplementation(() => {});
+    const traceLines = (level: "info" | "warn") => {
+      printed.mockClear();
+      const recorder = new RenderObservabilityRecorder({
+        pipelineStartMs: Date.now(),
+        log: createConsoleLogger(level),
+        renderJobId: "render-plain",
+      });
+      recorder.stageEnd("capture_streaming", recorder.stageStart("capture_streaming"));
+      return printed.mock.calls.filter(([line]) =>
+        String(line).startsWith("[INFO] [Render:trace] "),
+      );
+    };
+
+    try {
+      expect(traceLines("info")).toHaveLength(2);
+      expect(traceLines("warn")).toHaveLength(0);
+    } finally {
+      printed.mockRestore();
+    }
+  });
+});
+
+describe("init observability fallback (parallel workers)", () => {
+  const makeRecorder = () =>
+    new RenderObservabilityRecorder({ renderJobId: "render-par", pipelineStartMs: Date.now() });
+
+  it("uses the structured fallback when the console has no INIT line — the parallel success path", () => {
+    const summary = makeRecorder().summary({
+      lastBrowserConsole: ["[FrameCapture:NAV] page.goto start"],
+      capture: { forceScreenshot: false, captureMode: "screenshot" },
+      initFallback: { initDurationMs: 850, tweenCount: 1200, elementCount: 3400 },
+    });
+    expect(summary.init).toEqual({ initDurationMs: 850, tweenCount: 1200, elementCount: 3400 });
+  });
+
+  it("max-merges console INIT lines over the fallback, matching multi-session semantics", () => {
+    const summary = makeRecorder().summary({
+      lastBrowserConsole: [
+        "[FrameCapture:INIT] complete initDurationMs=1234 tweenCount=42 elementCount=5000",
+      ],
+      capture: { forceScreenshot: false, captureMode: "screenshot" },
+      initFallback: { initDurationMs: 850, tweenCount: 1200, elementCount: 3400 },
+    });
+    expect(summary.init).toEqual({ initDurationMs: 1234, tweenCount: 1200, elementCount: 5000 });
+  });
+
+  // The single-session path has no structured fallback — it parses the console
+  // line only. This is the path that covers renders the routing gate cannot
+  // measure, so the element count must survive it.
+  // The collector omits `elementCount=` entirely when the page.evaluate that
+  // measures it failed, rather than emitting 0 — a 0 there is
+  // indistinguishable from a legitimately empty comp, and evaluate failures
+  // concentrate on exactly the huge-DOM tail this field exists to observe.
+  it("leaves elementCount absent when the INIT line omits it (measurement failed)", () => {
+    const summary = makeRecorder().summary({
+      lastBrowserConsole: ["[FrameCapture:INIT] complete initDurationMs=90 tweenCount=7"],
+      capture: { forceScreenshot: false, captureMode: "screenshot" },
+    });
+    expect(summary.init).toEqual({ initDurationMs: 90, tweenCount: 7, elementCount: undefined });
+    expect(summary.init?.elementCount).not.toBe(0);
+  });
+
+  it("parses elementCount from the console INIT line with no fallback at all", () => {
+    const summary = makeRecorder().summary({
+      lastBrowserConsole: [
+        "[FrameCapture:INIT] complete initDurationMs=90 tweenCount=7 elementCount=1420",
+      ],
+      capture: { forceScreenshot: false, captureMode: "screenshot" },
+    });
+    expect(summary.init).toEqual({ initDurationMs: 90, tweenCount: 7, elementCount: 1420 });
+  });
+
+  it("stays undefined when neither source has anything", () => {
+    const summary = makeRecorder().summary({
+      lastBrowserConsole: [],
+      capture: { forceScreenshot: false, captureMode: "screenshot" },
+    });
+    expect(summary.init).toBeUndefined();
   });
 });

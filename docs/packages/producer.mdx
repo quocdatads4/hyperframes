@@ -1,371 +1,265 @@
 ---
 title: "@hyperframes/producer"
-description: "Full HTML-to-video rendering pipeline with encoding, audio mixing, and Docker support."
+description: "Render a HyperFrames project from Node.js."
 ---
 
-The producer package combines the [engine's](/packages/engine) frame capture with FFmpeg encoding to deliver a complete HTML-to-video rendering pipeline. It supports MP4 (h264) and WebM (VP9 with alpha transparency), and handles runtime injection, readiness gates, audio mixing, and optional Docker-based deterministic rendering.
+`@hyperframes/producer` owns the complete render pipeline: compile the project,
+capture its frames, encode the video, and mix its audio.
+
+Use it when rendering is part of your own Node.js service or job runner. For a
+local script or terminal workflow, use [`npx hyperframes render`](/developers/cli)
+instead.
 
 ```bash
 npm install @hyperframes/producer
 ```
 
-## When to Use
+## Render one project
 
-**Use `@hyperframes/producer` when you need to:**
-- Render compositions to MP4 or WebM programmatically from Node.js (e.g., in a backend service or CI pipeline)
-- Build a custom rendering service with fine-grained control over the pipeline
-- Run visual regression tests against golden baselines
-- Benchmark render performance across different configurations
+`createRenderJob()` describes the render. `executeRenderJob()` receives that
+job, the project directory, and the output path.
 
-**Use a different package if you want to:**
-- Render from the command line without writing code — use the [CLI](/packages/cli) (`npx hyperframes render`)
-- Preview compositions in the browser — use the [CLI](/packages/cli) or [studio](/packages/studio)
-- Capture frames without encoding — use the [engine](/packages/engine)
-- Lint or parse composition HTML — use [core](/packages/core)
-
-<Tip>
-  If you are building a web application or script that just needs to render a video, the [CLI](/packages/cli) is the fastest path. The producer package is for when you need programmatic control inside Node.js.
-</Tip>
-
-## What It Does
-
-The producer orchestrates the full render pipeline:
-
-<Steps>
-  <Step title="Load the composition HTML">
-    Reads your `index.html` and any referenced sub-compositions.
-  </Step>
-  <Step title="Inject the Hyperframes runtime">
-    Adds the runtime script that manages timeline seeking, clip lifecycle, and media playback.
-  </Step>
-  <Step title="Wait for readiness gates">
-    Polls for `window.__playerReady` and `window.__renderReady` to ensure all assets (fonts, images, video) are loaded before capture begins.
-  </Step>
-  <Step title="Capture frames via the engine">
-    Uses the [engine's](/packages/engine) BeginFrame pipeline to capture each frame as a pixel buffer.
-  </Step>
-  <Step title="Encode to MP4 or WebM via FFmpeg">
-    Pipes frame buffers into FFmpeg with the selected quality preset. MP4 uses h264; WebM uses VP9 with alpha transparency support.
-  </Step>
-  <Step title="Mix audio tracks">
-    Extracts audio from video clips and audio elements, applies `data-volume` and `data-media-start` offsets, and mixes them into the final MP4.
-  </Step>
-</Steps>
-
-## Programmatic Usage
-
-The producer uses a two-step API: create a render job configuration, then execute it.
-
-```typescript
-import { createRenderJob, executeRenderJob } from '@hyperframes/producer';
+```ts
+import {
+  createRenderJob,
+  executeRenderJob,
+} from "@hyperframes/producer";
 
 const job = createRenderJob({
   fps: 30,
-  quality: 'standard',
+  quality: "standard",
+  format: "mp4",
 });
 
-await executeRenderJob(job, './my-video', './output.mp4');
+await executeRenderJob(
+  job,
+  "./my-hyperframes-project",
+  "./renders/video.mp4",
+  (currentJob, message) => {
+    console.log(
+      `${Math.round(currentJob.progress)}% ${message}`,
+    );
+  },
+);
 ```
 
-### Render Configuration
+The entry file defaults to `index.html`. Set `entryFile` when the project has a
+different entry composition.
 
-```typescript
-import { createRenderJob } from '@hyperframes/producer';
-
+```ts
 const job = createRenderJob({
-  fps: 30,                   // integer, or { num: 30000, den: 1001 } for NTSC
-  quality: 'standard',       // 'draft', 'standard', or 'high'
-  format: 'mp4',             // 'mp4', 'webm', 'mov', 'gif', or 'png-sequence'
-  workers: 4,                // Parallel render workers (1-24, or omit for auto)
-  useGpu: false,             // GPU-accelerated encoding
-  debug: false,              // Debug logging
+  fps: { num: 30000, den: 1001 },
+  quality: "high",
+  entryFile: "compositions/launch.html",
 });
 ```
 
-#### WebM with Transparency
+## Choose an output
 
-Set `format: 'webm'` to render with a transparent background using VP9 alpha:
+| Format | Best for | Audio |
+| --- | --- | --- |
+| `mp4` | Default delivery and web playback | AAC |
+| `webm` | Transparent video for the web | Opus |
+| `mov` | Transparent ProRes 4444 for an editor | AAC |
+| `gif` | Small silent previews | None |
+| `png-sequence` | Lossless frames for another pipeline | AAC sidecar when needed |
+| `hls` | VOD streaming from a playlist directory | AAC rendition |
 
-```typescript
+HDR output is available for MP4 through `hdrMode`. Transparent formats render
+in SDR because HDR and alpha are not one supported output path.
+
+`chromaSubsampling: "444"` renders an SDR MP4 master with full-resolution
+colour (H.264 yuv444p, lossless PNG capture). It needs the software encoder,
+is rejected with `useGpu`, HDR output, other formats and distributed renders,
+and many players cannot decode it. See
+[4:4:4 masters](/guides/rendering#444-masters).
+
+```ts
 const job = createRenderJob({
   fps: 30,
-  quality: 'standard',
-  format: 'webm',
+  quality: "high",
+  format: "mp4",
+  hdrMode: "auto",
 });
-
-await executeRenderJob(job, './my-overlay', './overlay.webm');
 ```
 
-When `format: 'webm'`:
-- Frames are captured as PNG (preserves alpha channel)
-- Chrome's page background is set to transparent via CDP
-- FFmpeg encodes with VP9 + `yuva420p` pixel format
-- Audio is encoded as Opus (instead of AAC for MP4)
+See [HDR rendering](/guides/hdr) for the source and delivery constraints.
 
-#### HDR Output
+### HLS
 
-Set `hdrMode` to control HDR behavior. The producer probes every video and image source for BT.2020 / PQ / HLG color tagging — if any HDR source is found and the mode allows it, the output uses H.265 10-bit BT.2020 with HDR10 static metadata. SDR-only compositions are unaffected.
+`format: "hls"` writes an HLS VOD stream into `outputPath`, which is a
+directory: `master.m3u8`, `video.m3u8` and `video_NNNNN.ts`, plus `audio.m3u8`
+and `audio_NNNNN.ts` when the composition has audio. The encode is the same
+H.264 + AAC as MP4 — the packaging pass only stream-copies it into segments.
 
-```typescript
+```ts
 const job = createRenderJob({
   fps: 30,
-  quality: 'standard',
-  format: 'mp4',
-  hdrMode: 'auto',           // 'auto' | 'force-hdr' | 'force-sdr'
+  format: "hls",
+  hlsSegmentSeconds: 4,
 });
-
-await executeRenderJob(job, './my-video', './output.mp4');
 ```
 
-When `hdrMode` is `'auto'` or `'force-hdr'`:
-- Sources are probed via `ffprobe`; PQ takes precedence over HLG when both are present
-- HDR videos and images are extracted as 16-bit linear-light pixels and composited natively
-- SDR DOM overlays are converted from sRGB → BT.2020 before being layered on top
-- Output uses `libx265` with `yuv420p10le` and HDR10 mastering / content-light-level metadata
-- `format` must be `'mp4'` — `'mov'` and `'webm'` fall back to SDR
-- HDR `<img>` extraction support is **still images only**; animated GIF inputs are prepared as timeline-synced video before render
+Segments are exactly `hlsSegmentSeconds` long except the last, because the
+encoder GOP is locked to `round(fps × hlsSegmentSeconds)` frames so every
+segment starts on a keyframe. HLS is SDR only (`hdrMode: "force-hdr"` is
+rejected), refuses GPU encoding (GPU encoders ignore the keyframe lock), and is
+not available in distributed rendering, Lambda, or Cloud Run.
 
-For full details on source requirements, fallback rules, and verification, see [HDR Rendering](/guides/hdr).
+## Require specific output dimensions
 
-### Progress Callbacks
+Services can set `expectedOutputDimensions: { width: 1280, height: 720 }` in the render
+config or HTTP request. The producer checks the compiled composition and any output
+resolution scaling before opening the capture browser. A mismatch fails with
+`OUTPUT_DIMENSIONS_MISMATCH`; this option does not resize the composition.
 
-```typescript
-import type { ProgressCallback, RenderStatus } from '@hyperframes/producer';
+Successful jobs and HTTP completion responses include `outputDimensionsChecked: true`
+when this check ran. Distributed planning accepts the same option and reports the
+confirmation through `onPlanned`. A caller that requires this contract must reject
+an absent confirmation, including responses from older producer versions.
 
-const onProgress: ProgressCallback = (status: RenderStatus) => {
-  console.log(`Status: ${status}`);
-  // Statuses: "queued" | "preprocessing" | "rendering" | "encoding"
-  //           | "assembling" | "complete" | "failed" | "cancelled"
-};
+## Inspect output validation
+
+A matching output duration does not prove that every expected frame is present.
+WebM and HLS often omit the frame count from their metadata. When no usable count
+is available, the producer skips the frame-count check and continues checking
+duration and requested dimensions.
+
+Set `debug: true` in `createRenderJob()` or use `npx hyperframes render --debug`
+to retain `render.log` in the render's working directory. Its
+`artifact_frame_count_unavailable` debug event records the output path and
+expected frame count whenever this check is skipped. Normal output stays quiet;
+a custom `logger` can also collect the event through its `debug` method.
+
+## Reference background
+
+Completed jobs expose `reference_background`. In-process local render results, blocking and
+streaming producer responses, and distributed plan and assembly results carry
+this same additive field:
+
+```json
+{"reference_background":{"kind":"solid","rgb":[10,46,138]}}
 ```
 
-### Cancellation
+The value describes the composition root and its surrounding page background at
+the canonical initial film state. It is read from Chromium's computed styles
+before transparent capture changes those styles, not inferred from rendered
+frames or an inner panel. Distributed chunks preserve the plan's reference;
+they do not choose a different reference at each chunk boundary.
 
-```typescript
-import { RenderCancelledError } from '@hyperframes/producer';
+| Kind | Meaning |
+| --- | --- |
+| `solid` | An opaque computed background, with three integer sRGB components from 0 to 255. |
+| `none` | A positively established `background: none` declaration with no effective paint. |
+| `unsupported_non_solid` | An effective background image or gradient. |
+| `unknown` | Missing, unresolved, changing, translucent, or otherwise indeterminate background. |
 
-try {
-  await executeRenderJob(job);
-} catch (err) {
-  if (err instanceof RenderCancelledError) {
-    console.log(`Cancelled: ${err.reason}`);
-    // reason: "user_cancelled" | "timeout" | "aborted"
-  }
-}
+A transparent computed color alone does **not** establish `none`. An undeclared
+background, an authored transparent color, or an inaccessible stylesheet that
+prevents proving absence remains `unknown`. Gradients and images are never
+replaced with their underlying color. Consumers must preserve indeterminate
+results instead of treating them as a default color or proof of a blank frame.
+
+In-process local rendering reads from a session it already opens. The Docker CLI
+wrapper does not currently return the child process's result metadata. Distributed planning
+opens an inspection-only page even for a composition whose duration was
+resolved statically. It does not require WebGPU, run BeginFrame liveness checks,
+or reconcile media on that page. An unavailable browser or failed inspection
+produces `unknown` without rejecting an otherwise valid static plan. The value
+is stored in the execution-plan artifacts, not added to the hashed v2 transport
+manifest, so older readers and materializers remain compatible.
+
+## Cancel a render
+
+Pass an abort signal to the final argument:
+
+```ts
+const controller = new AbortController();
+
+await executeRenderJob(
+  job,
+  "./my-hyperframes-project",
+  "./renders/video.mp4",
+  undefined,
+  controller.signal,
+);
+
+// Call controller.abort() from your cancellation path.
 ```
 
-## HTTP Server
+An aborted render throws `RenderCancelledError`. Correctness warnings can also
+block a render when `strictness: "strict"` is enabled.
 
-The producer includes a built-in HTTP server for running as a rendering service:
+## Build a render service
 
-```typescript
-import { startServer } from '@hyperframes/producer/server';
+The package exports a Hono application and server helpers:
+
+```ts
+import { startServer } from "@hyperframes/producer";
 
 await startServer({ port: 8080 });
 ```
 
-### Server Endpoints
+A browser request (one that carries an `Origin` or `Sec-Fetch-Site` header) is accepted
+only under an IP address, `localhost` or a `*.localhost` name, so a page that points its
+own domain at the server cannot start renders or lint. If browsers reach the server
+through a proxy name, list that name in `allowedHosts` or in the comma-separated
+`PRODUCER_ALLOWED_HOSTS` variable. Requests without those headers, such as curl or
+another service, are unaffected.
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/render` | Blocking render — returns JSON result |
-| `POST` | `/render/stream` | Streaming render with Server-Sent Events |
-| `POST` | `/lint` | Lint a composition for issues |
-| `GET` | `/health` | Health check |
-| `GET` | `/outputs/:token` | Download a rendered MP4 |
+The server listens on `127.0.0.1` unless you pass `hostname` or set `PRODUCER_HOST`. To
+listen on any other address, also set `authToken` or `PRODUCER_AUTH_TOKEN`. Every route
+except `/health` then requires `Authorization: Bearer <token>`, and the server refuses to
+start without one. A request's `projectDir` must resolve, symlinks included, inside
+`projectsDir` (`PRODUCER_PROJECTS_DIR`, default: the working directory). Its `entryFile`
+must stay inside that project, and `outputPath` must be inside `rendersDir`
+(`PRODUCER_RENDERS_DIR`, default `/tmp`). `debug: true` is refused unless you set
+`allowDebug` or `PRODUCER_ALLOW_DEBUG=1`. `createProducerApp` applies these path and
+debug checks by default. `createRenderHandlers`, for mounting the handlers inside your own
+trusted service, applies them only with `confineRequests: true`.
 
-For custom server integration, use the lower-level handlers:
+For larger workloads, the `@hyperframes/producer/distributed` entry exposes the
+three rendering activities—`plan`, `renderChunk`, and `assemble`. Your
+orchestrator remains responsible for dispatch, retries, storage, and networking.
 
-```typescript
-import { createRenderHandlers, createProducerApp } from '@hyperframes/producer/server';
+A service that renders projects from other people should set
+`PRODUCER_RESTRICT_PAGE_NETWORK=true`. The render browser can then reach only its own
+project server and public IPv4 addresses: everything else it sends, from pages, frames,
+workers, WebSockets and WebRTC alike, goes through a local proxy that checks every
+address a name resolves to and connects to the address it checked. A refused request
+fails like any other unreachable asset. Leave it unset for local renders that load
+assets from your own machine or network.
 
-// Get individual request handlers
-const handlers = createRenderHandlers(options);
+Where the only way out is an egress proxy, set `HYPERFRAMES_CAPTURE_PROXY` to its
+`http://` URL, as for `capture`. The local proxy then sends every browser request to
+it by hostname, and the egress proxy must refuse private and internal destinations
+itself.
 
-// Or get a full Hono app
-const app = createProducerApp(options);
-```
+The setting accepts `true`, `1`, `yes` or `on` to turn the restriction on and `false`, `0`,
+`no` or `off` to leave it off, in any letter case. Any other value turns it on and logs a
+warning, so a misspelled value never leaves a render service open.
 
-## Docker Rendering
+With the restriction on, a video or audio URL is downloaded through the same address
+checks before FFmpeg reads it. A file FFmpeg does read by URL, such as a signed storage
+URL for a project's video, must be a self-contained container like MP4, WebM or WAV. A
+playlist, manifest or concat list under a media file name is refused.
 
-For deterministic output, the producer can render inside a Docker container with a pinned Chrome version and font set. This guarantees identical output across machines — critical for CI pipelines and production services.
+If your network routes a range that is not a private one, such as a cluster's pod range,
+add it with `PRODUCER_NON_PUBLIC_CIDRS`, a comma-separated list like `192.160.0.0/16`. Asset
+downloads and the render browser then refuse those addresses too. A malformed entry
+refuses every address rather than being skipped, and logs a warning.
 
-```bash
-# Via the CLI (recommended)
-npx hyperframes render --docker --output output.mp4
-```
+`hyperframes render --docker` passes both settings into its render container when they
+are set in the shell that runs it. When they are not set, the container's render page can
+reach anything the container's network can, including private addresses.
 
-<Info>
-  Docker mode requires Docker to be installed and running. Run `npx hyperframes doctor` to verify your environment. See [Deterministic Rendering](/concepts/determinism) for details on what makes Docker mode deterministic.
-</Info>
-
-## Quality Presets
-
-| Preset | Resolution | Encoding | Use Case |
-|--------|-----------|----------|----------|
-| `draft` | Original | Fast CRF | Quick iteration, previewing edits |
-| `standard` | Original | Balanced CRF | Production renders, sharing |
-| `high` | Original | High-quality CRF | Final delivery, archival |
-
-## GPU Encoding
-
-The producer supports hardware-accelerated encoding for faster renders:
-
-| Platform | Encoder | Selection |
-|----------|---------|-----------|
-| NVIDIA | NVENC | Auto-detected |
-| macOS | VideoToolbox | Auto-detected |
-| Linux | VAAPI | Auto-detected |
-| Intel | QSV | Auto-detected |
-| AMD on Windows | AMF | Auto-detected |
-
-When GPU encoding is enabled, Hyperframes detects the available FFmpeg hardware encoder automatically. To check your system's capabilities:
-
-```bash
-npx hyperframes doctor
-```
-
-The CLI enables local Chrome/WebGL GPU capture automatically and supports `--no-browser-gpu` as an opt-out. When using the producer API directly, pass an engine config override:
-
-```typescript
-import { resolveConfig } from '@hyperframes/producer';
-
-const job = createRenderJob({
-  fps: 30,
-  quality: 'standard',
-  producerConfig: resolveConfig({ browserGpuMode: 'hardware' }),
-});
-```
-
-## Additional Exports
-
-The producer also re-exports key engine functionality for convenience:
-
-| Export | Description |
-|--------|-------------|
-| `createCaptureSession()` | Create a frame capture session |
-| `initializeSession()` | Initialize session with a composition |
-| `captureFrame()` / `captureFrameToBuffer()` | Capture individual frames |
-| `closeCaptureSession()` | Clean up a capture session |
-| `getCompositionDuration()` | Get total composition duration |
-| `getCapturePerfSummary()` | Get capture performance metrics |
-| `createFileServer()` | Create an HTTP file server for serving assets |
-| `createVideoFrameInjector()` | Create a video frame injector for page |
-| `resolveConfig()` / `DEFAULT_CONFIG` | Producer configuration |
-| `createConsoleLogger()` / `defaultLogger` | Logging utilities |
-| `quantizeTimeToFrame()` | Convert time to frame boundary |
-| `resolveRenderPaths()` | Resolve render directory paths |
-| `prepareHyperframeLintBody()` / `runHyperframeLint()` | Linting utilities |
-
-## Logging
-
-The producer ships a small pluggable logger so callers can inject Pino, Winston, or any structured backend without taking a dependency on it.
-
-```ts
-export type LogLevel = "error" | "warn" | "info" | "debug";
-
-export interface ProducerLogger {
-  error(message: string, meta?: Record<string, unknown>): void;
-  warn(message: string, meta?: Record<string, unknown>): void;
-  info(message: string, meta?: Record<string, unknown>): void;
-  debug(message: string, meta?: Record<string, unknown>): void;
-  isLevelEnabled?(level: LogLevel): boolean;
-}
-```
-
-`createConsoleLogger(level)` returns a console-backed implementation that filters by level and JSON-stringifies the optional `meta` object. `defaultLogger` is the singleton at `level="info"`.
-
-### Skipping expensive metadata in hot paths
-
-`isLevelEnabled` is **optional** so existing custom loggers keep working unchanged. When you build a non-trivial meta object in a hot loop just to attach to a debug log, gate the construction with the nullish-coalescing pattern so production runs (`level=info`) pay nothing while loggers without the method behave exactly as before:
-
-```ts
-// Inside a per-frame loop in the encode pipeline:
-if (i % 30 === 0 && (log.isLevelEnabled?.("debug") ?? true)) {
-  const hdrEl = stackingInfo.find((e) => e.isHdr);
-  log.debug("[Render] HDR layer composite frame", {
-    frame: i,
-    time: time.toFixed(2),
-    hdrElement: hdrEl
-      ? { z: hdrEl.zIndex, visible: hdrEl.visible, width: hdrEl.width }
-      : null,
-    stackingCount: stackingInfo.length,
-    activeTransition: activeTransition?.shader,
-  });
-}
-```
-
-The `?? true` fallback means callers using a custom logger that does not implement `isLevelEnabled` continue to build and pass the meta object — the optimization is opt-in for logger implementations that want it.
-
-## Regression Testing
-
-The producer includes a regression harness for comparing render output against golden baselines. This is useful for catching visual regressions when changing the runtime, engine, or rendering pipeline.
-
-```bash
-cd packages/producer
-
-# Build the test Docker image
-bun run docker:build:test
-
-# Run regression tests (compares output against golden baselines)
-bun run docker:test
-
-# Regenerate golden baselines after intentional changes
-bun run docker:test:update
-```
-
-## Benchmarking
-
-Find optimal render settings for your hardware:
-
-```bash
-# Via the CLI
-npx hyperframes benchmark
-
-# Directly from the producer package
-cd packages/producer
-bun run benchmark
-```
-
-The benchmark runs several compositions with different quality and FPS settings and reports timing for each combination.
-
-## External assets (files outside `projectDir`)
-
-A composition can reference absolute paths to assets outside the project
-directory — a local voiceover in `~/Downloads`, a shared-drive image, a
-generated fixture at an absolute path. The producer handles these by:
-
-1. **Detection.** During compilation, the HTML compiler walks every
-   `[src]` / `[href]` and every `url(...)` in `<style>`. A path that
-   resolves to a file outside `projectDir` is collected into an
-   `externalAssets` map.
-2. **Sanitised keys.** Each absolute path is converted into a safe,
-   cross-platform relative key prefixed with `hf-ext/`. Windows
-   drive-letter colons are stripped (`D:\foo\x.wav` → `hf-ext/D/foo/x.wav`)
-   so that `path.join(compileDir, key)` stays inside the compile
-   directory on every OS.
-3. **Copy + rewrite.** The orchestrator copies the file under
-   `<compileDir>/hf-ext/...` and the HTML is rewritten to point at the
-   sanitised key. The file server then serves both project-internal and
-   external assets from the same root.
-
-The containment check uses `path.relative()` rather than a hardcoded
-separator, so external assets work identically on macOS, Linux, and
-Windows. See `packages/producer/src/utils/paths.ts` for the helpers.
-
-## Related Packages
+## Related topics
 
 <CardGroup cols={2}>
-  <Card title="CLI" icon="terminal" href="/packages/cli">
-    Command-line interface that wraps the producer for rendering, previewing, and more.
+  <Card title="Choose rendering infrastructure" icon="server" href="/deploy/overview">
+    Decide between local, server, Temporal, AWS, or another adapter.
   </Card>
-  <Card title="Engine" icon="gear" href="/packages/engine">
-    The low-level capture pipeline that the producer uses to grab frames.
-  </Card>
-  <Card title="Core" icon="cube" href="/packages/core">
-    Types, runtime, and linter that the producer depends on.
-  </Card>
-  <Card title="Studio" icon="palette" href="/packages/studio">
-    Visual editor for building compositions before rendering with the producer.
+  <Card title="@hyperframes/engine" icon="gear" href="/packages/engine">
+    Use the lower-level capture and encoding primitives.
   </Card>
 </CardGroup>

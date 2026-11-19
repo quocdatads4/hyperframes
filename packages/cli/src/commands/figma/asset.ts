@@ -4,7 +4,7 @@
  * provenance in the shared manifest, print a composition snippet.
  */
 
-import { defineCommand } from "citty";
+import { defineCommand } from "../../utils/defineCommand.js";
 import {
   appendRecord,
   buildAssetSnippet,
@@ -13,16 +13,17 @@ import {
   findAllByFigmaNode,
   freezeBytes,
   nextId,
+  ownTypeDir,
   parseFigmaRef,
   regenerateIndex,
   sanitizeSvg,
-  typeDirPath,
   updateRecord,
   type AssetSnippet,
   type FigmaAssetFormat,
   type FigmaClient,
   type FigmaManifestRecord,
 } from "@hyperframes/core/figma";
+import { terminalText } from "@hyperframes/core";
 import { existsSync } from "node:fs";
 import { join, relative } from "node:path";
 import { downloadRender } from "./download.js";
@@ -134,7 +135,7 @@ async function freezeAndRecord(
     bytes = new TextEncoder().encode(sanitizeSvg(new TextDecoder().decode(bytes)));
   }
   const id = nextId(deps.projectDir, "image");
-  const destAbs = join(typeDirPath(deps.projectDir, "image"), `${id}.${ext}`);
+  const destAbs = join(ownTypeDir(deps.projectDir, "image"), `${id}.${ext}`);
   freezeBytes(bytes, destAbs);
   const record: FigmaManifestRecord = {
     id,
@@ -194,7 +195,13 @@ export async function runAssetImportMany(
   const slots: (AssetImportResult | null)[] = refs.map((r) =>
     reuseExisting(fileKey, r.nodeId, opts, version, deps, description, entity),
   );
-  const missIndexes = slots.flatMap((s, i) => (s === null ? [i] : []));
+  const nodeIndexes = new Map<string, number>();
+  const missIndexes: number[] = [];
+  for (const [i, ref] of refs.entries()) {
+    if (nodeIndexes.has(ref.nodeId)) continue;
+    nodeIndexes.set(ref.nodeId, i);
+    if (slots[i] === null) missIndexes.push(i);
+  }
   try {
     if (missIndexes.length > 0) {
       const missNodeIds = missIndexes.map((i) => refs[i]!.nodeId);
@@ -231,9 +238,11 @@ export async function runAssetImportMany(
     // next import.
     safeRegenerateIndex(deps.projectDir);
   }
-  return slots.map((s, i) => {
-    if (!s) throw new Error(`figma asset import produced no result for "${refInputs[i]}"`);
-    return s;
+  return refs.map((ref, i) => {
+    const firstIndex = nodeIndexes.get(ref.nodeId) ?? i;
+    const result = slots[firstIndex];
+    if (!result) throw new Error(`figma asset import produced no result for "${refInputs[i]}"`);
+    return firstIndex === i ? result : { ...result, reused: true };
   });
 }
 
@@ -252,7 +261,9 @@ function safeRegenerateIndex(projectDir: string): void {
   try {
     regenerateIndex(projectDir);
   } catch (err) {
-    console.warn(`index.md regeneration failed: ${err instanceof Error ? err.message : err}`);
+    console.warn(
+      terminalText(`index.md regeneration failed: ${err instanceof Error ? err.message : err}`),
+    );
   }
 }
 
@@ -309,8 +320,8 @@ export default defineCommand({
       );
       for (const result of results) {
         const verb = result.reused ? "reused" : "imported";
-        console.log(`${verb} ${result.record.id} → ${result.record.path}`);
-        console.log(result.snippet.html);
+        console.log(terminalText(`${verb} ${result.record.id} → ${result.record.path}`));
+        console.log(terminalText(result.snippet.html));
       }
       if (results.length > 1) {
         const rendered = results.filter((r) => !r.reused).length;

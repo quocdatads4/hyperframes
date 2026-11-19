@@ -7,34 +7,35 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { findTrustedExecutable } from "@hyperframes/parsers/ff-binaries";
+
+type PythonOverrideValidation = { ok: true } | { ok: false; reason: string };
+
+/** Run `<override> --version` and check it reports Python 3, without throwing. */
+function validatePythonOverride(override: string): PythonOverrideValidation {
+  try {
+    const version = execFileSync(override, ["--version"], {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: 5000,
+    });
+    if (/Python 3/.test(version)) return { ok: true };
+    return {
+      ok: false,
+      reason: `did not report a Python 3 version (got ${JSON.stringify(version.trim())})`,
+    };
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
 
 /** Locate a Python 3: `HYPERFRAMES_PYTHON` env override first, then PATH. */
 export function findPython(): string | undefined {
   const override = process.env.HYPERFRAMES_PYTHON;
-  if (override) {
-    try {
-      const version = execFileSync(override, ["--version"], {
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-        timeout: 5000,
-      });
-      if (/Python 3/.test(version)) return override;
-    } catch {
-      // fall through to the PATH probe
-    }
-  }
+  if (override && validatePythonOverride(override).ok) return override;
   for (const name of ["python3", "python"]) {
     try {
-      const cmd = process.platform === "win32" ? "where" : "which";
-      const output = execFileSync(cmd, [name], {
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-        timeout: 5000,
-      });
-      const first = output
-        .split(/\r?\n/)
-        .map((s) => s.trim())
-        .find(Boolean);
+      const first = findTrustedExecutable(name);
       if (!first) continue;
 
       // Verify it's Python 3
@@ -52,17 +53,65 @@ export function findPython(): string | undefined {
   return undefined;
 }
 
-/** True if `import <pkg>` succeeds — actually executes the module. */
-export function hasPythonPackage(python: string, pkg: string): boolean {
+/**
+ * If `HYPERFRAMES_PYTHON` is set but `findPython()` would reject it, describe
+ * why. `findPython()` itself silently falls back to the PATH probe on any
+ * rejection (nonexistent path, non-executable, non-Python-3 output, timeout)
+ * with no diagnostic — a readiness check like `doctor` calls this to surface
+ * that instead of reporting a plain "not installed" that gives no hint the
+ * override was even seen.
+ */
+export function describeRejectedPythonOverride(): string | null {
+  const override = process.env.HYPERFRAMES_PYTHON;
+  if (!override) return null;
+  const validation = validatePythonOverride(override);
+  if (validation.ok) return null;
+  return `HYPERFRAMES_PYTHON="${override}" was rejected: ${validation.reason}`;
+}
+
+function withoutPythonPath(): NodeJS.ProcessEnv {
+  const { PYTHONPATH: _foreign, ...env } = process.env;
+  return env;
+}
+
+// `python -c` puts the working directory first on sys.path; `sys` itself is built in.
+const WITHOUT_WORKING_DIRECTORY =
+  "import sys\nif sys.path and sys.path[0] == '': del sys.path[0]\n";
+
+/** `code` for `python -c`, importing only installed modules, never ones in the working directory. */
+export function isolatedPythonCode(code: string): string {
+  return WITHOUT_WORKING_DIRECTORY + code;
+}
+
+function runs(python: string, code: string, env: NodeJS.ProcessEnv): boolean {
   try {
-    execFileSync(python, ["-c", `import ${pkg}`], {
+    execFileSync(python, ["-c", isolatedPythonCode(code)], {
       stdio: ["pipe", "pipe", "pipe"],
       timeout: 10_000,
+      env,
     });
     return true;
   } catch {
     return false;
   }
+}
+
+function environmentThatRuns(python: string, code: string): NodeJS.ProcessEnv | null {
+  return [process.env, withoutPythonPath()].find((env) => runs(python, code, env)) ?? null;
+}
+
+export function workingPythonEnv(
+  python: string,
+  modules: string[],
+  extra: NodeJS.ProcessEnv = {},
+): NodeJS.ProcessEnv | null {
+  const env = environmentThatRuns(python, `import ${modules.join(", ")}`);
+  return env && { ...env, ...extra };
+}
+
+/** True if `import <pkg>` succeeds — actually executes the module. */
+export function hasPythonPackage(python: string, pkg: string): boolean {
+  return environmentThatRuns(python, `import ${pkg}`) !== null;
 }
 
 /**
@@ -75,13 +124,5 @@ export function hasPythonModules(modules: string[]): boolean {
   if (!python) return false;
   const list = JSON.stringify(modules);
   const probe = `import importlib.util,sys; sys.exit(0 if all(importlib.util.find_spec(m) for m in ${list}) else 1)`;
-  try {
-    execFileSync(python, ["-c", probe], {
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 10_000,
-    });
-    return true;
-  } catch {
-    return false;
-  }
+  return environmentThatRuns(python, probe) !== null;
 }

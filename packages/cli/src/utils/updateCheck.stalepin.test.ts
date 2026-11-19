@@ -8,11 +8,20 @@ import { join } from "node:path";
 // "./updateCheck.js" would only override the export binding, not the internal
 // call printStalePinNotice makes to it from within the same module.
 let store: Record<string, unknown> = {};
+let runningVersion = "0.7.55";
+vi.mock("../version.js", () => ({
+  get VERSION() {
+    return runningVersion;
+  },
+}));
 // isDevMode() is true under vitest (module path ends in .ts), which would
 // suppress the notice unconditionally — mock ./env.js like updateCheck.test.ts does.
 vi.mock("./env.js", () => ({ isDevMode: () => false }));
+// What a process-cached readConfig() returns; null means it matches disk.
+let cachedRead: Record<string, unknown> | null = null;
 vi.mock("../telemetry/config.js", () => ({
-  readConfig: () => ({ ...store }),
+  readConfig: () => ({ ...(cachedRead ?? store) }),
+  readConfigFresh: () => ({ ...store }),
   writeConfig: (c: Record<string, unknown>) => {
     store = { ...c };
     return true;
@@ -27,6 +36,8 @@ describe("printStalePinNotice", () => {
   const origWrite = process.stderr.write.bind(process.stderr);
   beforeEach(() => {
     store = { latestVersion: "0.7.55" };
+    cachedRead = null;
+    runningVersion = "0.7.55";
     writes = [];
     dir = mkdtempSync(join(tmpdir(), "hf-pin-"));
     process.stderr.write = ((s: unknown) => {
@@ -41,6 +52,18 @@ describe("printStalePinNotice", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it("keeps what the background check wrote after this process read the settings", () => {
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({ scripts: { render: "npx --yes hyperframes@0.7.48 render" } }),
+    );
+    cachedRead = { ...store };
+    store = { ...store, lastUpdateCheck: "2026-09-27T00:00:00.000Z" };
+    printStalePinNotice(dir);
+    expect(store).toMatchObject({ lastUpdateCheck: "2026-09-27T00:00:00.000Z" });
+    expect(store["lastStalePinNoticeAt"]).toEqual(expect.any(Number));
+  });
+
   it("warns once when the project pins an older version", () => {
     writeFileSync(
       join(dir, "package.json"),
@@ -49,7 +72,7 @@ describe("printStalePinNotice", () => {
     printStalePinNotice(dir);
     printStalePinNotice(dir); // throttled — second call silent
     expect(writes.join("")).toContain("0.7.48");
-    expect(writes.join("")).toContain("upgrade --project");
+    expect(writes.join("")).toContain("--cli-version latest upgrade --project .");
     expect(writes.filter((w) => w.includes("upgrade --project")).length).toBe(1);
   });
 
@@ -60,6 +83,27 @@ describe("printStalePinNotice", () => {
     );
     printStalePinNotice(dir);
     expect(writes.join("")).toBe("");
+  });
+
+  it("warns on every run when an older CLI than the pin is running", () => {
+    store = { latestVersion: "0.9.71" };
+    runningVersion = "0.7.71";
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({ scripts: { check: "npx --yes hyperframes@0.9.66 check" } }),
+    );
+    printStalePinNotice(dir);
+    printStalePinNotice(dir);
+    const mismatch = writes.filter((w) => w.includes("This is hyperframes 0.7.71"));
+    expect(mismatch.length).toBe(2);
+    expect(mismatch[0]).toContain("--cli-version 0.9.66");
+    // fails without the fix: the notice told an agent to run the release the project's own
+    // package.json named, as if the project could choose the CLI.
+    expect(mismatch[0]).toContain("an agent runs the pinned release only when the person asks");
+    expect(mismatch[0]).not.toContain("to run the pinned release.");
+    expect(mismatch[0]).toContain("starting in your home folder, running npx hyperframes@0.9.66");
+    expect(mismatch[0]).toContain("absolute path");
+    expect(writes.join("")).not.toContain("upgrade --project");
   });
 
   it("silent under CI", () => {

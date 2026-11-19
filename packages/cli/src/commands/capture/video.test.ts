@@ -1,9 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
+import { consumeCommandResult } from "../../utils/commandResult.js";
 import {
   MAX_VIDEO_BYTES,
   VIDEO_CONTENT_TYPE_RE,
   findFilenameCollision,
   pickManifestEntry,
+  runVideoMode,
   safeFilename,
   type ManifestEntry,
 } from "./video.js";
@@ -158,5 +163,77 @@ describe("findFilenameCollision", () => {
     const manifest = [ENTRY(0), ENTRY(1)];
     const collisions = findFilenameCollision(manifest, manifest[0]!);
     expect(collisions.every((c) => c.index !== 0)).toBe(true);
+  });
+});
+
+describe("runVideoMode", () => {
+  // Creating symlinks needs elevated rights on Windows.
+  it.skipIf(process.platform === "win32").each([
+    { layout: "capture output", manifestDir: "extracted", planted: "assets" },
+    { layout: "W2H project", manifestDir: "capture/extracted", planted: "capture" },
+  ])(
+    "refuses to download through a planted $planted symlink in a $layout (#4304)",
+    async ({ manifestDir, planted }) => {
+      const root = mkdtempSync(join(tmpdir(), "hf-video-mode-"));
+      onTestFinished(() => rmSync(root, { recursive: true, force: true }));
+      const projectDir = join(root, "project");
+      const outside = join(root, "outside");
+      mkdirSync(projectDir);
+      mkdirSync(outside);
+      symlinkSync(outside, join(projectDir, planted));
+      mkdirSync(join(projectDir, manifestDir), { recursive: true });
+      writeFileSync(
+        join(projectDir, manifestDir, "video-manifest.json"),
+        JSON.stringify([ENTRY(0)]),
+      );
+      const fetchMock = vi.fn(async () => {
+        throw new Error("no network in tests");
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      onTestFinished(() => {
+        vi.unstubAllGlobals();
+        vi.restoreAllMocks();
+      });
+
+      await runVideoMode({ project: projectDir, index: "0" });
+
+      expect(consumeCommandResult().exitCode).toBe(1);
+      expect(String(error.mock.calls[0]?.[0])).toContain("resolves outside the capture directory");
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(existsSync(join(outside, planted === "assets" ? "videos" : "assets"))).toBe(false);
+    },
+  );
+});
+
+describe("runVideoMode --list", () => {
+  it("prints manifest values with control characters escaped", async () => {
+    // Built rather than written: a literal control character in the source is a lint error.
+    const esc = String.fromCharCode(27);
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-video-list-"));
+    onTestFinished(() => rmSync(projectDir, { recursive: true, force: true }));
+    mkdirSync(join(projectDir, "extracted"));
+    writeFileSync(
+      join(projectDir, "extracted", "video-manifest.json"),
+      JSON.stringify([
+        ENTRY(0, {
+          heading: `Launch${esc}[2J`,
+          url: `https://cdn.example.com/a${esc}]8;;https://x.test${String.fromCharCode(7)}.mp4`,
+        }),
+      ]),
+    );
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    onTestFinished(() => log.mockRestore());
+
+    await runVideoMode({ project: projectDir, list: true });
+
+    const printed = log.mock.calls
+      .map((call) => call.join(" "))
+      .join("\n")
+      .replace(new RegExp(`${esc}\\[[0-9;]*m`, "g"), "");
+    expect(printed).not.toContain(esc);
+    expect(printed).toContain('heading: "Launch\\x1b[2J"');
+    expect(printed).toContain("a\\x1b]8;;https://x.test\\x07.mp4");
   });
 });

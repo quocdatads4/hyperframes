@@ -1,10 +1,16 @@
 // fallow-ignore-file code-duplication
-import { describe, expect, it, mock, beforeAll } from "bun:test";
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, mock } from "bun:test";
+import { createHash } from "node:crypto";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { runInThisContext } from "node:vm";
 import { parseHTML } from "linkedom";
+import { interpolateVolumeGain } from "@hyperframes/core/media-volume-envelope";
+import { redactTelemetryString } from "@hyperframes/core";
+import { _clearGoogleFontCssCacheForTests } from "@hyperframes/core/fonts/embed";
 import { defaultLogger } from "../logger.js";
+import { NotMediaPayloadError, _setDownloadFetchForTests } from "@hyperframes/engine";
 import {
   collectExternalAssets,
   compileForRender,
@@ -13,14 +19,222 @@ import {
   detectRenderModeHints,
   detectShaderTransitionUsage,
   detectThreeDTransformUsage,
+  discoverMediaFromBrowser,
   discoverAudioVolumeAutomationFromTimeline,
+  discoverVideoVisibilityFromTimeline,
   inlineExternalScripts,
   localizeRemoteMediaSources,
   localizeRemoteImageSources,
   localizeRemoteFontFaces,
   recompileWithResolutions,
+  resolveCompositionDurations,
 } from "./htmlCompiler.js";
 import { validateNoSystemFonts } from "./render/planValidation.js";
+
+const PAGE_URL = "http://localhost:4000/index.html";
+
+describe("discoverMediaFromBrowser", () => {
+  async function discover(
+    html: string,
+    currentSrcById: Record<string, string>,
+    serializeCallback = false,
+    intrinsicDurationById: Record<string, number> = {},
+    defaultPlaybackRateById: Record<string, number> = {},
+  ) {
+    const { document } = parseHTML(html);
+    for (const [id, currentSrc] of Object.entries(currentSrcById)) {
+      const element = document.getElementById(id);
+      if (element) Object.defineProperty(element, "currentSrc", { value: currentSrc });
+    }
+    for (const [id, duration] of Object.entries(intrinsicDurationById)) {
+      const element = document.getElementById(id);
+      if (element) Object.defineProperty(element, "duration", { value: duration });
+    }
+    for (const [id, defaultPlaybackRate] of Object.entries(defaultPlaybackRateById)) {
+      const element = document.getElementById(id);
+      if (element) {
+        Object.defineProperty(element, "defaultPlaybackRate", { value: defaultPlaybackRate });
+        Object.defineProperty(element, "playbackRate", { value: defaultPlaybackRate * 2 });
+      }
+    }
+    const previousDocument = Reflect.get(globalThis, "document");
+    Reflect.set(globalThis, "document", document);
+    Reflect.set(globalThis, "location", { href: PAGE_URL });
+    try {
+      return await discoverMediaFromBrowser({
+        evaluate: async (collect) => {
+          if (!serializeCallback) return collect();
+          const isolated = runInThisContext(`(${collect.toString()})`) as typeof collect;
+          return isolated();
+        },
+      } as never);
+    } finally {
+      if (previousDocument === undefined) Reflect.deleteProperty(globalThis, "document");
+      else Reflect.set(globalThis, "document", previousDocument);
+    }
+  }
+
+  it("uses the selected currentSrc from a variable-bound nested source", async () => {
+    const media = await discover(
+      `<video id="clip" data-start="0" data-end="1">
+        <source src="fallback.mp4" data-var-src="clip_src" />
+      </video>`,
+      { clip: "https://cdn.example/runtime.webm" },
+    );
+
+    expect(media).toHaveLength(1);
+    expect(media[0]).toMatchObject({
+      id: "clip",
+      tagName: "video",
+      src: "https://cdn.example/runtime.webm",
+    });
+  });
+
+  it("discovers variable-bound images with the same generated id as the static parser", async () => {
+    const media = await discover(
+      `<img src="first.png" /><img src="fallback.png" data-var-src="hero_src" />`,
+      {},
+    );
+
+    expect(media).toHaveLength(1);
+    expect(media[0]).toMatchObject({ id: "hf-img-1", tagName: "image" });
+  });
+
+  it("uses intrinsic duration only for variable media with an inferred duration", async () => {
+    const media = await discover(
+      `<audio id="inferred" src="fallback.wav" data-start="0" data-duration="3" data-end="3" data-var-src="track" data-hf-inferred-duration></audio>
+       <audio id="authored" src="fallback.wav" data-start="0" data-duration="3" data-end="3" data-var-src="track"></audio>`,
+      { inferred: "selected.wav", authored: "selected.wav" },
+      false,
+      { inferred: 6.530612, authored: 6.530612 },
+    );
+
+    expect(media.find((item) => item.id === "inferred")?.duration).toBe(6.530612);
+    expect(media.find((item) => item.id === "inferred")?.durationInferred).toBe(true);
+    expect(media.find((item) => item.id === "authored")?.duration).toBe(3);
+    expect(media.find((item) => item.id === "authored")?.durationInferred).toBe(false);
+  });
+
+  it("discovers the owning image for a variable-bound picture source", async () => {
+    const media = await discover(
+      `<picture>
+        <source src="fallback.webp" data-var-src="hero_src" />
+        <img id="hero" src="fallback.png" />
+      </picture>`,
+      { hero: "https://cdn.example/runtime.avif" },
+    );
+
+    expect(media).toHaveLength(1);
+    expect(media[0]).toMatchObject({
+      id: "hero",
+      tagName: "image",
+      src: "https://cdn.example/runtime.avif",
+    });
+  });
+
+  it.each(["", " ", "#", "#t=1", "?", "?x=1"])(
+    "reports no source for src=%j, which the browser resolves to the page URL",
+    async (authored) => {
+      const media = await discover(
+        `<video id="page" src="${authored}" data-start="0" data-end="1"></video>
+         <video id="real" src="clip.mp4" data-start="0" data-end="1"></video>`,
+        {
+          page: `http://localhost:4000/index.html${authored.trim()}`,
+          real: "http://localhost:4000/clip.mp4",
+        },
+      );
+      expect(media.find((item) => item.id === "page")?.src).toBe("");
+      expect(media.find((item) => item.id === "real")?.src).toBe("http://localhost:4000/clip.mp4");
+    },
+  );
+
+  it("keeps strict timing parsing self-contained after Puppeteer serializes the callback", async () => {
+    const media = await discover(
+      '<video id="clip" src="clip.mp4" data-start="0" data-end="2" data-duration="2" data-media-start="1"></video>',
+      {},
+      true,
+    );
+    expect(media[0]).toMatchObject({ start: 0, end: 2, duration: 2, mediaStart: 1 });
+  });
+
+  it("reads authored rates and native defaults after the browser callback is serialized", async () => {
+    const media = await discover(
+      `<video id="authored" src="clip.mp4" data-start="0" data-duration="2" data-playback-rate="1.5"></video>
+       <audio id="native" src="clip.wav" data-start="0" data-duration="2"></audio>
+       <video id="invalid" src="clip.mp4" data-start="0" data-duration="2" data-playback-rate="0"></video>
+       <audio id="bounded" src="clip.wav" data-start="0" data-duration="2" data-playback-rate="20"></audio>
+       <video id="default" src="clip.mp4" data-start="0" data-duration="2"></video>`,
+      {},
+      true,
+      {},
+      { authored: 0.5, native: 0.5, invalid: 1.25 },
+    );
+
+    expect(media.map((element) => element.playbackRate)).toEqual([1.5, 0.5, 1.25, 10, 1]);
+  });
+
+  it.each(["video", "audio"])(
+    "discovers a %s rate lane after the browser callback is serialized",
+    async (tag) => {
+      const lane = {
+        target: "rate",
+        points: [
+          { t: 0, v: 1 },
+          { t: 1, v: 2 },
+        ],
+      };
+      const automation = JSON.stringify({ version: 1, lanes: [lane] });
+      const media = await discover(
+        `<${tag} id="clip" src="clip.mp4" data-start="0" data-duration="1" data-playback-rate="3" data-automation='${automation}'></${tag}>`,
+        {},
+        true,
+        {},
+        { clip: 0.5 },
+      );
+
+      expect(media[0]?.playbackRate).toEqual(lane);
+    },
+  );
+
+  it("uses scalar rates when automation is invalid or has no rate lane", async () => {
+    const media = await discover(
+      `<video id="invalid" src="clip.mp4" data-start="0" data-playback-rate="1.5" data-automation="{nope"></video>
+       <audio id="other" src="clip.wav" data-start="0" data-automation='{"version":1,"lanes":[{"target":"volume","points":[{"t":0,"v":0.5}]}]}'></audio>`,
+      {},
+      true,
+      {},
+      { other: 0.5 },
+    );
+
+    expect(media.map((element) => element.playbackRate)).toEqual([1.5, 0.5]);
+  });
+
+  it("reports colliding empty-src videos by render id, not author id", async () => {
+    const media = await discover(
+      `<video id="clip" data-hf-render-id="clip" src="" data-start="0" data-end="4" data-media-start="10"></video>` +
+        `<video id="clip" data-hf-render-id="clip__hf2" src="" data-start="4" data-end="8" data-media-start="40"></video>`,
+      {},
+    );
+    expect(media.map((entry) => entry.id)).toEqual(["clip", "clip__hf2"]);
+    expect(media.map((entry) => entry.mediaStart)).toEqual([10, 40]);
+  });
+});
+
+function validTestMediaResponse(): Response {
+  const bytes = new Uint8Array([
+    0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0, 0, 0, 0, 0x69, 0x73, 0x6f, 0x6d,
+    0x6d, 0x70, 0x34, 0x32,
+  ]);
+  return new Response(bytes, { status: 200 });
+}
+
+function validTestImageResponse(): Response {
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  return new Response(png, { status: 200 });
+}
 
 describe("injectSdkPositionEditsRenderScript", () => {
   it("injects before </body> when SDK position-edit markers are present", () => {
@@ -30,6 +244,14 @@ describe("injectSdkPositionEditsRenderScript", () => {
     expect(out).toContain("<script>");
     expect(out.indexOf("<script>")).toBeLessThan(out.indexOf("</body>"));
     expect(out).toContain("data-hf-edit-base-x");
+  });
+
+  it("injects before the document's own </body>, not inside an inlined script that prints one", () => {
+    const vendor = 'p.print("</body>")';
+    const html = `<html><body><h1 data-hf-edit-base-x="0">Hi</h1><script>${vendor}</script></body></html>`;
+    const out = injectSdkPositionEditsRenderScript(html);
+    expect(out).toContain(`<script>${vendor}</script><script>`);
+    expect(out.endsWith("</script></body></html>")).toBe(true);
   });
 
   it("appends the script when there is no </body> tag", () => {
@@ -161,6 +383,71 @@ describe("collectExternalAssets", () => {
 // ── inlineExternalScripts ──────────────────────────────────────────────────
 
 describe("inlineExternalScripts", () => {
+  it("fetches composition scripts only from public HTTPS addresses", async () => {
+    const fetched: string[] = [];
+    const record = mock(async (url: string | URL | Request) => {
+      fetched.push(String(url));
+      return new Response("window.fromLocalHost = 1;");
+    });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = record as unknown as typeof fetch;
+    _setDownloadFetchForTests(record);
+    try {
+      const html = `<html><body><script src="http://127.0.0.1:8080/a.js"></script><script src="https://127.0.0.1:8443/b.js"></script><script src="https://10.0.0.5/c.js"></script></body></html>`;
+      const result = await inlineExternalScripts(html);
+      expect({ fetched, inlined: result.includes("window.fromLocalHost") }).toEqual({
+        fetched: [],
+        inlined: false,
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+      _setDownloadFetchForTests();
+    }
+  });
+
+  it("trusts only the operator's GSAP mirror, without following its redirects", async () => {
+    const asked: { url: string; redirect?: RequestRedirect }[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = mock(async (url: string | URL | Request, init?: RequestInit) => {
+      asked.push({ url: String(url), redirect: init?.redirect });
+      return new Response("window.fromMirror = 1;");
+    }) as unknown as typeof fetch;
+    const previous = process.env.HYPERFRAMES_GSAP_BASE_URL;
+    process.env.HYPERFRAMES_GSAP_BASE_URL = "http://127.0.0.1:8080/vendor/npm";
+    try {
+      const mirror = "http://127.0.0.1:8080/vendor/npm/gsap@3.15.0/dist/gsap.min.js";
+      const escape = "http://127.0.0.1:8080/vendor/npm/../../admin.js";
+      const result = await inlineExternalScripts(
+        `<script src="${mirror}"></script><script src="${escape}"></script>`,
+      );
+      expect(asked).toEqual([{ url: mirror, redirect: "error" }]);
+      expect(result).toContain("window.fromMirror = 1;");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (previous === undefined) delete process.env.HYPERFRAMES_GSAP_BASE_URL;
+      else process.env.HYPERFRAMES_GSAP_BASE_URL = previous;
+    }
+  });
+
+  it("checks every redirect of a CDN script before following it", async () => {
+    const asked: string[] = [];
+    _setDownloadFetchForTests(async (url) => {
+      asked.push(url);
+      return new Response(null, {
+        status: 302,
+        headers: { location: "https://169.254.169.254/latest/meta-data/" },
+      });
+    });
+    try {
+      const html = `<html><body><script src="https://cdn.example.com/r.js"></script></body></html>`;
+      const result = await inlineExternalScripts(html);
+      expect(result).toContain('src="https://cdn.example.com/r.js"');
+      expect(asked).toEqual(["https://cdn.example.com/r.js"]);
+    } finally {
+      _setDownloadFetchForTests();
+    }
+  });
+
   it("returns HTML unchanged when no external scripts exist", async () => {
     const html = `<html><body><script>var x = 1;</script></body></html>`;
     const result = await inlineExternalScripts(html);
@@ -173,9 +460,22 @@ describe("inlineExternalScripts", () => {
     expect(result).toBe(html);
   });
 
+  it("leaves a CDN runtime link for the file server to strip", async () => {
+    const fetchMock = mock(async () => new Response("window.__hyperframeRuntime = {};"));
+    _setDownloadFetchForTests(fetchMock as any);
+    try {
+      const html = `<html><head><script src="https://cdn.example.com/hyperframe.runtime.iife.js"></script></head><body></body></html>`;
+      expect(await inlineExternalScripts(html)).toBe(html);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      _setDownloadFetchForTests();
+    }
+  });
+
   it("inlines a CDN script on successful fetch", async () => {
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = mock(async () => new Response("var gsap = {};", { status: 200 })) as any;
+    _setDownloadFetchForTests(
+      mock(async () => new Response("var gsap = {};", { status: 200 })) as any,
+    );
 
     try {
       const html = `<html><body><script src="https://cdn.example.com/gsap.min.js"></script></body></html>`;
@@ -184,15 +484,56 @@ describe("inlineExternalScripts", () => {
       expect(result).toContain("var gsap = {};");
       expect(result).not.toContain('src="https://cdn.example.com/gsap.min.js"');
     } finally {
-      globalThis.fetch = originalFetch;
+      _setDownloadFetchForTests();
+    }
+  });
+
+  it("verifies raw script bytes using the strongest supported SRI metadata", async () => {
+    // Include a BOM: decoding before hashing would incorrectly reject these bytes.
+    const bytes = Buffer.from("\ufeffwindow.integrityWitness = true;");
+    const digest = (algorithm: string, data = bytes) =>
+      `${algorithm}-${createHash(algorithm).update(data).digest("base64")}`;
+    const good384 = digest("sha384");
+    const bad384 = digest("sha384", Buffer.from("changed CDN bytes"));
+    const cases = [
+      { metadata: good384, accepted: true },
+      { metadata: good384.replace("sha384", "SHA384"), accepted: true },
+      { metadata: bad384.replace("sha384", "SHA384"), accepted: false },
+      { metadata: bad384.replace("sha384", "sHa384"), accepted: false },
+      { metadata: `${digest("sha256")} ${bad384.replace("sha384", "SHA384")}`, accepted: false },
+      { metadata: bad384, accepted: false },
+      { metadata: `${digest("sha256")} ${bad384}`, accepted: false },
+      { metadata: `${bad384} ${good384}`, accepted: true },
+      { metadata: `${good384} ${digest("sha512", Buffer.from("changed"))}`, accepted: false },
+      { metadata: `${bad384} ${digest("sha512")}`, accepted: true },
+      { metadata: `\t${good384}?reserved\n`, accepted: true },
+      { metadata: good384.replaceAll("+", "-").replaceAll("/", "_"), accepted: true },
+      { metadata: "sha384-YQ==", accepted: false },
+      { metadata: "sha1-unknown malformed", accepted: true },
+    ];
+    _setDownloadFetchForTests(mock(async () => new Response(bytes)) as any);
+    try {
+      for (const { metadata, accepted } of cases) {
+        const html = `<script src="https://cdn.example.com/script.js" integrity="${metadata}" crossorigin="anonymous"></script>`;
+        if (!accepted) {
+          await expect(inlineExternalScripts(html)).rejects.toThrow(
+            "Subresource integrity mismatch",
+          );
+          continue;
+        }
+        const result = await inlineExternalScripts(html);
+        expect(result).toContain("window.integrityWitness = true;");
+        expect(result).not.toContain('src="https://cdn.example.com/script.js"');
+      }
+    } finally {
+      _setDownloadFetchForTests();
     }
   });
 
   it("preserves non-src script attributes when inlining", async () => {
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = mock(
-      async () => new Response('console.log("module");', { status: 200 }),
-    ) as any;
+    _setDownloadFetchForTests(
+      mock(async () => new Response('console.log("module");', { status: 200 })) as any,
+    );
 
     try {
       const html =
@@ -204,15 +545,16 @@ describe("inlineExternalScripts", () => {
       expect(result).toContain('console.log("module");');
       expect(result).not.toContain('src="https://cdn.example.com/module.js"');
     } finally {
-      globalThis.fetch = originalFetch;
+      _setDownloadFetchForTests();
     }
   });
 
   it("escapes </script in downloaded content", async () => {
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = mock(
-      async () => new Response('var x = "</script><script>alert(1)</script>";', { status: 200 }),
-    ) as any;
+    _setDownloadFetchForTests(
+      mock(
+        async () => new Response('var x = "</script><script>alert(1)</script>";', { status: 200 }),
+      ) as any,
+    );
 
     try {
       const html = `<html><body><script src="https://cdn.example.com/evil.js"></script></body></html>`;
@@ -221,18 +563,19 @@ describe("inlineExternalScripts", () => {
       expect(result).not.toContain("</script><script>alert(1)</script>");
       expect(result).toContain("<\\/script");
     } finally {
-      globalThis.fetch = originalFetch;
+      _setDownloadFetchForTests();
     }
   });
 
   it("preserves literal replacement tokens in downloaded script content", async () => {
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = mock(
-      async () =>
-        new Response('const before = "$`"; const after = "$\'"; const both = "$&";', {
-          status: 200,
-        }),
-    ) as any;
+    _setDownloadFetchForTests(
+      mock(
+        async () =>
+          new Response('const before = "$`"; const after = "$\'"; const both = "$&";', {
+            status: 200,
+          }),
+      ) as any,
+    );
 
     try {
       const html = `<html><body><script src="https://cdn.example.com/d3.min.js"></script><div>tail</div></body></html>`;
@@ -243,13 +586,14 @@ describe("inlineExternalScripts", () => {
       expect(result).toContain('const both = "$&";');
       expect(result.match(/<script>/g)?.length).toBe(1);
     } finally {
-      globalThis.fetch = originalFetch;
+      _setDownloadFetchForTests();
     }
   });
 
   it("returns a fragment when the input has no html/body wrapper", async () => {
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = mock(async () => new Response("var d3 = {};", { status: 200 })) as any;
+    _setDownloadFetchForTests(
+      mock(async () => new Response("var d3 = {};", { status: 200 })) as any,
+    );
 
     try {
       const html = '<script src="https://cdn.example.com/d3.min.js"></script><div>tail</div>';
@@ -260,15 +604,16 @@ describe("inlineExternalScripts", () => {
       expect(result).toContain("<div>tail</div>");
       expect(result).not.toContain('src="https://cdn.example.com/d3.min.js"');
     } finally {
-      globalThis.fetch = originalFetch;
+      _setDownloadFetchForTests();
     }
   });
 
   it("warns but keeps original tag when fetch fails", async () => {
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = mock(async () => {
-      throw new Error("Network error");
-    }) as any;
+    _setDownloadFetchForTests(
+      mock(async () => {
+        throw new Error("Network error");
+      }) as any,
+    );
 
     try {
       const html = `<html><body><script src="https://cdn.example.com/gsap.min.js"></script></body></html>`;
@@ -276,18 +621,19 @@ describe("inlineExternalScripts", () => {
       // Original script tag should remain since download failed
       expect(result).toContain('src="https://cdn.example.com/gsap.min.js"');
     } finally {
-      globalThis.fetch = originalFetch;
+      _setDownloadFetchForTests();
     }
   });
 
   it("handles multiple CDN scripts with mixed success/failure", async () => {
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = mock(async (url: string) => {
-      if (url.includes("gsap")) {
-        return new Response("var gsap = {};", { status: 200 });
-      }
-      throw new Error("404");
-    }) as any;
+    _setDownloadFetchForTests(
+      mock(async (url: string) => {
+        if (url.includes("gsap")) {
+          return new Response("var gsap = {};", { status: 200 });
+        }
+        throw new Error("404");
+      }) as any,
+    );
 
     try {
       const html = `<html><body>
@@ -300,17 +646,18 @@ describe("inlineExternalScripts", () => {
       // Lottie should remain as original tag
       expect(result).toContain('src="https://cdn.example.com/lottie.min.js"');
     } finally {
-      globalThis.fetch = originalFetch;
+      _setDownloadFetchForTests();
     }
   });
 
   it("handles duplicate CDN URLs (same script referenced twice)", async () => {
-    const originalFetch = globalThis.fetch;
     let fetchCount = 0;
-    globalThis.fetch = mock(async () => {
-      fetchCount++;
-      return new Response("var gsap = {};", { status: 200 });
-    }) as any;
+    _setDownloadFetchForTests(
+      mock(async () => {
+        fetchCount++;
+        return new Response("var gsap = {};", { status: 200 });
+      }) as any,
+    );
 
     try {
       const html = `<html><body>
@@ -318,13 +665,13 @@ describe("inlineExternalScripts", () => {
         <script src="https://cdn.example.com/gsap.min.js"></script>
       </body></html>`;
       const result = await inlineExternalScripts(html);
-      // Both identical script tags should be fetched and replaced independently.
-      expect(fetchCount).toBe(2);
+      // The URL is fetched once and both tags are replaced.
+      expect(fetchCount).toBe(1);
       expect(
         result.match(/\/\* inlined: https:\/\/cdn\.example\.com\/gsap\.min\.js \*\//g)?.length,
       ).toBe(2);
     } finally {
-      globalThis.fetch = originalFetch;
+      _setDownloadFetchForTests();
     }
   });
 });
@@ -461,6 +808,74 @@ describe("detectRenderModeHints", () => {
     expect(result.recommendScreenshot).toBe(true);
   });
 
+  it("routes a capture-motion-blur root to screenshot capture", () => {
+    const html = `<!DOCTYPE html>
+<html><body>
+  <div data-composition-id="root" data-motion-blur="on" data-width="1920" data-height="1080"></div>
+</body></html>`;
+
+    const result = detectRenderModeHints(html);
+
+    expect(result.reasons.map((reason) => reason.code)).toEqual(["captureMotionBlur"]);
+    expect(result.recommendScreenshot).toBe(true);
+  });
+
+  it("does not route a root whose motion blur is off", () => {
+    const html = `<!DOCTYPE html>
+<html><body>
+  <div data-composition-id="root" data-motion-blur="off" data-width="1920" data-height="1080"></div>
+</body></html>`;
+
+    expect(detectRenderModeHints(html).reasons).toEqual([]);
+  });
+
+  describe("capture motion blur root selection", () => {
+    const codes = (html: string) => detectRenderModeHints(html).reasons.map((r) => r.code);
+
+    it("does not route when only a sub-composition opted in", () => {
+      const html = `<div data-composition-id="root"><div data-composition-id="sub" data-motion-blur="on"></div></div>`;
+      expect(codes(html)).toEqual([]);
+    });
+
+    it("routes when the outermost root opted in, whatever its sub-compositions say", () => {
+      const html = `<div data-composition-id="root" data-motion-blur="on"><div data-composition-id="sub"></div></div>`;
+      expect(codes(html)).toEqual(["captureMotionBlur"]);
+    });
+
+    it("reads data-root=true before the first composition", () => {
+      const first = `<div data-composition-id="a" data-motion-blur="on"></div><div data-composition-id="b" data-root="true"></div>`;
+      const marked = `<div data-composition-id="a"></div><div data-composition-id="b" data-root="true" data-motion-blur="on"></div>`;
+      expect(codes(first)).toEqual([]);
+      expect(codes(marked)).toEqual(["captureMotionBlur"]);
+    });
+  });
+
+  it("does not route a moving root that did not opt in", () => {
+    const tween = `<script>window.__timelines.main = gsap.timeline().to("#a", { x: 400 });</script>`;
+    const plain = `<div data-composition-id="root" data-width="1920" data-height="1080"></div>${tween}`;
+    expect(detectRenderModeHints(plain).reasons).toEqual([]);
+  });
+
+  it("does not route an opted-in root when the render turns page motion blur off", () => {
+    const html = `<div data-composition-id="root" data-motion-blur="on"></div>`;
+    expect(detectRenderModeHints(html, "off").reasons).toEqual([]);
+  });
+
+  it("detects html-in-canvas API via the content=drawable canvas of Chrome 157+", () => {
+    const html = `<!DOCTYPE html>
+<html><body>
+  <div data-composition-id="root" data-width="1920" data-height="1080">
+    <canvas id="glass-canvas" content="drawable" width="1920" height="1080">
+      <div class="panel" drawable>Glass content</div>
+    </canvas>
+  </div>
+</body></html>`;
+
+    expect(detectRenderModeHints(html).reasons.map((reason) => reason.code)).toContain(
+      "htmlInCanvas",
+    );
+  });
+
   it("does not flag htmlInCanvas for plain canvas elements without layoutsubtree", () => {
     const html = `<!DOCTYPE html>
 <html><body>
@@ -502,13 +917,14 @@ describe("detectRenderModeHints", () => {
 </template>`,
     );
 
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = mock(async () => {
-      return new Response(
-        "window.gsap = { timeline: function() { return { paused: true }; } }; function __ticker(){ requestAnimationFrame(__ticker); }",
-        { status: 200 },
-      );
-    }) as any;
+    _setDownloadFetchForTests(
+      mock(async () => {
+        return new Response(
+          "window.gsap = { timeline: function() { return { paused: true }; } }; function __ticker(){ requestAnimationFrame(__ticker); }",
+          { status: 200 },
+        );
+      }) as any,
+    );
 
     try {
       const result = await compileForRender(projectDir, join(projectDir, "index.html"), projectDir);
@@ -516,8 +932,60 @@ describe("detectRenderModeHints", () => {
       expect(result.renderModeHints.recommendScreenshot).toBe(false);
       expect(result.renderModeHints.reasons).toEqual([]);
     } finally {
-      globalThis.fetch = originalFetch;
+      _setDownloadFetchForTests();
     }
+  });
+
+  it("rebases a direct nested entry's sibling assets without changing project-root assets", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-direct-entry-base-"));
+    const compositionsDir = join(projectDir, "compositions");
+    mkdirSync(compositionsDir, { recursive: true });
+    writeFileSync(join(compositionsDir, "sibling.png"), "sibling");
+    writeFileSync(join(projectDir, "root.png"), "root");
+    const entryPath = join(compositionsDir, "scene.html");
+    writeFileSync(
+      entryPath,
+      `<!doctype html><html><body>
+  <div data-composition-id="scene" data-width="100" data-height="100" data-duration="1">
+    <img id="sibling" src="sibling.png" srcset="sibling.png 1x" />
+    <picture><source id="responsive" srcset="sibling.png 1x, root.png 2x"><img src="root.png"></picture>
+    <img id="root" src="root.png" />
+  </div>
+</body></html>`,
+    );
+
+    const compiled = await compileForRender(projectDir, entryPath, projectDir);
+    const { document } = parseHTML(compiled.html);
+
+    expect(document.querySelector("#sibling")?.getAttribute("src")).toBe(
+      "compositions/sibling.png",
+    );
+    expect(document.querySelector("#root")?.getAttribute("src")).toBe("root.png");
+    expect(document.querySelector("#sibling")?.getAttribute("srcset")).toBe(
+      "compositions/sibling.png 1x",
+    );
+    expect(document.querySelector("#responsive")?.getAttribute("srcset")).toBe(
+      "compositions/sibling.png 1x, root.png 2x",
+    );
+  });
+
+  it("reads the root's data-fx-chain as the composition's master chain, apart from any clip", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-master-chain-"));
+    const chain = '{"version":1,"nodes":[]}';
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!doctype html><html><body>
+  <div data-composition-id="main" data-width="100" data-height="100" data-duration="1" data-fx-chain='${chain}'>
+    <video id="talk" src="talk.mp4" data-start="0" data-duration="1"></video>
+  </div>
+</body></html>`,
+    );
+
+    const compiled = await compileForRender(projectDir, join(projectDir, "index.html"), projectDir);
+
+    expect(compiled.masterFxChain).toBe(chain);
+    expect(compiled.audios.map((audio) => audio.id)).toEqual(["talk-audio"]);
+    expect(compiled.audios[0]).not.toHaveProperty("fxChain");
   });
 
   // Shared fixture builder for the assertSubCompositionsUsable / EmptyCompositionError
@@ -612,6 +1080,59 @@ describe("detectRenderModeHints", () => {
     ).rejects.toThrow(/compositions\/intro\.html[\s\S]*compositions\/outro\.html/);
   });
 
+  it("compileForRender aborts naming a data-composition-src that points at a folder", async () => {
+    const projectDir = makeSubCompProject(
+      "hf-folder-subcomp-",
+      [{ id: "intro", src: "compositions/intro.html" }],
+      {},
+    );
+    try {
+      mkdirSync(join(projectDir, "compositions", "intro.html"));
+      await expect(
+        compileForRender(projectDir, join(projectDir, "index.html"), projectDir),
+      ).rejects.toThrow(/compositions\/intro\.html[\s\S]*a folder, not an HTML file/);
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("compileForRender refuses to inline an env file named as a data-composition-src", async () => {
+    const projectDir = makeSubCompProject(
+      "hf-env-subcomp-",
+      [{ id: "intro", src: "compositions/.env.html" }],
+      { ".env.html": validSubCompHtml("intro", "ENV_SECRET_VALUE") },
+    );
+    try {
+      await expect(
+        compileForRender(projectDir, join(projectDir, "index.html"), projectDir),
+      ).rejects.toThrow(
+        /compositions\/\.env\.html[\s\S]*git metadata, an env file or a private tool record/,
+      );
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("compileForRender refuses to inline the app's records under .hyperframes as a data-composition-src", async () => {
+    const projectDir = makeSubCompProject(
+      "hf-record-subcomp-",
+      [{ id: "intro", src: ".hyperframes/agent-handoff.html" }],
+      {},
+    );
+    try {
+      mkdirSync(join(projectDir, ".hyperframes"));
+      writeFileSync(
+        join(projectDir, ".hyperframes", "agent-handoff.html"),
+        validSubCompHtml("intro", "HANDOFF_SECRET_VALUE"),
+      );
+      await expect(
+        compileForRender(projectDir, join(projectDir, "index.html"), projectDir),
+      ).rejects.toThrow(/\.hyperframes\/agent-handoff\.html[\s\S]*a private tool record/);
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
   it("compileForRender aborts when a data-composition-src reference points at a missing file", async () => {
     const projectDir = makeSubCompProject(
       "hf-missing-subcomp-",
@@ -622,6 +1143,148 @@ describe("detectRenderModeHints", () => {
     await expect(
       compileForRender(projectDir, join(projectDir, "index.html"), projectDir),
     ).rejects.toThrow(/compositions\/does-not-exist\.html/);
+  });
+
+  it.each([
+    ["a %20-encoded name", "compositions/my%20scene.html"],
+    ["a leading slash for the project root", "/compositions/my scene.html"],
+  ])("compileForRender reads a data-composition-src written with %s", async (_label, src) => {
+    const projectDir = makeSubCompProject("hf-spelled-subcomp-", [{ id: "intro", src }], {
+      "my scene.html": validSubCompHtml("intro", "Spelled"),
+    });
+    try {
+      const compiled = await compileForRender(
+        projectDir,
+        join(projectDir, "index.html"),
+        projectDir,
+      );
+      expect(compiled.html).toContain("Spelled");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("compileForRender re-points a sibling asset of a sub-composition whose folder is %20-encoded", async () => {
+    const projectDir = makeSubCompProject(
+      "hf-encoded-dir-subcomp-",
+      [{ id: "intro", src: "my%20dir/scene.html" }],
+      {},
+    );
+    try {
+      mkdirSync(join(projectDir, "my dir"), { recursive: true });
+      writeFileSync(join(projectDir, "my dir", "img.png"), "png");
+      writeFileSync(
+        join(projectDir, "my dir", "scene.html"),
+        `<!doctype html><html><body><div data-composition-id="intro" data-width="100" data-height="100"><img id="pic" src="img.png"></div></body></html>`,
+      );
+      const compiled = await compileForRender(
+        projectDir,
+        join(projectDir, "index.html"),
+        projectDir,
+      );
+      const src = parseHTML(compiled.html).document.getElementById("pic")?.getAttribute("src");
+      expect(decodeURIComponent(src ?? "")).toContain("my dir/img.png");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("compileForRender refuses an entry that is not an .html file, and renders the same page named .html", async () => {
+    const projectDir = makeSubCompProject("hf-media-entry-", [], {});
+    try {
+      const page = readFileSync(join(projectDir, "index.html"), "utf-8");
+      writeFileSync(join(projectDir, "scene.png"), page);
+      writeFileSync(join(projectDir, "scene.html"), page);
+      await expect(
+        compileForRender(projectDir, join(projectDir, "scene.png"), projectDir),
+      ).rejects.toThrow(/scene\.png is not an \.html file, so it is refused/);
+      const compiled = await compileForRender(
+        projectDir,
+        join(projectDir, "scene.html"),
+        projectDir,
+      );
+      expect(compiled.html).toContain('data-composition-id="main"');
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("compileForRender checks containment before the file type of a data-composition-src", async () => {
+    const projectDir = makeSubCompProject(
+      "hf-outside-media-subcomp-",
+      [{ id: "intro", src: "../outside-scene.png" }],
+      {},
+    );
+    const outside = join(dirname(projectDir), "outside-scene.png");
+    writeFileSync(outside, validSubCompHtml("intro", "Outside"));
+    try {
+      await expect(
+        compileForRender(projectDir, join(projectDir, "index.html"), projectDir),
+      ).rejects.toThrow(/outside-scene\.png: it is outside the project folder/);
+    } finally {
+      rmSync(outside, { force: true });
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["compositions/scene.png", "/compositions/scene.png", "compositions/scene.mp4"])(
+    "compileForRender refuses a data-composition-src that is not an .html file: %s",
+    async (src) => {
+      const name = src.split("/").pop() ?? "";
+      const projectDir = makeSubCompProject("hf-media-subcomp-", [{ id: "intro", src }], {
+        [name]: validSubCompHtml("intro", "Media named"),
+      });
+      try {
+        await expect(
+          compileForRender(projectDir, join(projectDir, "index.html"), projectDir),
+        ).rejects.toThrow(/not an \.html file/);
+      } finally {
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each([
+    ["dot-dot segments", "../outside-scene.html"],
+    ["an encoded ../", "%2e%2e%2foutside-scene.html"],
+    ["a leading slash and dot-dot", "/../outside-scene.html"],
+    ["an encoded leading slash and dot-dot", "%2f%2e%2e%2foutside-scene.html"],
+  ])(
+    "compileForRender refuses a data-composition-src that leaves the project through %s",
+    async (_label, src) => {
+      const projectDir = makeSubCompProject("hf-outside-subcomp-", [{ id: "intro", src }], {});
+      const outside = join(dirname(projectDir), "outside-scene.html");
+      writeFileSync(outside, validSubCompHtml("intro", "Outside"));
+      try {
+        await expect(
+          compileForRender(projectDir, join(projectDir, "index.html"), projectDir),
+        ).rejects.toThrow(/outside the project folder/);
+      } finally {
+        rmSync(outside, { force: true });
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("compileForRender preserves a bare fragment's markup, sibling styles, and script", async () => {
+    const projectDir = makeSubCompProject(
+      "hf-fragment-subcomp-",
+      [{ id: "intro", src: "compositions/intro.html" }],
+      {
+        "intro.html": `<style>.fragment-title { color: rgb(12, 34, 56); }</style>
+<div data-composition-id="intro" data-width="100" data-height="100"><div class="fragment-title">Bare fragment</div></div>
+<script>window.__fragmentLoaded = true;</script>`,
+      },
+    );
+    try {
+      const result = await compileForRender(projectDir, join(projectDir, "index.html"), projectDir);
+      const { document } = parseHTML(result.html);
+      expect(document.querySelector(".fragment-title")?.textContent).toBe("Bare fragment");
+      expect(result.html).toContain("rgb(12, 34, 56)");
+      expect(result.html).toContain("window.__fragmentLoaded = true");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
   });
 
   it("compileForRender succeeds when the sub-composition file is valid (happy path)", async () => {
@@ -810,6 +1473,32 @@ describe("detectShaderTransitionUsage", () => {
 });
 
 describe("system-primary font normalization", () => {
+  // Google Fonts answers from a stub and a fresh cache, so a cold cache never waits on the network.
+  const FACE = "https://fonts.gstatic.com/s/stub/face.woff2";
+  let restore = () => {};
+  beforeEach(() => {
+    const previousFetch = globalThis.fetch;
+    const previousCacheDir = process.env.HYPERFRAMES_FONT_CACHE_DIR;
+    process.env.HYPERFRAMES_FONT_CACHE_DIR = mkdtempSync(join(tmpdir(), "hf-font-cache-"));
+    _clearGoogleFontCssCacheForTests();
+    globalThis.fetch = (async (input: unknown) => {
+      const url = new URL(String(input));
+      if (url.href === FACE) return new Response(new Uint8Array(64));
+      if (url.hostname !== "fonts.googleapis.com") throw new TypeError(`offline: ${url.href}`);
+      const family = (url.searchParams.get("family") ?? "").split(":")[0];
+      return new Response(
+        `@font-face { font-family: '${family}'; src: url(${FACE}) format('woff2'); }`,
+      );
+    }) as unknown as typeof fetch;
+    restore = () => {
+      _clearGoogleFontCssCacheForTests();
+      globalThis.fetch = previousFetch;
+      if (previousCacheDir === undefined) delete process.env.HYPERFRAMES_FONT_CACHE_DIR;
+      else process.env.HYPERFRAMES_FONT_CACHE_DIR = previousCacheDir;
+    };
+  });
+  afterEach(() => restore());
+
   it("promotes Inter before system/generic primary stacks before distributed plan validation", async () => {
     const projectDir = mkdtempSync(join(tmpdir(), "hf-system-primary-font-"));
     writeFileSync(
@@ -857,9 +1546,132 @@ describe("system-primary font normalization", () => {
     expect(rootStyle).toContain("--inline-system-font: Inter, system-ui, sans-serif");
     expect(rootStyle).toContain("font-family: Inter, sans-serif");
   });
+
+  it("promotes Inter inside the fallback of an undefined var() before plan validation", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-var-system-font-"));
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!doctype html>
+<html>
+  <head>
+    <style>
+      body {
+        font-family: var(
+          --font-display,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Helvetica Neue",
+          Arial,
+          sans-serif
+        );
+      }
+    </style>
+  </head>
+  <body>
+    <div data-composition-id="root" data-width="640" data-height="360" data-duration="1">Hello</div>
+  </body>
+</html>`,
+    );
+
+    const compiled = await compileForRender(projectDir, join(projectDir, "index.html"), projectDir);
+
+    expect(() => validateNoSystemFonts(compiled.html)).not.toThrow();
+    expect(compiled.html.replace(/\s+/g, "")).toContain(
+      'font-family:var(--font-display,Inter,-apple-system,BlinkMacSystemFont,"HelveticaNeue",Arial,sans-serif)',
+    );
+  });
 });
 
 describe("local font embedding", () => {
+  it.each([".env", ".git/config", ".hyperframes/agent-handoff.json"])(
+    "never inlines the private project file %s that an @font-face url names",
+    async (file) => {
+      const projectDir = mkdtempSync(join(tmpdir(), "hf-private-font-"));
+      const secret = "HEYGEN_API_KEY=not-for-the-page";
+      mkdirSync(dirname(join(projectDir, file)), { recursive: true });
+      writeFileSync(join(projectDir, file), secret);
+      writeFileSync(
+        join(projectDir, "index.html"),
+        `<!DOCTYPE html>
+<html><head><style>
+  @font-face { font-family: "P"; src: url("${file}"); }
+</style></head><body>
+  <div data-composition-id="root" data-width="640" data-height="360" data-duration="1">Text</div>
+</body></html>`,
+      );
+
+      const { html } = await compileForRender(
+        projectDir,
+        join(projectDir, "index.html"),
+        projectDir,
+      );
+
+      expect(html).not.toContain(Buffer.from(secret).toString("base64"));
+      expect(html).not.toContain("data:font/");
+      rmSync(projectDir, { recursive: true, force: true });
+    },
+  );
+
+  it("deduplicates assembled scene fonts before embedding and keeps the last descriptor order", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-repeated-scene-fonts-"));
+    mkdirSync(join(projectDir, "fonts"));
+    writeFileSync(join(projectDir, "fonts/shared.woff2"), Buffer.alloc(128 * 1024, 0x41));
+    const face = (display: string) =>
+      `@font-face { font-family: "SceneFont"; src: url("fonts/shared.woff2"); font-display: ${display}; }`;
+    for (let i = 0; i < 3; i++) {
+      writeFileSync(
+        join(projectDir, `scene-${i}.html`),
+        `<html><head><style>${face(i === 1 ? "block" : "swap")}</style></head><body>
+          <div data-composition-id="scene-${i}" data-width="640" data-height="360" data-duration="1">Scene ${i}</div>
+        </body></html>`,
+      );
+    }
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<html><head></head><body><div data-composition-id="root" data-width="640" data-height="360" data-duration="3">
+        ${Array.from({ length: 3 }, (_, i) => `<div class="clip" data-composition-id="scene-${i}" data-composition-src="scene-${i}.html" data-start="${i}" data-duration="1"></div>`).join("")}
+      </div></body></html>`,
+    );
+    try {
+      const compiled = await compileForRender(
+        projectDir,
+        join(projectDir, "index.html"),
+        projectDir,
+      );
+      const { document } = parseHTML(compiled.html);
+      const css = [...document.querySelectorAll("style")].map((el) => el.textContent).join("\n");
+      expect(css.match(/font-display:\s*swap/g)).toHaveLength(1);
+      expect(css.match(/font-display:\s*block/g)).toHaveLength(1);
+      expect(css.indexOf("block")).toBeLessThan(css.indexOf("swap"));
+      expect(Buffer.byteLength(compiled.html)).toBeLessThan(450 * 1024);
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("retains font rules inside conditional and inactive styles", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-conditional-fonts-"));
+    const face =
+      '@font-face { font-family: "SceneFont"; src: url("data:font/woff2;base64,QQ=="); }';
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<html><head>
+      <style>${face}</style><style media="print">${face}</style>
+      <style>@media print { ${face} }</style><style title="alternate">${face}</style>
+      </head><body><div data-composition-id="root" data-width="640" data-height="360" data-duration="1">Text</div>
+      <template><style>${face}</style></template></body></html>`,
+    );
+    try {
+      const compiled = await compileForRender(
+        projectDir,
+        join(projectDir, "index.html"),
+        projectDir,
+      );
+      expect(compiled.html.match(/@font-face/g)).toHaveLength(5);
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
   it("embeds one font file once when sub-compositions use equivalent relative paths", async () => {
     const projectDir = mkdtempSync(join(tmpdir(), "hf-local-font-dedupe-"));
     const assetsDir = join(projectDir, "assets");
@@ -877,19 +1689,116 @@ describe("local font embedding", () => {
 </body></html>`,
     );
 
-    const originalInfo = defaultLogger.info;
+    const originalDebug = defaultLogger.debug;
     const embeddedMessages: string[] = [];
-    defaultLogger.info = (message) => {
+    defaultLogger.debug = (message) => {
       if (message.includes("Embedded local font file")) embeddedMessages.push(message);
     };
 
     try {
       await compileForRender(projectDir, join(projectDir, "index.html"), projectDir);
     } finally {
-      defaultLogger.info = originalInfo;
+      defaultLogger.debug = originalDebug;
     }
 
     expect(embeddedMessages).toHaveLength(1);
+  });
+
+  it("embeds local ttf and otf fonts as-is without woff2 compression", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-local-font-raw-"));
+    const cacheDir = mkdtempSync(join(tmpdir(), "hf-local-font-cache-"));
+    const font = readFileSync(
+      join(
+        import.meta.dirname,
+        "../../../../docs/public/catalog/items/frost-sequence-camera-orbit/assets/fonts/Geist-Regular.ttf",
+      ),
+    );
+    writeFileSync(join(projectDir, "a.ttf"), font);
+    writeFileSync(join(projectDir, "b.otf"), font);
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!DOCTYPE html>
+<html><head><style>
+  @font-face { font-family: "A"; src: url("a.ttf"); }
+  @font-face { font-family: "B"; src: url("b.otf"); }
+</style></head><body>
+  <div data-composition-id="root" data-width="640" data-height="360" data-duration="1">Text</div>
+</body></html>`,
+    );
+
+    const previousCacheDir = process.env.HYPERFRAMES_FONT_CACHE_DIR;
+    process.env.HYPERFRAMES_FONT_CACHE_DIR = cacheDir;
+    let html: string;
+    try {
+      ({ html } = await compileForRender(projectDir, join(projectDir, "index.html"), projectDir));
+    } finally {
+      if (previousCacheDir === undefined) delete process.env.HYPERFRAMES_FONT_CACHE_DIR;
+      else process.env.HYPERFRAMES_FONT_CACHE_DIR = previousCacheDir;
+    }
+
+    const embedded = (mime: string) =>
+      Buffer.from(
+        html.match(new RegExp(`data:${mime};base64,([A-Za-z0-9+/=]+)`))?.[1] ?? "",
+        "base64",
+      );
+    expect(embedded("font/ttf").equals(font)).toBe(true);
+    expect(embedded("font/otf").equals(font)).toBe(true);
+    expect(html).not.toContain("data:font/woff2");
+    // The woff2 compressor writes every result to this cache; empty means it never ran.
+    expect(readdirSync(cacheDir, { recursive: true })).toEqual([]);
+    rmSync(projectDir, { recursive: true, force: true });
+    rmSync(cacheDir, { recursive: true, force: true });
+  });
+
+  it("keeps large local font collections file-backed instead of expanding them into HTML", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-large-local-font-"));
+    const assetsDir = join(projectDir, "assets");
+    mkdirSync(assetsDir, { recursive: true });
+    writeFileSync(join(assetsDir, "large.ttc"), Buffer.alloc(6 * 1024 * 1024, 0x41));
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!DOCTYPE html>
+<html><head><style>
+  @font-face {
+    font-family: "LargeLocal";
+    src: url("assets/large.ttc") format("collection");
+  }
+  @font-face {
+    font-family: "LargeLocalAlias";
+    src: url("./assets/large.ttc") format("collection");
+  }
+  @font-face {
+    font-family: "LargeLocalNormalized";
+    src: url("assets/../assets/large.ttc") format("collection");
+  }
+</style></head><body>
+  <div data-composition-id="root" data-width="640" data-height="360" data-duration="1">
+    Text
+  </div>
+</body></html>`,
+    );
+
+    const originalDebug = defaultLogger.debug;
+    const fileBackedMessages: string[] = [];
+    defaultLogger.debug = (message) => {
+      if (message.includes("Kept large local font file-backed")) {
+        fileBackedMessages.push(message);
+      }
+    };
+
+    let compiled: Awaited<ReturnType<typeof compileForRender>>;
+    try {
+      compiled = await compileForRender(projectDir, join(projectDir, "index.html"), projectDir);
+    } finally {
+      defaultLogger.debug = originalDebug;
+    }
+
+    expect(compiled.html).toContain('url("assets/large.ttc")');
+    expect(compiled.html).toContain('url("./assets/large.ttc")');
+    expect(compiled.html).toContain('url("assets/../assets/large.ttc")');
+    expect(compiled.html).not.toContain("data:font/collection;base64,");
+    expect(Buffer.byteLength(compiled.html)).toBeLessThan(1024 * 1024);
+    expect(fileBackedMessages).toHaveLength(1);
   });
 });
 
@@ -970,18 +1879,49 @@ describe("template-wrapped sub-composition media offsets", () => {
 
     const compiled = await compileForRender(projectDir, indexPath, projectDir);
 
+    // The 4s clip closes with its 2s host (data-start 2 + data-duration 2),
+    // not at its own authored end.
     expect(compiled.videos).toHaveLength(1);
     expect(compiled.videos[0]).toMatchObject({
       id: "scene-video",
       start: 2,
-      end: 6,
+      end: 4,
     });
     expect(compiled.audios).toHaveLength(1);
     expect(compiled.audios[0]).toMatchObject({
       id: "scene-video-audio",
       start: 2,
-      end: 6,
+      end: 4,
     });
+  });
+
+  it("offsets nested media by a host data-start id-ref to a sibling slot", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-chained-slots-"));
+    const compositionsDir = join(projectDir, "compositions");
+    mkdirSync(compositionsDir, { recursive: true });
+    const scene = (id: string) => `<template>
+  <div data-composition-id="${id}" data-start="0" data-duration="2" data-width="640" data-height="360">
+    <video id="${id}-video" src="../assets/clip.mp4" data-start="0" data-duration="2" data-track-index="0"></video>
+  </div>
+</template>`;
+    writeFileSync(join(compositionsDir, "hook.html"), scene("hook"));
+    writeFileSync(join(compositionsDir, "body.html"), scene("body"));
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!DOCTYPE html>
+<html><body>
+  <div data-composition-id="root" data-start="0" data-duration="4" data-width="640" data-height="360">
+    <div data-composition-id="hook" data-composition-src="compositions/hook.html" data-start="0" data-duration="2"></div>
+    <div data-composition-id="body" data-composition-src="compositions/body.html" data-start="hook" data-duration="2"></div>
+  </div>
+  <script>window.__timelines = { root: { duration: () => 4 } };</script>
+</body></html>`,
+    );
+
+    const compiled = await compileForRender(projectDir, join(projectDir, "index.html"), projectDir);
+    const byId = Object.fromEntries(compiled.videos.map((v) => [v.id, v]));
+    expect(byId["hook-video"]).toMatchObject({ start: 0, end: 2 });
+    expect(byId["body-video"]).toMatchObject({ start: 2, end: 4 });
   });
 
   it("preserves first-pass media offsets when durations are resolved after inlining", async () => {
@@ -1304,13 +2244,18 @@ describe("crossorigin attribute stripping", () => {
 //
 // Tests run on localizeRemoteMediaSources directly (exported for testing) to
 // avoid invoking ffprobe / the full compileForRender pipeline. fetch is patched
-// in-process for success cases; real 404s from example.com cover fallback.
+// in-process for success cases; the unit lane's refused network covers fallback.
+
+// Downloads go through the engine's fetch seam, not the global fetch.
+const stubDownloadFetch = {
+  set fetch(impl: unknown) {
+    _setDownloadFetchForTests(impl as never);
+  },
+};
 
 describe("localizeRemoteMediaSources", () => {
   it("rewrites remote <video> src to _remote_media path when download succeeds", async () => {
-    const orig = globalThis.fetch;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (globalThis as any).fetch = async () => new Response(new Uint8Array(100), { status: 200 });
+    stubDownloadFetch.fetch = async () => validTestMediaResponse();
     try {
       const dl = mkdtempSync(join(tmpdir(), "hf-dl-ok-"));
       const html = `<video id="v1" src="https://media-ok.example.com/a/clip.mp4" data-start="0" data-end="10" muted></video>`;
@@ -1319,8 +2264,7 @@ describe("localizeRemoteMediaSources", () => {
       expect(result).toContain("_remote_media/");
       expect(remoteMediaAssets.size).toBe(1);
     } finally {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (globalThis as any).fetch = orig;
+      _setDownloadFetchForTests();
     }
   });
 
@@ -1333,13 +2277,37 @@ describe("localizeRemoteMediaSources", () => {
     expect(remoteMediaAssets.size).toBe(0);
   });
 
+  it("logs only a safe fingerprint and host for a signed-URL media failure", async () => {
+    const originalWarn = defaultLogger.warn;
+    const warnings: unknown[] = [];
+    stubDownloadFetch.fetch = async () =>
+      new Response("<!doctype html><html><body>expired</body></html>", { status: 200 });
+    defaultLogger.warn = (message, meta) => warnings.push({ message, meta });
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-dl-safe-log-"));
+      const url = "https://cdn.example/private/customer.mp4?X-Amz-Signature=super-secret-signature";
+      const html = `<video id="v1" src="${url}" data-start="0" data-end="10"></video>`;
+      const { html: result, remoteMediaAssets } = await localizeRemoteMediaSources(html, dl);
+
+      expect(result).toContain(url);
+      expect(remoteMediaAssets.size).toBe(0);
+      expect(warnings).toHaveLength(1);
+      const serialized = JSON.stringify(warnings);
+      expect(serialized).toContain("cdn.example");
+      expect(serialized).toContain("urlFingerprint");
+      expect(serialized).not.toContain("customer.mp4");
+      expect(serialized).not.toContain("super-secret-signature");
+    } finally {
+      _setDownloadFetchForTests();
+      defaultLogger.warn = originalWarn;
+    }
+  });
+
   it("deduplicates: two tags with the same src URL → one download", async () => {
-    const orig = globalThis.fetch;
     let fetchCount = 0;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (globalThis as any).fetch = async () => {
+    stubDownloadFetch.fetch = async () => {
       fetchCount++;
-      return new Response(new Uint8Array(100), { status: 200 });
+      return validTestMediaResponse();
     };
     try {
       const dl = mkdtempSync(join(tmpdir(), "hf-dl-dedup-"));
@@ -1348,8 +2316,7 @@ describe("localizeRemoteMediaSources", () => {
       await localizeRemoteMediaSources(html, dl);
       expect(fetchCount).toBe(1);
     } finally {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (globalThis as any).fetch = orig;
+      _setDownloadFetchForTests();
     }
   });
 
@@ -1362,10 +2329,24 @@ describe("localizeRemoteMediaSources", () => {
     expect(remoteMediaAssets.size).toBe(0);
   });
 
+  it("localizes remote <source> children of a <video>", async () => {
+    stubDownloadFetch.fetch = async () => validTestMediaResponse();
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-dl-src-"));
+      const html = `<video id="rec" data-start="0" data-end="5" muted>
+<source src="https://src-ok.example.com/rec.mp4" type="video/mp4">
+<source src="https://src-ok.example.com/rec.webm" type="video/webm">
+</video>`;
+      const { html: result, remoteMediaAssets } = await localizeRemoteMediaSources(html, dl);
+      expect(result).not.toContain("https://src-ok.example.com/");
+      expect(remoteMediaAssets.size).toBe(2);
+    } finally {
+      _setDownloadFetchForTests();
+    }
+  });
+
   it("rewrites src in both double-quoted and single-quoted attributes", async () => {
-    const orig = globalThis.fetch;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (globalThis as any).fetch = async () => new Response(new Uint8Array(100), { status: 200 });
+    stubDownloadFetch.fetch = async () => validTestMediaResponse();
     try {
       const dl = mkdtempSync(join(tmpdir(), "hf-dl-quotes-"));
       const html = `<video id="v1" src="https://q.example.com/c/dq.mp4" data-start="0" data-end="10" muted></video>
@@ -1374,8 +2355,7 @@ describe("localizeRemoteMediaSources", () => {
       expect(result).not.toContain("https://q.example.com/");
       expect(result.match(/_remote_media\//g)?.length).toBe(2);
     } finally {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (globalThis as any).fetch = orig;
+      _setDownloadFetchForTests();
     }
   });
 
@@ -1404,9 +2384,7 @@ describe("localizeRemoteMediaSources", () => {
 
 describe("localizeRemoteImageSources", () => {
   it("rewrites remote <img> src to _remote_media path when download succeeds", async () => {
-    const orig = globalThis.fetch;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (globalThis as any).fetch = async () => new Response(new Uint8Array(100), { status: 200 });
+    stubDownloadFetch.fetch = async () => validTestImageResponse();
     try {
       const dl = mkdtempSync(join(tmpdir(), "hf-img-ok-"));
       const html = `<img class="hero" src="https://img-ok.example.com/photo.png" />`;
@@ -1415,8 +2393,7 @@ describe("localizeRemoteImageSources", () => {
       expect(result).toContain("_remote_media/");
       expect(remoteMediaAssets.size).toBe(1);
     } finally {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (globalThis as any).fetch = orig;
+      _setDownloadFetchForTests();
     }
   });
 
@@ -1430,12 +2407,10 @@ describe("localizeRemoteImageSources", () => {
   });
 
   it("deduplicates: two <img> tags with the same src URL → one download", async () => {
-    const orig = globalThis.fetch;
     let fetchCount = 0;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (globalThis as any).fetch = async () => {
+    stubDownloadFetch.fetch = async () => {
       fetchCount++;
-      return new Response(new Uint8Array(100), { status: 200 });
+      return validTestImageResponse();
     };
     try {
       const dl = mkdtempSync(join(tmpdir(), "hf-img-dedup-"));
@@ -1444,8 +2419,7 @@ describe("localizeRemoteImageSources", () => {
       await localizeRemoteImageSources(html, dl);
       expect(fetchCount).toBe(1);
     } finally {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (globalThis as any).fetch = orig;
+      _setDownloadFetchForTests();
     }
   });
 
@@ -1467,9 +2441,7 @@ describe("localizeRemoteImageSources", () => {
   });
 
   it("rewrites both double-quoted and single-quoted src attributes", async () => {
-    const orig = globalThis.fetch;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (globalThis as any).fetch = async () => new Response(new Uint8Array(100), { status: 200 });
+    stubDownloadFetch.fetch = async () => validTestImageResponse();
     try {
       const dl = mkdtempSync(join(tmpdir(), "hf-img-quotes-"));
       const html = `<img src="https://q-img.example.com/dq.png" />
@@ -1478,8 +2450,7 @@ describe("localizeRemoteImageSources", () => {
       expect(result).not.toContain("https://q-img.example.com/");
       expect(result.match(/_remote_media\//g)?.length).toBe(2);
     } finally {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (globalThis as any).fetch = orig;
+      _setDownloadFetchForTests();
     }
   });
 
@@ -1488,12 +2459,10 @@ describe("localizeRemoteImageSources", () => {
     // `src`. We must localise what Chrome actually paints (the real `src`),
     // not the `data-src` URL — matching `data-src` would download an asset the
     // render never shows and could break the loader's runtime swap.
-    const orig = globalThis.fetch;
     let fetchCount = 0;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (globalThis as any).fetch = async () => {
+    stubDownloadFetch.fetch = async () => {
       fetchCount++;
-      return new Response(new Uint8Array(100), { status: 200 });
+      return validTestImageResponse();
     };
     try {
       const dl = mkdtempSync(join(tmpdir(), "hf-img-datasrc-"));
@@ -1504,17 +2473,14 @@ describe("localizeRemoteImageSources", () => {
       expect(result).not.toContain("https://cdn.example.com/placeholder.png");
       expect(fetchCount).toBe(1);
     } finally {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (globalThis as any).fetch = orig;
+      _setDownloadFetchForTests();
     }
   });
 
   it("handles src attribute not as the first attribute (agent-pipeline shape)", async () => {
     // The 02_kobe astral-pipeline composition that surfaced this bug emits
     // <img> tags with `class` before `src`. Regex must not assume src position.
-    const orig = globalThis.fetch;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (globalThis as any).fetch = async () => new Response(new Uint8Array(100), { status: 200 });
+    stubDownloadFetch.fetch = async () => validTestImageResponse();
     try {
       const dl = mkdtempSync(join(tmpdir(), "hf-img-attr-order-"));
       const html = `<img class="kobe-cutout" alt="kobe" src="https://astral.example.com/d828bca.png" />`;
@@ -1523,8 +2489,7 @@ describe("localizeRemoteImageSources", () => {
       expect(result).toContain("_remote_media/");
       expect(remoteMediaAssets.size).toBe(1);
     } finally {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (globalThis as any).fetch = orig;
+      _setDownloadFetchForTests();
     }
   });
 });
@@ -1535,9 +2500,7 @@ describe("localizeRemoteFontFaces", () => {
   const FONT_URL = "https://gen-os-static.s3.us-east-2.amazonaws.com/fonts/komika-axis.ttf";
 
   it("rewrites @font-face url() inside <style> to _remote_media/ path", async () => {
-    const orig = globalThis.fetch;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (globalThis as any).fetch = async () => new Response(new Uint8Array(16), { status: 200 });
+    stubDownloadFetch.fetch = async () => new Response(new Uint8Array(16), { status: 200 });
     try {
       const dl = mkdtempSync(join(tmpdir(), "hf-ff-"));
       const html = `<style>
@@ -1551,14 +2514,12 @@ describe("localizeRemoteFontFaces", () => {
       expect(result).toContain("_remote_media/");
       expect(remoteMediaAssets.size).toBe(1);
     } finally {
-      globalThis.fetch = orig;
+      _setDownloadFetchForTests();
     }
   });
 
   it("ignores url() references outside @font-face (e.g. background-image)", async () => {
-    const orig = globalThis.fetch;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (globalThis as any).fetch = async () => new Response(new Uint8Array(16), { status: 200 });
+    stubDownloadFetch.fetch = async () => new Response(new Uint8Array(16), { status: 200 });
     try {
       const dl = mkdtempSync(join(tmpdir(), "hf-ff-bg-"));
       const BG_URL = "https://cdn.example.com/bg.png";
@@ -1571,14 +2532,12 @@ body { background-image: url("${BG_URL}"); }
       expect(result).not.toContain(FONT_URL);
       expect(result).toContain(BG_URL);
     } finally {
-      globalThis.fetch = orig;
+      _setDownloadFetchForTests();
     }
   });
 
   it("preserves original URL when download fails", async () => {
-    const orig = globalThis.fetch;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (globalThis as any).fetch = async () => new Response(null, { status: 403 });
+    stubDownloadFetch.fetch = async () => new Response(null, { status: 403 });
     try {
       const dl = mkdtempSync(join(tmpdir(), "hf-ff-fail-"));
       const FAIL_URL = "https://fail-font.example.com/f.ttf";
@@ -1587,15 +2546,13 @@ body { background-image: url("${BG_URL}"); }
       expect(result).toContain(FAIL_URL);
       expect(remoteMediaAssets.size).toBe(0);
     } finally {
-      globalThis.fetch = orig;
+      _setDownloadFetchForTests();
     }
   });
 
   it("deduplicates: same font URL in two @font-face blocks → 1 download", async () => {
-    const orig = globalThis.fetch;
     let fetchCount = 0;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (globalThis as any).fetch = async () => {
+    stubDownloadFetch.fetch = async () => {
       fetchCount++;
       return new Response(new Uint8Array(16), { status: 200 });
     };
@@ -1610,7 +2567,7 @@ body { background-image: url("${BG_URL}"); }
       expect(fetchCount).toBe(1);
       expect(remoteMediaAssets.size).toBe(1);
     } finally {
-      globalThis.fetch = orig;
+      _setDownloadFetchForTests();
     }
   });
 
@@ -1668,9 +2625,7 @@ body { margin: 0; }
 }
 h1 { font-size: 2rem; }`;
 
-    const orig = globalThis.fetch;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (globalThis as any).fetch = async (url: string) => {
+    stubDownloadFetch.fetch = async (url: string) => {
       if (url === STYLESHEET_URL) {
         return new Response(fakeCss, { status: 200 });
       }
@@ -1684,6 +2639,7 @@ h1 { font-size: 2rem; }`;
       const { html: result, remoteMediaAssets } = await localizeRemoteFontFaces(html, dl);
       // The <link> tag should be replaced with an inline <style> containing the @font-face
       expect(result).not.toContain(`href="${STYLESHEET_URL}"`);
+      expect(result).not.toContain(STYLESHEET_URL);
       expect(result).not.toContain("<link");
       expect(result).toContain("@font-face");
       expect(result).toContain("CustomFont");
@@ -1692,15 +2648,13 @@ h1 { font-size: 2rem; }`;
       expect(result).toContain("_remote_media/");
       expect(remoteMediaAssets.size).toBe(1);
     } finally {
-      globalThis.fetch = orig;
+      _setDownloadFetchForTests();
     }
   });
 
   it("keeps <link> tag when external stylesheet fetch fails (graceful degradation)", async () => {
     const STYLESHEET_URL = "https://down.example.com/fonts.css";
-    const orig = globalThis.fetch;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (globalThis as any).fetch = async () => new Response(null, { status: 503 });
+    stubDownloadFetch.fetch = async () => new Response(null, { status: 503 });
     try {
       const dl = mkdtempSync(join(tmpdir(), "hf-ff-extfail-"));
       const html = `<link rel="stylesheet" href="${STYLESHEET_URL}">`;
@@ -1710,15 +2664,60 @@ h1 { font-size: 2rem; }`;
       expect(result).toContain("<link");
       expect(remoteMediaAssets.size).toBe(0);
     } finally {
-      globalThis.fetch = orig;
+      _setDownloadFetchForTests();
+    }
+  });
+
+  it("rejects a stylesheet redirect to a private host before the second request", async () => {
+    const STYLESHEET_URL = "https://styles.example.com/fonts.css";
+    let fetchCount = 0;
+    stubDownloadFetch.fetch = async () => {
+      fetchCount++;
+      return new Response(null, {
+        status: 302,
+        headers: { location: "https://169.254.169.254/latest/meta-data/" },
+      });
+    };
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-ff-private-redirect-"));
+      const html = `<link rel="stylesheet" href="${STYLESHEET_URL}">`;
+      const { html: result, remoteMediaAssets } = await localizeRemoteFontFaces(html, dl);
+
+      expect(fetchCount).toBe(1);
+      expect(result).toBe(html);
+      expect(remoteMediaAssets.size).toBe(0);
+    } finally {
+      _setDownloadFetchForTests();
+    }
+  });
+
+  it("does not log a signed stylesheet path or query on failure", async () => {
+    const STYLESHEET_URL =
+      "https://styles.example.com/private/customer.css?X-Amz-Signature=super-secret";
+    const originalWarn = defaultLogger.warn;
+    const warnings: unknown[] = [];
+    stubDownloadFetch.fetch = async () =>
+      new Response(null, { status: 503, statusText: STYLESHEET_URL });
+    defaultLogger.warn = (message, meta) => warnings.push({ message, meta });
+    try {
+      const dl = mkdtempSync(join(tmpdir(), "hf-ff-safe-style-log-"));
+      const html = `<link rel="stylesheet" href="${STYLESHEET_URL}">`;
+      await localizeRemoteFontFaces(html, dl);
+
+      const serialized = JSON.stringify(warnings);
+      expect(serialized).toContain("styles.example.com");
+      expect(serialized).toContain("urlFingerprint");
+      expect(serialized).not.toContain("customer.css");
+      expect(serialized).not.toContain("super-secret");
+    } finally {
+      _setDownloadFetchForTests();
+      defaultLogger.warn = originalWarn;
     }
   });
 
   it("keeps <link> tag when external stylesheet has no @font-face rules", async () => {
     const STYLESHEET_URL = "https://cdn.example.com/reset.css";
-    const orig = globalThis.fetch;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (globalThis as any).fetch = async () =>
+    stubDownloadFetch.fetch = async () =>
       new Response("body { margin: 0; } h1 { color: blue; }", { status: 200 });
     try {
       const dl = mkdtempSync(join(tmpdir(), "hf-ff-noff-"));
@@ -1729,7 +2728,7 @@ h1 { font-size: 2rem; }`;
       expect(result).toContain("<link");
       expect(remoteMediaAssets.size).toBe(0);
     } finally {
-      globalThis.fetch = orig;
+      _setDownloadFetchForTests();
     }
   });
 
@@ -1738,9 +2737,7 @@ h1 { font-size: 2rem; }`;
     const FONT_FILE_URL = "https://use.typekit.net/af/font.woff2";
     const fontCss = `@font-face { font-family: "AdobeFont"; src: url("${FONT_FILE_URL}") format("woff2"); }`;
 
-    const orig = globalThis.fetch;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (globalThis as any).fetch = async (url: string) => {
+    stubDownloadFetch.fetch = async (url: string) => {
       if (url === FONT_CDN_URL) return new Response(fontCss, { status: 200 });
       return new Response(new Uint8Array(16), { status: 200 });
     };
@@ -1757,12 +2754,99 @@ h1 { font-size: 2rem; }`;
       expect(result).toContain("_remote_media/");
       expect(remoteMediaAssets.size).toBe(1);
     } finally {
-      globalThis.fetch = orig;
+      _setDownloadFetchForTests();
     }
   });
 });
 
 describe("discoverAudioVolumeAutomationFromTimeline", () => {
+  it("treats trailing-garbage duration as unknown instead of truncating automation sampling", async () => {
+    class TestAudioElement {
+      id = "music";
+      dataset = { start: "0", duration: "5s", volume: "0" };
+      volume = 0;
+    }
+    class TestVideoElement {}
+    const audio = new TestAudioElement();
+    const previous = {
+      window: globalThis.window,
+      document: globalThis.document,
+      audio: globalThis.HTMLAudioElement,
+      video: globalThis.HTMLVideoElement,
+    };
+    globalThis.window = {
+      __timelines: { root: { totalTime: (time: number) => (audio.volume = time < 7 ? 0 : 1) } },
+    } as any;
+    globalThis.document = {
+      querySelector: () => ({ getAttribute: () => "root" }),
+      getElementById: () => audio,
+    } as any;
+    globalThis.HTMLAudioElement = TestAudioElement as any;
+    globalThis.HTMLVideoElement = TestVideoElement as any;
+    try {
+      const page = { evaluate: async (fn: (arg: any) => unknown, arg: unknown) => fn(arg) } as any;
+      const [automation] = await discoverAudioVolumeAutomationFromTimeline(page, ["music"], 10, 1);
+      expect(automation?.keyframes).toContainEqual({ time: 7, volume: 1 });
+    } finally {
+      globalThis.window = previous.window;
+      globalThis.document = previous.document;
+      globalThis.HTMLAudioElement = previous.audio;
+      globalThis.HTMLVideoElement = previous.video;
+    }
+  });
+
+  it("emits plateau boundaries around a sampled volume change", async () => {
+    class TestAudioElement {
+      id = "music";
+      dataset = { start: "0", duration: "3", volume: "0.8" };
+      volume = 0.8;
+    }
+    class TestVideoElement {}
+
+    const audio = new TestAudioElement();
+    const previousWindow = globalThis.window;
+    const previousDocument = globalThis.document;
+    const previousAudioElement = globalThis.HTMLAudioElement;
+    const previousVideoElement = globalThis.HTMLVideoElement;
+
+    globalThis.window = {
+      __timelines: {
+        root: {
+          totalTime: (time: number) => {
+            audio.volume = time < 1.05 ? 0.8 : 0.2;
+          },
+        },
+      },
+    } as any;
+    globalThis.document = {
+      querySelector: (selector: string) =>
+        selector === "[data-composition-id]"
+          ? { getAttribute: (name: string) => (name === "data-composition-id" ? "root" : null) }
+          : null,
+      getElementById: (id: string) => (id === "music" ? audio : null),
+    } as any;
+    globalThis.HTMLAudioElement = TestAudioElement as any;
+    globalThis.HTMLVideoElement = TestVideoElement as any;
+
+    try {
+      const page = {
+        evaluate: async (fn: (arg: unknown) => unknown, arg: unknown) => fn(arg),
+      } as any;
+
+      const [automation] = await discoverAudioVolumeAutomationFromTimeline(page, ["music"], 3, 10);
+
+      expect(automation?.keyframes).toContainEqual({ time: 1, volume: 0.8 });
+      expect(automation?.keyframes).toContainEqual({ time: 1.1, volume: 0.2 });
+      expect(interpolateVolumeGain(automation?.keyframes ?? [], 0.5)).toBeCloseTo(0.8, 6);
+      expect(interpolateVolumeGain(automation?.keyframes ?? [], 1.5)).toBeCloseTo(0.2, 6);
+    } finally {
+      globalThis.window = previousWindow;
+      globalThis.document = previousDocument;
+      globalThis.HTMLAudioElement = previousAudioElement;
+      globalThis.HTMLVideoElement = previousVideoElement;
+    }
+  });
+
   it("prefers runtime duration over stale data-end while sampling video-derived audio", async () => {
     class TestAudioElement {}
     class TestVideoElement {
@@ -1831,6 +2915,155 @@ describe("discoverAudioVolumeAutomationFromTimeline", () => {
   });
 });
 
+describe("resolveCompositionDurations strict literal timing", () => {
+  it("falls through whitespace data-duration to a valid composition duration", async () => {
+    const previousDocument = globalThis.document;
+    const previousWindow = globalThis.window;
+    globalThis.window = { __timelines: {} } as any;
+    globalThis.document = {
+      getElementById: () => ({
+        getAttribute: (name: string) =>
+          name === "data-duration" ? "   " : name === "data-composition-duration" ? "5" : null,
+      }),
+    } as any;
+    try {
+      const page = {
+        evaluate: async (fn: (arg: unknown) => unknown, arg: unknown) => fn(arg),
+      } as any;
+      const result = await resolveCompositionDurations(page, [
+        { id: "scene", tagName: "div", start: 0, mediaStart: 0, playbackRate: 1 },
+      ]);
+      expect(result).toEqual([{ id: "scene", duration: 5 }]);
+    } finally {
+      globalThis.document = previousDocument;
+      globalThis.window = previousWindow;
+    }
+  });
+
+  it("falls back to the authored duration when the registered duration() throws", async () => {
+    const previousDocument = globalThis.document;
+    const previousWindow = globalThis.window;
+    globalThis.window = {
+      __timelines: {
+        scene: {
+          duration() {
+            throw new Error("boom");
+          },
+        },
+      },
+    } as any;
+    globalThis.document = {
+      getElementById: () => ({
+        getAttribute: (name: string) => (name === "data-composition-duration" ? "5" : null),
+      }),
+    } as any;
+    try {
+      const page = {
+        evaluate: async (fn: (arg: unknown) => unknown, arg: unknown) => fn(arg),
+      } as any;
+      const result = await resolveCompositionDurations(page, [
+        { id: "scene", tagName: "div", start: 0, mediaStart: 0, playbackRate: 1 },
+      ]);
+      expect(result).toEqual([{ id: "scene", duration: 5 }]);
+    } finally {
+      globalThis.document = previousDocument;
+      globalThis.window = previousWindow;
+    }
+  });
+
+  it("does not partially parse trailing-garbage composition duration", async () => {
+    const previousDocument = globalThis.document;
+    const previousWindow = globalThis.window;
+    globalThis.window = { __timelines: {} } as any;
+    globalThis.document = {
+      getElementById: () => ({
+        getAttribute: (name: string) => (name === "data-composition-duration" ? "5s" : null),
+      }),
+    } as any;
+    try {
+      const page = {
+        evaluate: async (fn: (arg: unknown) => unknown, arg: unknown) => fn(arg),
+      } as any;
+      const result = await resolveCompositionDurations(page, [
+        { id: "scene", tagName: "div", start: 0, mediaStart: 0, playbackRate: 1 },
+      ]);
+      expect(result).toEqual([]);
+    } finally {
+      globalThis.document = previousDocument;
+      globalThis.window = previousWindow;
+    }
+  });
+});
+
+describe("discoverVideoVisibilityFromTimeline", () => {
+  it("returns scene visibility windows for auto-start videos", async () => {
+    const duration = 2;
+    const sampleStep = 0.1;
+    const windows = [
+      { id: "v0", start: 0.2, end: 0.7 },
+      { id: "v1", start: 0.5, end: 1.2 },
+      { id: "v2", start: 1.0, end: 1.8 },
+      { id: "v3", start: 0.0, end: 0.4 },
+    ];
+
+    type SceneEl = { opacityAt: (t: number) => number };
+    const videos = windows.map((win) => {
+      const sceneEl: SceneEl = {
+        opacityAt: (t) => (t >= win.start && t <= win.end ? 1 : 0),
+      };
+      return {
+        id: win.id,
+        closest: (selector: string) => (selector === ".scene" ? sceneEl : null),
+      };
+    });
+
+    let currentTime = 0;
+    const previousWindow = globalThis.window;
+    const previousDocument = globalThis.document;
+
+    globalThis.window = {
+      __timelines: {
+        root: {
+          totalTime: (time: number) => {
+            currentTime = time;
+          },
+        },
+      },
+      getComputedStyle: (el: SceneEl) => ({
+        opacity: String(el.opacityAt(currentTime)),
+      }),
+    } as typeof globalThis.window;
+    globalThis.document = {
+      querySelectorAll: (selector: string) =>
+        selector === "video[data-hf-auto-start]" ? videos : [],
+      querySelector: (selector: string) =>
+        selector === "[data-composition-id]"
+          ? { getAttribute: (name: string) => (name === "data-composition-id" ? "root" : null) }
+          : null,
+    } as typeof globalThis.document;
+
+    try {
+      const page = {
+        evaluate: async (fn: (arg: number) => unknown, arg: number) => fn(arg),
+      };
+
+      const result = await discoverVideoVisibilityFromTimeline(page as never, duration);
+
+      expect(result).toHaveLength(windows.length);
+      for (const win of windows) {
+        const found = result.find((entry) => entry.videoId === win.id);
+        expect(found).toBeDefined();
+        expect(found!.visibleStart).toBeGreaterThanOrEqual(win.start - sampleStep);
+        expect(found!.visibleStart).toBeLessThanOrEqual(win.start + sampleStep);
+        expect(found!.visibleEnd).toBeGreaterThanOrEqual(win.end - sampleStep);
+        expect(found!.visibleEnd).toBeLessThanOrEqual(win.end + sampleStep);
+      }
+    } finally {
+      globalThis.window = previousWindow;
+      globalThis.document = previousDocument;
+    }
+  });
+});
 describe("sub-composition variable injection (render path, #2064)", () => {
   function writeSubCompVarProject(hostVars: string): string {
     const projectDir = mkdtempSync(join(tmpdir(), "hf-subvar-"));
@@ -1873,6 +3106,18 @@ describe("sub-composition variable injection (render path, #2064)", () => {
     const compiled = await compileForRender(projectDir, join(projectDir, "index.html"), projectDir);
     expect(compiled.html).toMatch(/window\.__hfVariablesByComp\s*=\s*Object\.assign/);
     expect(compiled.html).toContain("#00ff00");
+  });
+
+  it("writes the table in <head>, so it runs before the composition scripts that wait for fonts", async () => {
+    const projectDir = writeSubCompVarProject(`data-variable-values='{"color":"#00ff00"}'`);
+    const compiled = await compileForRender(projectDir, join(projectDir, "index.html"), projectDir);
+    const { document } = parseHTML(compiled.html);
+    const tables = [...document.querySelectorAll("script")].filter((s) =>
+      s.textContent?.includes("__hfVariablesByComp = Object.assign"),
+    );
+    expect(tables.map((s) => [s.parentElement?.tagName, s.getAttribute("type")])).toEqual([
+      ["HEAD", null],
+    ]);
   });
 
   it("still injects the declared default even with no per-instance override", async () => {
@@ -2100,4 +3345,486 @@ describe("sub-composition variable injection (render path, #2064)", () => {
     const compiled = await compileForRender(projectDir, join(projectDir, "index.html"), projectDir);
     expect(compiled.html).not.toMatch(/window\.__hfVariablesByComp\s*=\s*Object\.assign/);
   });
+});
+
+// ── Markup payload sniff (STUDIO-5433) ─────────────────────────────────────
+//
+// Producer's `resolveMediaDuration` is a two-step pipeline (download → probe)
+// that runs on every media element without an authored duration. Before this
+// defense, an authoring bug that handed a `.html` payload through as a video
+// src produced an opaque `[mov,mp4,m4a,3gp,3g2,mj2 @ ...] moov atom not found`
+// from ffprobe — the `mov,mp4,…` prefix is ffprobe's demuxer probe order, NOT
+// the file's true format, so every alert routed as a codec/ffmpeg bug. The
+// byte-level sniff itself is unit-tested in
+// `engine/src/utils/notMediaPayload.test.ts`; what is pinned here is the
+// compiler's handling of the verdict, which differs by element type.
+
+describe("compileForRender non-media payload sniff (STUDIO-5433)", () => {
+  function writeProject(mediaTag: string): string {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-payload-sniff-e2e-"));
+    mkdirSync(join(projectDir, "assets"));
+    writeFileSync(
+      join(projectDir, "assets", "nested.html"),
+      "<!DOCTYPE html>\n<html><head><title>streamed-preview</title></head><body></body></html>",
+    );
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!DOCTYPE html>
+<html>
+  <body>
+    <div data-composition-id="root" data-width="640" data-height="360" data-start="0" data-duration="4">
+      ${mediaTag}
+    </div>
+    <script>
+      window.__timelines = window.__timelines || {};
+      window.__timelines["root"] = { duration: () => 4 };
+    </script>
+  </body>
+</html>`,
+    );
+    return projectDir;
+  }
+
+  it("aborts with NotMediaPayloadError before ffprobe when a <video> src is an HTML payload", async () => {
+    // Mimics STUDIO-5433: an a-roll element whose src points at a legitimate
+    // 6.5 KB `<!DOCTYPE html>` preview page instead of the rendered MP4.
+    const projectDir = writeProject(
+      '<video id="v1" src="assets/nested.html" data-start="0" muted></video>',
+    );
+
+    let caught: unknown;
+    try {
+      await compileForRender(projectDir, join(projectDir, "index.html"), projectDir);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(NotMediaPayloadError);
+    const err = caught as NotMediaPayloadError;
+    // Routing metadata, not just a readable string: these are what the server's
+    // SAFE_RENDER_ERROR_CODES allowlist and the distributed retry sets key off.
+    expect(err.code).toBe("NOT_MEDIA_PAYLOAD");
+    expect(err.owner).toBe("user");
+    expect(err.retryable).toBe(false);
+    // Correlation is the hashed element id — the authored src never reaches a
+    // message that producer forwards to API clients.
+    expect(err.elementFingerprints).toHaveLength(1);
+    expect(err.message).not.toContain("assets/nested.html");
+    // Also the ordering pin: this fixture is an input ffprobe rejects, so if
+    // the sniff ran after the probe the rejection would be ffprobe's untyped
+    // error and this assertion would fail.
+  });
+
+  it("aborts before ffprobe when a <video> playlist names a file outside its folder", async () => {
+    const projectDir = writeProject(
+      '<video id="v1" src="assets/clip.m3u8" data-start="0" muted></video>',
+    );
+    writeFileSync(
+      join(projectDir, "assets", "clip.m3u8"),
+      "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n../../outside.mp4\n#EXT-X-ENDLIST\n",
+    );
+    let caught: unknown;
+    try {
+      await compileForRender(projectDir, join(projectDir, "index.html"), projectDir);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(NotMediaPayloadError);
+    expect((caught as NotMediaPayloadError).message).not.toContain("clip.m3u8");
+  });
+
+  it("drops an <audio> document payload to duration 0 and warns instead of failing the render", async () => {
+    // The audio/video split is the compiler's contract: an unprobeable audio
+    // src is excluded from the render, and only video surfaces its probe
+    // failure. A hard abort here would take down renders that used to succeed
+    // without the offending audio.
+    const projectDir = writeProject(
+      '<audio id="a1" src="assets/nested.html" data-start="0"></audio>',
+    );
+    const warnings: string[] = [];
+    const log = { ...defaultLogger, warn: (message: string) => warnings.push(message) };
+
+    const compiled = await compileForRender(
+      projectDir,
+      join(projectDir, "index.html"),
+      projectDir,
+      { log },
+    );
+
+    expect(compiled.html).not.toContain('id="a1" src="assets/nested.html" data-end');
+    expect(warnings.join("\n")).toContain("text document");
+    expect(warnings.join("\n")).toContain("a1");
+  });
+
+  it.each([".git/clip.mp4", ".hyperframes/clip.mp4", ".claude/clip.mp4", "keys/id_rsa"])(
+    "never probes the private project file %s that a <video> or <audio> names",
+    async (src) => {
+      const projectDir = writeProject(
+        `<video id="v1" src="${src}" data-start="0" muted></video>` +
+          `<audio id="a1" src="${src}" data-start="0"></audio>`,
+      );
+      mkdirSync(dirname(join(projectDir, src)), { recursive: true });
+      writeFileSync(join(projectDir, src), readFileSync(join(projectDir, "assets", "nested.html")));
+      const warnings: string[] = [];
+      const log = { ...defaultLogger, warn: (message: string) => warnings.push(message) };
+
+      await compileForRender(projectDir, join(projectDir, "index.html"), projectDir, { log });
+
+      expect(warnings.join("\n")).not.toContain("text document");
+      rmSync(projectDir, { recursive: true, force: true });
+    },
+  );
+});
+
+describe("duplicate media ids across nested compositions", () => {
+  // Element ids are unique per composition FILE; the render document is the
+  // inlined union of every file. The producer used to merge the per-file media
+  // lists and deduplicate by id, so colliding clips collapsed into one entry
+  // and the survivor's frames were injected onto whichever element came first
+  // in the document — leaving the visible scene without footage (#3340).
+  function sceneWithVideoId(label: string, mediaStart: number): string {
+    return `<div data-composition-id="${label}" data-start="0" data-duration="3"
+     data-width="640" data-height="360">
+  <video id="clip" src="../assets/long-take.mp4" data-start="0" data-duration="3"
+         data-media-start="${mediaStart}" data-track-index="0"></video>
+</div>`;
+  }
+
+  function writeTwoSceneProject(
+    sceneAFile: string,
+    sceneBFile: string = sceneAFile,
+    sceneBody: (label: string, mediaStart: number) => string = sceneWithVideoId,
+  ): { projectDir: string; indexPath: string } {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-dup-media-"));
+    const compositionsDir = join(projectDir, "compositions");
+    mkdirSync(compositionsDir, { recursive: true });
+
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!DOCTYPE html>
+<html><head></head><body>
+  <div id="root" data-composition-id="root" data-start="0" data-duration="6"
+       data-width="640" data-height="360">
+    <div id="scene-a-host" data-composition-id="scene-a" data-composition-src="compositions/${sceneAFile}"
+         data-start="0" data-duration="3" data-width="640" data-height="360"></div>
+    <div id="scene-b-host" data-composition-id="scene-b" data-composition-src="compositions/${sceneBFile}"
+         data-start="3" data-duration="3" data-width="640" data-height="360"></div>
+  </div>
+</body></html>`,
+    );
+
+    const wrap = (label: string, mediaStart: number) =>
+      `<template id="${label}-template">\n${sceneBody(label, mediaStart)}\n</template>`;
+    writeFileSync(join(compositionsDir, sceneAFile), wrap("scene-a", 5));
+    if (sceneBFile !== sceneAFile) {
+      writeFileSync(join(compositionsDir, sceneBFile), wrap("scene-b", 50));
+    }
+
+    return { projectDir, indexPath: join(projectDir, "index.html") };
+  }
+
+  it("keeps both clips when two scenes declare the same video id", async () => {
+    const { projectDir, indexPath } = writeTwoSceneProject("scene-a.html", "scene-b.html");
+
+    const compiled = await compileForRender(projectDir, indexPath, projectDir);
+
+    expect(compiled.videos).toHaveLength(2);
+    expect(compiled.videos[0]).toMatchObject({ start: 0, end: 3, mediaStart: 5 });
+    expect(compiled.videos[1]).toMatchObject({ start: 3, end: 6, mediaStart: 50 });
+  });
+
+  it("gives the colliding clips ids that each address one element", async () => {
+    const { projectDir, indexPath } = writeTwoSceneProject("scene-a.html", "scene-b.html");
+
+    const compiled = await compileForRender(projectDir, indexPath, projectDir);
+
+    const ids = compiled.videos.map((v) => v.id);
+    expect(new Set(ids).size).toBe(2);
+
+    // One element per id is exactly what the frame injector relies on.
+    const { document } = parseHTML(compiled.html);
+    for (const id of ids) {
+      expect(document.querySelectorAll(`[data-hf-render-id="${id}"]`)).toHaveLength(1);
+    }
+  });
+
+  it("keeps author ids intact so scene CSS and scripts still resolve", async () => {
+    const { projectDir, indexPath } = writeTwoSceneProject("scene-a.html", "scene-b.html");
+
+    const compiled = await compileForRender(projectDir, indexPath, projectDir);
+
+    const { document } = parseHTML(compiled.html);
+    expect(document.querySelectorAll('video[id="clip"]')).toHaveLength(2);
+  });
+
+  it("keeps both clips when the same scene file is mounted twice", async () => {
+    // The author cannot make these unique: it is one file, mounted twice.
+    const { projectDir, indexPath } = writeTwoSceneProject("scene.html");
+
+    const compiled = await compileForRender(projectDir, indexPath, projectDir);
+
+    expect(compiled.videos).toHaveLength(2);
+    expect(compiled.videos[0]).toMatchObject({ start: 0, end: 3 });
+    expect(compiled.videos[1]).toMatchObject({ start: 3, end: 6 });
+  });
+
+  it("keeps both clips when neither scene names its video", async () => {
+    // No authored id at all: the timing compiler numbers auto-ids per file, so
+    // both scenes arrive as `hf-video-0`.
+    const { projectDir, indexPath } = writeTwoSceneProject(
+      "scene-a.html",
+      "scene-b.html",
+      (label, mediaStart) =>
+        `<div data-composition-id="${label}" data-start="0" data-duration="3"
+     data-width="640" data-height="360">
+  <video src="../assets/long-take.mp4" data-start="0" data-duration="3"
+         data-media-start="${mediaStart}" data-track-index="0"></video>
+</div>`,
+    );
+
+    const compiled = await compileForRender(projectDir, indexPath, projectDir);
+
+    expect(compiled.videos).toHaveLength(2);
+    expect(compiled.videos.map((v) => v.mediaStart)).toEqual([5, 50]);
+  });
+
+  it("keeps both audio tracks when two scenes declare the same audio id", async () => {
+    const { projectDir, indexPath } = writeTwoSceneProject(
+      "scene-a.html",
+      "scene-b.html",
+      (label, mediaStart) =>
+        `<div data-composition-id="${label}" data-start="0" data-duration="3"
+     data-width="640" data-height="360">
+  <audio id="vo" src="../assets/narration.wav" data-start="0" data-duration="3"
+         data-media-start="${mediaStart}" data-track-index="1"></audio>
+</div>`,
+    );
+
+    const compiled = await compileForRender(projectDir, indexPath, projectDir);
+
+    expect(compiled.audios).toHaveLength(2);
+    expect(compiled.audios[0]).toMatchObject({ start: 0, end: 3, mediaStart: 5 });
+    expect(compiled.audios[1]).toMatchObject({ start: 3, end: 6, mediaStart: 50 });
+  });
+
+  it("stamps unique render ids on empty-src videos across two scenes", async () => {
+    const { projectDir, indexPath } = writeTwoSceneProject(
+      "scene-a.html",
+      "scene-b.html",
+      (label, mediaStart) =>
+        `<div data-composition-id="${label}" data-start="0" data-duration="3"
+     data-width="640" data-height="360">
+  <video id="clip" src="" data-start="0" data-duration="3"
+         data-media-start="${mediaStart}" data-track-index="0"></video>
+</div>`,
+    );
+
+    const compiled = await compileForRender(projectDir, indexPath, projectDir);
+
+    // Static parse still omits empty src from the media list; the stamp is
+    // what the snapshot uses to keep the two clips distinct.
+    expect(compiled.videos).toHaveLength(0);
+    const { document } = parseHTML(compiled.html);
+    expect(
+      Array.from(document.querySelectorAll("video")).map((el) =>
+        el.getAttribute("data-hf-render-id"),
+      ),
+    ).toEqual(["clip", "clip__hf2"]);
+  });
+});
+
+describe("STUDIO-5433 — ffprobe failure includes src URL for attribution", () => {
+  function writeCorruptVideoProject(videoSrc: string, assetBytes: Buffer): string {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-studio-5433-"));
+    mkdirSync(join(projectDir, "assets"), { recursive: true });
+    writeFileSync(join(projectDir, "assets", "clip.mp4"), assetBytes);
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!DOCTYPE html>
+<html>
+  <body>
+    <div id="root" data-composition-id="root" data-start="0" data-duration="4" data-width="640" data-height="360">
+      <video
+        id="clip"
+        src="${videoSrc}"
+        data-start="0"
+        data-duration="4"
+        data-width="640"
+        data-height="360"
+      ></video>
+    </div>
+    <script>
+      window.__timelines = window.__timelines || {};
+      window.__timelines["root"] = { duration: () => 4 };
+    </script>
+  </body>
+</html>`,
+    );
+    return projectDir;
+  }
+
+  it("wraps the ffprobe error with [src=<relative-path>] when the local video is corrupt", async () => {
+    // 0-byte mp4 — ffprobe reports "Invalid data found when processing input",
+    // the same class as the STUDIO-5433 moov failure. Fail-fast semantics remain
+    // (video branch throws, unlike audio's graceful-degrade to duration=0).
+    const projectDir = writeCorruptVideoProject("assets/clip.mp4", Buffer.alloc(0));
+
+    let thrown: unknown;
+    try {
+      await compileForRender(projectDir, join(projectDir, "index.html"), projectDir);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    const message = (thrown as Error).message;
+    // A bare relative path IS the redactor's `BARE_RELATIVE_PATH` shape (one
+    // separator + a media extension), so it lands as `[path]`. The attribution
+    // that matters is the remote-URL case below; a local relative src carries
+    // no host to attribute and the redactor is right to drop it.
+    expect(message).toContain("[src=[path]]");
+    // Original ffprobe diagnostic must still be present so failure classifiers
+    // downstream (e.g. hyperframes_render_metrics.py) continue to match.
+    expect(message).toMatch(/ffprobe|Invalid data|No video stream/i);
+  });
+
+  // The STUDIO-5433 case is a remote src, and that is the shape whose
+  // attribution has to survive redaction: host + path kept, query dropped so a
+  // pre-signed signature never reaches telemetry. Pinned on the redactor
+  // directly — driving a remote src through `compileForRender` would need a
+  // download stub, and the wrapper's only transform IS this call.
+  it("keeps host and path but drops the query when redacting a remote src", () => {
+    expect(redactTelemetryString("https://cdn.example.com/renders/clip.mp4?sig=abc123&exp=1")).toBe(
+      "https://cdn.example.com/renders/clip.mp4?\u2026",
+    );
+  });
+});
+
+describe("nested CDN integrity", () => {
+  it("verifies a nested pin before returning compiled HTML, including a duplicate root script", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hf-nested-sri-"));
+    const src = "https://cdn.example.com/pinned.js";
+    const bytes = "window.nestedIntegrityWitness = true;";
+    const integrity = `sha384-${createHash("sha384").update(bytes).digest("base64")}`;
+    writeFileSync(
+      join(dir, "index.html"),
+      `<html><head><script src="${src}"></script></head><body><div data-composition-id="root" data-width="320" data-height="180" data-duration="1"><div data-composition-id="child" data-composition-src="child.html"></div></div></body></html>`,
+    );
+    writeFileSync(
+      join(dir, "child.html"),
+      `<html><head><script src="${src}" integrity="${integrity}" crossorigin="anonymous"></script></head><body><div data-composition-id="child" data-width="320" data-height="180" data-duration="1">Child</div></body></html>`,
+    );
+    try {
+      _setDownloadFetchForTests(mock(async () => new Response(bytes)) as any);
+      await expect(compileForRender(dir, join(dir, "index.html"), dir)).resolves.toBeDefined();
+      _setDownloadFetchForTests(
+        mock(async () => new Response("window.compromised = true;")) as any,
+      );
+      await expect(compileForRender(dir, join(dir, "index.html"), dir)).rejects.toThrow(
+        "Subresource integrity mismatch",
+      );
+    } finally {
+      _setDownloadFetchForTests();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("missing local GSAP in renders", () => {
+  const missingGsapEntry = `<!DOCTYPE html>
+<html><head><script src="node_modules/gsap/dist/gsap.min.js"></script></head><body>
+  <div data-composition-id="root" data-width="320" data-height="180"></div>
+</body></html>`;
+
+  async function compileMissingGsap(
+    base: string | undefined,
+    files: Record<string, string> = { "index.html": missingGsapEntry },
+  ): Promise<{
+    html: string;
+    fetched: string[];
+  }> {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-render-gsap-mirror-"));
+    for (const [path, content] of Object.entries(files)) {
+      mkdirSync(dirname(join(projectDir, path)), { recursive: true });
+      writeFileSync(join(projectDir, path), content);
+    }
+    const fetched: string[] = [];
+    const originalFetch = globalThis.fetch;
+    const previous = process.env.HYPERFRAMES_GSAP_BASE_URL;
+    if (base === undefined) delete process.env.HYPERFRAMES_GSAP_BASE_URL;
+    else process.env.HYPERFRAMES_GSAP_BASE_URL = base;
+    const fetchMock = mock(async (input: string | URL | Request) => {
+      fetched.push(String(input instanceof Request ? input.url : input));
+      return new Response("window.gsap = {};", { status: 200 });
+    });
+    // The operator's mirror is fetched directly; every other URL goes through the checked transport.
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    _setDownloadFetchForTests(fetchMock);
+    try {
+      const result = await compileForRender(projectDir, join(projectDir, "index.html"), projectDir);
+      return { html: result.html, fetched };
+    } finally {
+      globalThis.fetch = originalFetch;
+      _setDownloadFetchForTests();
+      if (previous === undefined) delete process.env.HYPERFRAMES_GSAP_BASE_URL;
+      else process.env.HYPERFRAMES_GSAP_BASE_URL = previous;
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  }
+
+  it("loads it from HYPERFRAMES_GSAP_BASE_URL when set", async () => {
+    const { html, fetched } = await compileMissingGsap("http://127.0.0.1:8080/vendor/npm/");
+    expect(fetched).toContain("http://127.0.0.1:8080/vendor/npm/gsap@3.15.0/dist/gsap.min.js");
+    expect(fetched.some((url) => url.includes("jsdelivr"))).toBe(false);
+    expect(html).toContain(
+      "inlined: http://127.0.0.1:8080/vendor/npm/gsap@3.15.0/dist/gsap.min.js",
+    );
+  });
+
+  const scene = (id: string, inner = "") => `<template id="${id}-template">
+  <script src="node_modules/gsap/dist/gsap.min.js"></script>
+  <div data-composition-id="${id}" data-width="320" data-height="180">${inner}</div>
+</template>`;
+  const mount = (id: string, src: string) =>
+    `<div data-composition-id="${id}" data-composition-src="${src}" data-start="0" data-duration="1"></div>`;
+
+  it.each([
+    ["a sub-composition", { "compositions/scene.html": scene("scene") }],
+    [
+      "a nested sub-composition",
+      {
+        "compositions/scene.html": `<template id="scene-template"><div data-composition-id="scene" data-width="320" data-height="180">${mount("inner", "compositions/inner.html")}</div></template>`,
+        "compositions/inner.html": scene("inner"),
+      },
+    ],
+  ])("loads a missing GSAP script in %s from the mirror", async (_label, subFiles) => {
+    const { html, fetched } = await compileMissingGsap("http://127.0.0.1:8080/vendor/npm/", {
+      "index.html": `<!DOCTYPE html>
+<html><body><div data-composition-id="root" data-width="320" data-height="180">${mount("scene", "compositions/scene.html")}</div></body></html>`,
+      ...subFiles,
+    });
+    expect(fetched).toContain("http://127.0.0.1:8080/vendor/npm/gsap@3.15.0/dist/gsap.min.js");
+    expect(html).not.toContain("node_modules/gsap/dist/gsap.min.js");
+  });
+
+  it("keeps a sub-composition's GSAP that exists next to it", async () => {
+    const { fetched } = await compileMissingGsap("http://127.0.0.1:8080/vendor/npm/", {
+      "index.html": `<!DOCTYPE html>
+<html><body><div data-composition-id="root" data-width="320" data-height="180">${mount("scene", "compositions/scene.html")}</div></body></html>`,
+      "compositions/scene.html": scene("scene"),
+      "compositions/node_modules/gsap/dist/gsap.min.js": "window.gsap = {};",
+    });
+    expect(fetched).toEqual([]);
+  });
+
+  it("keeps jsDelivr when no mirror is set", async () => {
+    const { fetched } = await compileMissingGsap(undefined);
+    expect(fetched).toContain("https://cdn.jsdelivr.net/npm/gsap@3.15.0/dist/gsap.min.js");
+  });
+
+  it.each(["http://mirror.example/npm", "/vendor/npm"])(
+    "fails the render on an invalid mirror instead of using jsDelivr: %s",
+    async (base) => {
+      await expect(compileMissingGsap(base)).rejects.toThrow("HYPERFRAMES_GSAP_BASE_URL");
+    },
+  );
 });

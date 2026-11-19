@@ -4,6 +4,8 @@ import { useTrackDesignInput } from "../../contexts/DesignPanelInputContext";
 import type { DomEditSelection } from "./domEditingTypes";
 
 /** The action buttons in the inspector header: visibility, Ungroup (groups only), copy, clear. */
+import { keyHint, useStudioKeys } from "../../player/components/studioShortcuts";
+
 export function InspectorHeaderActions({
   element,
   copied,
@@ -37,7 +39,7 @@ export function InspectorHeaderActions({
             track("toggle", "Element visibility");
             void onToggleHidden(selectedElementId, !selectedElementHidden);
           }}
-          className="flex h-6 w-6 items-center justify-center rounded text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-300"
+          className="flex h-6 w-6 items-center justify-center rounded-sm text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-300"
         >
           {selectedElementHidden ? (
             <EyeSlash size={13} weight="bold" aria-hidden="true" />
@@ -53,8 +55,8 @@ export function InspectorHeaderActions({
             track("button", "Ungroup");
             onUngroup();
           }}
-          title="Ungroup (⌘⇧G)"
-          className="flex h-6 items-center rounded px-2 text-[11px] font-medium text-neutral-400 transition-colors hover:bg-neutral-800 hover:text-neutral-200"
+          title={`Ungroup (${keyHint("ungroup", useStudioKeys())})`}
+          className="flex h-6 items-center rounded-sm px-2 text-[11px] font-medium text-neutral-400 transition-colors hover:bg-neutral-800 hover:text-neutral-200"
         >
           Ungroup
         </button>
@@ -67,7 +69,7 @@ export function InspectorHeaderActions({
         }}
         className={`flex h-6 w-6 items-center justify-center rounded transition-colors ${
           copied
-            ? "text-studio-accent"
+            ? "text-accent-ink"
             : "text-neutral-500 hover:bg-neutral-800 hover:text-neutral-300"
         }`}
         title={copied ? "Copied!" : "Copy element info to clipboard"}
@@ -91,7 +93,7 @@ export function InspectorHeaderActions({
           track("button", "Clear selection");
           onClear();
         }}
-        className="flex h-6 w-6 items-center justify-center rounded text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-300"
+        className="flex h-6 w-6 items-center justify-center rounded-sm text-neutral-500 transition-colors hover:bg-neutral-800 hover:text-neutral-300"
       >
         <X size={13} />
       </button>

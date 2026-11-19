@@ -57,6 +57,17 @@ function opts(executions: ExecutionsClientLike) {
 }
 
 describe("renderToCloudRun", () => {
+  it("rejects a stale v1 SDK option before any GCP work", async () => {
+    const fake = new FakeExecutions();
+    const staleOptions = { ...opts(fake), planProtocol: "v1" };
+
+    await expect(renderToCloudRun(staleOptions)).rejects.toMatchObject({
+      name: "PLAN_PROTOCOL_UNSUPPORTED",
+    });
+    expect(fake.lastArgument).toBeNull();
+    expect(fake.lastParent).toBeNull();
+  });
+
   it("starts an execution and returns a handle", async () => {
     const fake = new FakeExecutions();
     const handle = await renderToCloudRun(opts(fake));
@@ -66,18 +77,30 @@ describe("renderToCloudRun", () => {
     );
     expect(handle.outputGcsUri).toBe("gs://b/renders/hf-render-fixed/output.mp4");
     expect(handle.projectGcsUri).toBe("gs://b/sites/abc/project.tar.gz");
+    expect(Object.keys(handle)).toEqual([
+      "renderId",
+      "executionName",
+      "bucketName",
+      "workflowId",
+      "outputGcsUri",
+      "projectGcsUri",
+      "startedAt",
+    ]);
   });
 
   it("builds the workflow argument the YAML expects", async () => {
     const fake = new FakeExecutions();
     await renderToCloudRun(opts(fake));
     const arg = JSON.parse(fake.lastArgument ?? "{}");
-    expect(arg.RenderId).toBe("hf-render-fixed");
-    expect(arg.ProjectGcsUri).toBe("gs://b/sites/abc/project.tar.gz");
-    expect(arg.PlanOutputGcsPrefix).toBe("gs://b/renders/hf-render-fixed/");
-    expect(arg.OutputGcsUri).toBe("gs://b/renders/hf-render-fixed/output.mp4");
-    expect(arg.ServiceUrl).toBe("https://render-abc.run.app");
-    expect(arg.Config.format).toBe("mp4");
+    expect(arg).toEqual({
+      RenderId: "hf-render-fixed",
+      ProjectGcsUri: "gs://b/sites/abc/project.tar.gz",
+      PlanOutputGcsPrefix: "gs://b/renders/hf-render-fixed/",
+      OutputGcsUri: "gs://b/renders/hf-render-fixed/output.mp4",
+      ServiceUrl: "https://render-abc.run.app",
+      Config: config,
+      PlanProtocol: "v2",
+    });
     expect(fake.lastParent).toBe(
       "projects/proj/locations/us-central1/workflows/hyperframes-render",
     );
@@ -109,7 +132,7 @@ describe("renderToCloudRun", () => {
   it("validates the config before any GCP call", async () => {
     const fake = new FakeExecutions();
     await expect(
-      renderToCloudRun({ ...opts(fake), config: { ...config, fps: 25 } as never }),
+      renderToCloudRun({ ...opts(fake), config: { ...config, fps: 50 } as never }),
     ).rejects.toThrow(/config\.fps/);
     expect(fake.lastArgument).toBeNull();
   });

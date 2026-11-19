@@ -1,6 +1,15 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanupProxyCache } from "./proxyCache.js";
 
@@ -14,6 +23,10 @@ function cacheDir(): string {
   return cache;
 }
 
+/** A proxy path named the way the transcoder names one. */
+const proxy = (cache: string, label: string, extension = ".mp4") =>
+  join(cache, `${createHash("sha256").update(label).digest("hex")}${extension}`);
+
 function writeEntry(path: string, bytes: number, modifiedAt: number): void {
   writeFileSync(path, Buffer.alloc(bytes));
   const date = new Date(modifiedAt);
@@ -25,12 +38,35 @@ afterEach(() => {
 });
 
 describe("cleanupProxyCache", () => {
+  it.skipIf(process.platform === "win32")(
+    "removes nothing from the folder a linked .transcode-cache points at",
+    () => {
+      const project = mkdtempSync(join(tmpdir(), "hf-proxy-cache-project-"));
+      const outside = mkdtempSync(join(tmpdir(), "hf-proxy-cache-outside-"));
+      tempDirs.push(project, outside);
+      const now = 1_800_000_000_000;
+      const theirs = proxy(outside, "someone-elses-file");
+      writeEntry(theirs, 4, now - 31 * 24 * 60 * 60 * 1000);
+      symlinkSync(outside, join(project, ".transcode-cache"));
+
+      const result = cleanupProxyCache(join(project, ".transcode-cache"), {
+        now,
+        maxBytes: Number.POSITIVE_INFINITY,
+        maxIdleMs: 60 * 60 * 1000,
+        minSweepIntervalMs: 0,
+      });
+
+      expect(result.removed).toEqual([]);
+      expect(existsSync(theirs)).toBe(true);
+    },
+  );
+
   it("removes idle and oldest entries until the cache is within its byte budget", () => {
     const cache = cacheDir();
     const now = 1_800_000_000_000;
-    const expired = join(cache, "expired.mp4");
-    const oldest = join(cache, "oldest.mp4");
-    const newest = join(cache, "newest.mp4");
+    const expired = proxy(cache, "expired");
+    const oldest = proxy(cache, "oldest");
+    const newest = proxy(cache, "newest");
     writeEntry(expired, 4, now - 31 * 24 * 60 * 60 * 1000);
     writeEntry(oldest, 6, now - 3_000);
     writeEntry(newest, 6, now - 1_000);
@@ -49,11 +85,50 @@ describe("cleanupProxyCache", () => {
     expect(existsSync(newest)).toBe(true);
   });
 
+  it("counts the cached still frames toward the budget and sweeps them with the copies", () => {
+    const cache = cacheDir();
+    const now = 1_800_000_000_000;
+    const oldStill = proxy(cache, "old-still", ".jpg");
+    const copy = proxy(cache, "copy");
+    writeEntry(oldStill, 6, now - 3_000);
+    writeEntry(copy, 6, now - 1_000);
+
+    const result = cleanupProxyCache(cache, {
+      now,
+      maxBytes: 8,
+      maxIdleMs: 30 * 24 * 60 * 60 * 1000,
+      minSweepIntervalMs: 0,
+    });
+
+    expect(result.removed).toEqual([oldStill]);
+    expect(existsSync(oldStill)).toBe(false);
+    expect(existsSync(copy)).toBe(true);
+  });
+
+  it("reports the same removals in a dry run and removes nothing", () => {
+    const cache = cacheDir();
+    const now = 1_800_000_000_000;
+    const idle = proxy(cache, "idle");
+    const older = proxy(cache, "older");
+    const recent = proxy(cache, "recent");
+    writeEntry(idle, 4, now - 2 * 60 * 60 * 1000);
+    writeEntry(older, 3, now - 10_000);
+    writeEntry(recent, 6, now - 1_000);
+    const options = { now, maxBytes: 7, maxIdleMs: 60 * 60 * 1000, minSweepIntervalMs: 0 };
+
+    const planned = cleanupProxyCache(cache, { ...options, dryRun: true });
+    expect(existsSync(idle)).toBe(true);
+    expect(cleanupProxyCache(cache, options)).toEqual(planned);
+    expect(planned).toMatchObject({ removed: [idle, older], bytesBefore: 13, bytesAfter: 6 });
+    expect(existsSync(idle)).toBe(false);
+    expect(existsSync(recent)).toBe(true);
+  });
+
   it("counts and evicts WebM proxies alongside MP4 proxies", () => {
     const cache = cacheDir();
     const now = 1_800_000_000_000;
-    const webm = join(cache, "alpha.webm");
-    const mp4 = join(cache, "opaque.mp4");
+    const webm = proxy(cache, "alpha", ".webm");
+    const mp4 = proxy(cache, "opaque");
     writeEntry(webm, 6, now - 2_000);
     writeEntry(mp4, 6, now - 1_000);
 
@@ -72,8 +147,8 @@ describe("cleanupProxyCache", () => {
   it("preserves in-flight entries and removes stale temporary files", () => {
     const cache = cacheDir();
     const now = 1_800_000_000_000;
-    const inFlight = join(cache, "active.mp4");
-    const staleTemp = join(cache, ".tmp-crashed-active.mp4");
+    const inFlight = proxy(cache, "active");
+    const staleTemp = join(cache, `.tmp-${randomUUID()}-${basename(inFlight)}`);
     writeEntry(inFlight, 12, now - 40 * 24 * 60 * 60 * 1000);
     writeEntry(staleTemp, 3, now - 2 * 60 * 60 * 1000);
 
@@ -91,9 +166,82 @@ describe("cleanupProxyCache", () => {
     expect(existsSync(inFlight)).toBe(true);
   });
 
+  it("sweeps stale pieces of a stopped long copy, but not while its copy runs or within the hour", () => {
+    const cache = cacheDir();
+    const now = 1_800_000_000_000;
+    const hour = 60 * 60 * 1000;
+    const key = basename(proxy(cache, "long"), ".mp4");
+    const runningKey = basename(proxy(cache, "running"), ".mp4");
+    const tag = "0123456789abcdef".repeat(2);
+    const stalePiece = join(cache, `.part-${key}-${tag}-0.mp4`);
+    const stalePieceTemp = join(cache, `.tmp-${randomUUID()}-.part-${key}-${tag}-1.mp4`);
+    const untaggedPiece = join(cache, `.part-${key}-3.mp4`);
+    const freshPiece = join(cache, `.part-${key}-${tag}-2.mp4`);
+    const runningPiece = join(cache, `.part-${runningKey}-${tag}-0.mp4`);
+    writeEntry(stalePiece, 3, now - 2 * hour);
+    writeEntry(untaggedPiece, 3, now - 2 * hour);
+    writeEntry(stalePieceTemp, 3, now - 2 * hour);
+    writeEntry(freshPiece, 3, now - 11 * 60 * 1000);
+    writeEntry(runningPiece, 3, now - 2 * hour);
+
+    const result = cleanupProxyCache(cache, {
+      now,
+      staleTempMs: 10 * 60 * 1000,
+      minSweepIntervalMs: 0,
+      protectedPaths: new Set([join(cache, `${runningKey}.mp4`)]),
+    });
+
+    expect(result.removed.sort()).toEqual([stalePiece, stalePieceTemp, untaggedPiece].sort());
+    expect(existsSync(freshPiece)).toBe(true);
+    expect(existsSync(runningPiece)).toBe(true);
+  });
+
+  it("sweeps old-style pieces even while that copy runs, and pieces dated in the future", () => {
+    const cache = cacheDir();
+    const now = 1_800_000_000_000;
+    const hour = 60 * 60 * 1000;
+    const runningKey = basename(proxy(cache, "running"), ".mp4");
+    const stoppedKey = basename(proxy(cache, "stopped"), ".mp4");
+    const tag = "0123456789abcdef".repeat(2);
+    const untagged = join(cache, `.part-${runningKey}-0.mp4`);
+    const ownPiece = join(cache, `.part-${runningKey}-${tag}-1.mp4`);
+    const futureDated = join(cache, `.part-${stoppedKey}-${tag}-0.mp4`);
+    writeEntry(untagged, 3, now - 2 * hour);
+    writeEntry(ownPiece, 3, now - 2 * hour);
+    writeEntry(futureDated, 3, now + 365 * 24 * hour);
+
+    const result = cleanupProxyCache(cache, {
+      now,
+      staleTempMs: 10 * 60 * 1000,
+      minSweepIntervalMs: 0,
+      protectedPaths: new Set([join(cache, `${runningKey}.mp4`)]),
+    });
+
+    expect(result.removed.sort()).toEqual([futureDated, untagged].sort());
+    expect(existsSync(ownPiece)).toBe(true);
+  });
+
+  it("never removes a file the transcoder did not name, even from an idle cache over budget", () => {
+    const cache = cacheDir();
+    const now = 1_800_000_000_000;
+    const userFiles = [join(cache, "holiday.mp4"), join(cache, ".tmp-notes.mp4")];
+    for (const path of userFiles) writeEntry(path, 4, now - 40 * 24 * 60 * 60 * 1000);
+
+    const result = cleanupProxyCache(cache, {
+      now,
+      maxBytes: 0,
+      maxIdleMs: 1,
+      staleTempMs: 1,
+      minSweepIntervalMs: 0,
+    });
+
+    expect(result.removed).toEqual([]);
+    for (const path of userFiles) expect(existsSync(path)).toBe(true);
+  });
+
   it("rate-limits repeated directory sweeps", () => {
     const cache = cacheDir();
-    const path = join(cache, "entry.mp4");
+    const path = proxy(cache, "entry");
     writeEntry(path, 2, 1_000);
 
     const first = cleanupProxyCache(cache, {

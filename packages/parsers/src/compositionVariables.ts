@@ -5,13 +5,14 @@
  * linkedom/Node HTML-parser machinery from the main entry.
  */
 
-import type { CompositionVariable, CompositionVariableType } from "./types.js";
+import type {
+  CompositionVariable,
+  CompositionVariableType,
+  FontValue,
+  ImageValue,
+} from "./types.js";
 
-/**
- * Required typeof for each variable type's `default`. For font the default is
- * the font-family name string; for image it is the fallback URL string —
- * extra metadata fields on both are optional and not validated here.
- */
+/** Scalar defaults; font/image also accept their typed object values. */
 const DEFAULT_TYPEOF: Record<CompositionVariableType, "string" | "number" | "boolean"> = {
   string: "string",
   number: "number",
@@ -33,7 +34,25 @@ export function isScalarVariableValue(value: unknown): value is string | number 
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null;
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+export function isFontValue(value: unknown): value is FontValue {
+  return isRecord(value) && typeof value.name === "string" && typeof value.source === "string";
+}
+
+export function isImageValue(value: unknown): value is ImageValue {
+  return (
+    isRecord(value) &&
+    typeof value.url === "string" &&
+    (value.alt === undefined || typeof value.alt === "string") &&
+    (value.fit === undefined ||
+      value.fit === "cover" ||
+      value.fit === "contain" ||
+      value.fit === "fill" ||
+      value.fit === "none" ||
+      value.fit === "scale-down")
+  );
 }
 
 function isVariableType(t: unknown): t is CompositionVariableType {
@@ -50,9 +69,29 @@ export function isCompositionVariable(v: unknown): v is CompositionVariable {
   if (!isRecord(v)) return false;
   if (typeof v.id !== "string" || typeof v.label !== "string") return false;
   if (!isVariableType(v.type)) return false;
+  if (v.type === "font") return typeof v.default === "string" || isFontValue(v.default);
+  if (v.type === "image") return typeof v.default === "string" || isImageValue(v.default);
   if (typeof v.default !== DEFAULT_TYPEOF[v.type]) return false;
   if (v.type === "enum" && !Array.isArray(v.options)) return false;
   return true;
+}
+
+export interface ReadCompositionVariables {
+  declarations: CompositionVariable[];
+  complete: boolean;
+}
+
+/** Valid declarations in the raw attribute text; `complete` is false when anything in it was dropped or unreadable. */
+export function readCompositionVariables(raw: string | null | undefined): ReadCompositionVariables {
+  if (!raw) return { declarations: [], complete: true };
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return { declarations: [], complete: false };
+    const declarations = parsed.filter(isCompositionVariable);
+    return { declarations, complete: declarations.length === parsed.length };
+  } catch {
+    return { declarations: [], complete: false };
+  }
 }
 
 /**
@@ -62,18 +101,32 @@ export function isCompositionVariable(v: unknown): v is CompositionVariable {
  * absent attribute, invalid JSON, or a non-array payload yields `[]`.
  */
 export function parseCompositionVariables(htmlEl: Element): CompositionVariable[] {
-  const variablesAttr = htmlEl.getAttribute("data-composition-variables");
-  if (!variablesAttr) {
-    return [];
-  }
+  return readCompositionVariables(htmlEl.getAttribute("data-composition-variables")).declarations;
+}
 
-  try {
-    const parsed = JSON.parse(variablesAttr);
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-    return parsed.filter(isCompositionVariable);
-  } catch {
-    return [];
-  }
+/**
+ * Protocol allowlist for a resolved media URL. Relative URLs (no scheme) resolve
+ * against the page origin and are always safe. Absolute URLs are restricted to
+ * http(s)/blob and image data: URIs -- defense-in-depth alongside the runtime's
+ * VAR_SRC_TAGS element guard, blocking `javascript:`, `data:text/html`, `file:`,
+ * etc. even if a future tag slips past it. Control chars are stripped before the
+ * scheme test because browsers ignore them when parsing the URL.
+ *
+ * Lives here rather than in the runtime because the linter has to reach the same
+ * verdict on a declared default statically: a value this rejects is dropped at
+ * bind time and the element's authored fallback renders instead, so a second copy
+ * of the scheme list would let lint and the runtime disagree silently.
+ */
+export function isSafeMediaUrl(url: string): boolean {
+  // Browsers ignore ASCII control chars/whitespace when parsing a URL, so strip
+  // them before reading the scheme (defeats `java\tscript:` style bypasses).
+  // oxlint-disable-next-line no-control-regex -- control chars are the target here
+  const normalized = url.replace(/[\u0000-\u0020]/g, "");
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(normalized);
+  if (!scheme) return true;
+  const proto = scheme[1]?.toLowerCase();
+  if (!proto) return false;
+  if (proto === "https" || proto === "http" || proto === "blob") return true;
+  if (proto === "data") return /^data:image\//i.test(normalized);
+  return false;
 }

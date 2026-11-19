@@ -43,6 +43,8 @@ function request() {
         codec: "h264",
         chunkSize: 120,
         maxParallelChunks: 8,
+        targetChunkFrames: 1600,
+        minParallelChunks: 4,
         cfr: true,
       },
     },
@@ -50,6 +52,87 @@ function request() {
 }
 
 describe("RenderRequest", () => {
+  it("preserves explicit motion blur off through the distributed request round trip", () => {
+    const value = request();
+    value.options.pageMotionBlur = "off";
+    const config = distributedConfigFromRequest(value);
+    expect(config.pageMotionBlur).toBe("off");
+    expect(
+      renderRequestFromDistributedConfig({
+        projectDir: value.projectDir,
+        outputPath: value.outputPath,
+        config,
+      }).options.pageMotionBlur,
+    ).toBe("off");
+  });
+
+  it("carries strictVariables through the in-process and distributed adapters, and refuses a non-boolean", () => {
+    const value = request();
+    value.options.strictVariables = true;
+    expect(renderConfigFromRequest(value).strictVariables).toBe(true);
+    const config = distributedConfigFromRequest(value);
+    expect(config.strictVariables).toBe(true);
+    expect(
+      renderRequestFromDistributedConfig({
+        projectDir: value.projectDir,
+        outputPath: value.outputPath,
+        config,
+      }).options.strictVariables,
+    ).toBe(true);
+    expect(() =>
+      parseRenderRequest({ ...value, options: { ...value.options, strictVariables: "yes" } }),
+    ).toThrow(/strictVariables must be a boolean/);
+  });
+  it("carries expectedOutputDimensions through the in-process and distributed adapters, and refuses invalid dimensions", () => {
+    const value = request();
+    value.options.expectedOutputDimensions = { width: 1280, height: 720 };
+    expect(renderConfigFromRequest(value).expectedOutputDimensions).toEqual({
+      width: 1280,
+      height: 720,
+    });
+    const config = distributedConfigFromRequest(value);
+    expect(config.expectedOutputDimensions).toEqual({ width: 1280, height: 720 });
+    expect(
+      renderRequestFromDistributedConfig({
+        projectDir: value.projectDir,
+        outputPath: value.outputPath,
+        config,
+      }).options.expectedOutputDimensions,
+    ).toEqual({ width: 1280, height: 720 });
+    expect(() =>
+      parseRenderRequest({
+        ...value,
+        options: { ...value.options, expectedOutputDimensions: "yes" },
+      }),
+    ).toThrow(/expectedOutputDimensions/);
+  });
+
+  it("carries the delivery encoder options through every adapter", () => {
+    const value = request();
+    Object.assign(value.options, {
+      keyframeIntervalSeconds: 2,
+      maxBitrate: "8M",
+      bufferSize: "12M",
+    });
+    const expected = { keyframeIntervalSeconds: 2, maxBitrate: "8M", bufferSize: "12M" };
+    expect(renderConfigFromRequest(value)).toMatchObject(expected);
+    const config = distributedConfigFromRequest(value);
+    expect(config).toMatchObject(expected);
+    expect(
+      renderRequestFromDistributedConfig({
+        projectDir: value.projectDir,
+        outputPath: value.outputPath,
+        config,
+      }).options,
+    ).toMatchObject(expected);
+    expect(() =>
+      parseRenderRequest({ ...value, options: { ...value.options, maxBitrate: 8 } }),
+    ).toThrow();
+    expect(() =>
+      parseRenderRequest({ ...value, options: { ...value.options, keyframeIntervalSeconds: 0 } }),
+    ).toThrow(/positive/);
+  });
+
   it("round-trips through JSON without dropping nested options", () => {
     const value = request();
     expect(parseRenderRequest(serializeRenderRequest(value))).toEqual(value);
@@ -120,6 +203,12 @@ describe("RenderRequest", () => {
     expect(renderConfigFromRequest(value).producerConfig?.forceScreenshot).toBe(true);
   });
 
+  it("accepts 25 fps for a distributed render", () => {
+    const value = request();
+    value.options.fps = { num: 25, den: 1 };
+    expect(distributedConfigFromRequest(value).fps).toBe(25);
+  });
+
   it("rejects unsupported distributed fps before an adapter launch", () => {
     const value = request();
     value.options.fps = { num: 30_000, den: 1_001 };
@@ -181,6 +270,7 @@ describe("RenderRequest", () => {
       {},
       { ...value.options.engineConfig, protocolTimeout: "forever" },
       { ...value.options.engineConfig, browserGpuMode: "turbo" },
+      { ...value.options.engineConfig, streamingEncodeDurationCapEnabled: "true" },
     ]) {
       expect(() =>
         parseRenderRequest({ ...value, options: { ...value.options, engineConfig } }),
@@ -191,6 +281,7 @@ describe("RenderRequest", () => {
       {},
       { ...value.options.engineConfig, protocolTimeout: "forever" },
       { ...value.options.engineConfig, browserGpuMode: "turbo" },
+      { ...value.options.engineConfig, streamingEncodeDurationCapEnabled: "true" },
     ]) {
       const distributed = distributedConfigFromRequest(value);
       (distributed as { engineConfig: unknown }).engineConfig = engineConfig;
@@ -260,5 +351,148 @@ describe("RenderRequest", () => {
         config: distributed,
       }),
     ).toThrow("must be even");
+  });
+
+  describe("format: hls", () => {
+    function hlsRequest(options: { hlsSegmentSeconds?: number } = {}) {
+      return createRenderRequest({
+        projectDir: "/project",
+        outputPath: "/output/video-hls",
+        engineConfig: DEFAULT_CONFIG,
+        options: {
+          fps: { num: 30, den: 1 },
+          quality: "standard",
+          format: "hls",
+          ...options,
+        },
+      });
+    }
+
+    it("round-trips hls and its segment length", () => {
+      const value = hlsRequest({ hlsSegmentSeconds: 6 });
+      expect(value.options.format).toBe("hls");
+      expect(value.options.hlsSegmentSeconds).toBe(6);
+      expect(parseRenderRequest(serializeRenderRequest(value))).toEqual(value);
+    });
+
+    it("carries the segment length through to the local render config", () => {
+      expect(renderConfigFromRequest(hlsRequest({ hlsSegmentSeconds: 2 }))).toMatchObject({
+        format: "hls",
+        hlsSegmentSeconds: 2,
+      });
+    });
+
+    it("omits hlsSegmentSeconds when unset so the orchestrator default applies", () => {
+      expect(hlsRequest().options).not.toHaveProperty("hlsSegmentSeconds");
+    });
+
+    it("rejects a non-positive or fractional segment length at the wire boundary", () => {
+      const value = hlsRequest();
+      for (const hlsSegmentSeconds of [0, -4, 4.5]) {
+        expect(() =>
+          parseRenderRequest({ ...value, options: { ...value.options, hlsSegmentSeconds } }),
+        ).toThrow("hlsSegmentSeconds must be an integer >= 1");
+      }
+    });
+
+    // v1 is in-process only. `DistributedFormat` has no "hls" member, so this
+    // gate is also what makes the adapter's `format:` assignment typecheck.
+    it("refuses to convert an hls request to a distributed config", () => {
+      const value = createRenderRequest({
+        projectDir: "/project",
+        outputPath: "/output/video-hls",
+        engineConfig: DEFAULT_CONFIG,
+        options: {
+          fps: { num: 30, den: 1 },
+          quality: "standard",
+          format: "hls",
+          distributed: { width: 1920, height: 1080 },
+        },
+      });
+
+      expect(() => distributedConfigFromRequest(value)).toThrow(
+        "Distributed render does not support hls",
+      );
+    });
+
+    it("still names gif in the same rejection", () => {
+      const value = createRenderRequest({
+        projectDir: "/project",
+        outputPath: "/output/video.gif",
+        engineConfig: DEFAULT_CONFIG,
+        options: {
+          fps: { num: 30, den: 1 },
+          quality: "standard",
+          format: "gif",
+          distributed: { width: 1920, height: 1080 },
+        },
+      });
+
+      expect(() => distributedConfigFromRequest(value)).toThrow(
+        "Distributed render does not support gif",
+      );
+    });
+  });
+});
+
+describe("chromaSubsampling", () => {
+  function chromaRequest(chromaSubsampling: "420" | "444", distributed = false) {
+    return createRenderRequest({
+      projectDir: "/project",
+      outputPath: "/output/video.mp4",
+      engineConfig: DEFAULT_CONFIG,
+      options: {
+        fps: { num: 30, den: 1 },
+        quality: "standard",
+        format: "mp4",
+        chromaSubsampling,
+        ...(distributed ? { distributed: { width: 1920, height: 1080 } } : {}),
+      },
+    });
+  }
+
+  it("round-trips 4:4:4 into the local render config", () => {
+    const value = chromaRequest("444");
+    expect(parseRenderRequest(serializeRenderRequest(value))).toEqual(value);
+    expect(renderConfigFromRequest(value).chromaSubsampling).toBe("444");
+  });
+
+  it("rejects an unknown chroma value at the wire boundary", () => {
+    const value = chromaRequest("420");
+    expect(() =>
+      parseRenderRequest({ ...value, options: { ...value.options, chromaSubsampling: "422" } }),
+    ).toThrow("chromaSubsampling is invalid");
+  });
+
+  it("refuses 4:4:4 for a distributed render, which would come back 4:2:0", () => {
+    expect(() => distributedConfigFromRequest(chromaRequest("444", true))).toThrow(
+      "Distributed render does not support chromaSubsampling 444",
+    );
+  });
+
+  it("still converts an explicit 4:2:0 request to a distributed config", () => {
+    expect(distributedConfigFromRequest(chromaRequest("420", true)).format).toBe("mp4");
+  });
+});
+
+describe("segmented resume flags", () => {
+  it("carries resumeSegments and keepSegments from the request into the render config", () => {
+    const req = createRenderRequest({
+      projectDir: "/project",
+      outputPath: "/output/video.mp4",
+      engineConfig: { ...DEFAULT_CONFIG },
+      options: {
+        fps: { num: 30, den: 1 },
+        quality: "high",
+        format: "mp4",
+        gifLoop: 0,
+        strictness: "best-effort",
+        resumeSegments: true,
+        keepSegments: true,
+      },
+    });
+    const config = renderConfigFromRequest(req);
+    expect(config.resumeSegments).toBe(true);
+    expect(config.keepSegments).toBe(true);
   });
 });

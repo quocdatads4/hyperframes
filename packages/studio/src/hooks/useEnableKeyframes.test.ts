@@ -1,18 +1,19 @@
 // @vitest-environment happy-dom
 import { act, createElement, useRef } from "react";
 import { createRoot } from "react-dom/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GsapAnimation } from "@hyperframes/core/gsap-parser";
 import type { DomEditSelection } from "../components/editor/domEditingTypes";
 import {
+  applyArcKeyframeAtPlayhead,
   animatedProps,
-  buildExtendedKeyframes,
   isPlayheadWithinTween,
   promoteSetToKeyframes,
   resolveNewTweenRange,
   useEnableKeyframes,
   type EnableKeyframesSession,
 } from "./useEnableKeyframes";
+import { buildExtendedKeyframes } from "./gsapDragPositionCommit";
 import { usePlayerStore } from "../player/store/playerStore";
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -106,6 +107,13 @@ describe("isPlayheadWithinTween", () => {
 
   it("does not block when the start can't be resolved", () => {
     expect(isPlayheadWithinTween(anim({ position: "+=1" }), 99)).toBe(true);
+  });
+
+  it("uses the window GSAP plays a duration-less tween in, not its clip", () => {
+    const durationless = anim({ position: 0 });
+
+    expect(isPlayheadWithinTween(durationless, 0.4)).toBe(true);
+    expect(isPlayheadWithinTween(durationless, 5)).toBe(false);
   });
 });
 
@@ -219,6 +227,125 @@ describe("promoteSetToKeyframes — auto endpoint", () => {
   });
 });
 
+describe("applyArcKeyframeAtPlayhead", () => {
+  const arcAnim = anim({
+    id: "#el-to-0-position",
+    position: 0,
+    duration: 10,
+    ease: "none",
+    keyframes: {
+      format: "object-array",
+      keyframes: [
+        { percentage: 0, properties: { x: 0, y: 0 } },
+        { percentage: 50, properties: { x: 50, y: 50 } },
+        { percentage: 100, properties: { x: 100, y: 0 } },
+      ],
+    },
+    arcPath: {
+      enabled: true,
+      autoRotate: false,
+      segments: [{ curviness: 1 }, { curviness: 1 }],
+    },
+  });
+
+  function arcFixture(x: number, y: number) {
+    const commitMutation = vi.fn(async () => undefined);
+    const session = { commitMutation } as unknown as EnableKeyframesSession;
+    const sel = {
+      id: "el",
+      selector: "#el",
+      element: { isConnected: true } as HTMLElement,
+      dataAttributes: { duration: "10" },
+    } as DomEditSelection;
+    const iframe = {
+      contentWindow: {
+        gsap: { getProperty: (_element: Element, property: string) => (property === "x" ? x : y) },
+      },
+    } as unknown as HTMLIFrameElement;
+    return { commitMutation, iframe, sel, session };
+  }
+
+  it("removes an existing interior stop without redistributing the remaining times", async () => {
+    const fixture = arcFixture(50, 50);
+    await applyArcKeyframeAtPlayhead(fixture.session, fixture.sel, arcAnim, 5, fixture.iframe);
+    expect(fixture.commitMutation).toHaveBeenCalledWith(
+      {
+        type: "replace-with-keyframes",
+        animationId: arcAnim.id,
+        targetSelector: "#el",
+        position: 0,
+        duration: 10,
+        keyframes: [
+          { percentage: 0, properties: { x: 0, y: 0 } },
+          { percentage: 100, properties: { x: 100, y: 0 } },
+        ],
+        ease: "none",
+      },
+      { label: "Remove keyframe", softReload: true },
+    );
+  });
+
+  it("preserves the path endpoints", async () => {
+    const fixture = arcFixture(0, 0);
+    await applyArcKeyframeAtPlayhead(fixture.session, fixture.sel, arcAnim, 0, fixture.iframe);
+    expect(fixture.commitMutation).not.toHaveBeenCalled();
+  });
+
+  it("adds a temporal keyframe at the exact playhead while preserving authored times", async () => {
+    const fixture = arcFixture(25, 25);
+    await applyArcKeyframeAtPlayhead(fixture.session, fixture.sel, arcAnim, 2.5, fixture.iframe);
+    expect(fixture.commitMutation).toHaveBeenCalledWith(
+      {
+        type: "replace-with-keyframes",
+        animationId: arcAnim.id,
+        targetSelector: "#el",
+        position: 0,
+        duration: 10,
+        keyframes: [
+          { percentage: 0, properties: { x: 0, y: 0 } },
+          { percentage: 25, properties: { x: 25, y: 25 } },
+          { percentage: 50, properties: { x: 50, y: 50 } },
+          { percentage: 100, properties: { x: 100, y: 0 } },
+        ],
+        ease: "none",
+      },
+      { label: "Add keyframe", softReload: true, keyframeAction: "add" },
+    );
+  });
+
+  it("extends a duration-less arc to a later playhead, keeping the other nodes' times", async () => {
+    const fixture = arcFixture(100, 0);
+    const durationlessArc = { ...arcAnim, duration: undefined };
+
+    await applyArcKeyframeAtPlayhead(
+      fixture.session,
+      fixture.sel,
+      durationlessArc,
+      2.5,
+      fixture.iframe,
+    );
+
+    // GSAP plays it 0-0.5 s, so the nodes stay at 0, 0.25 and 0.5 s.
+    expect(fixture.commitMutation).toHaveBeenCalledWith(
+      {
+        type: "replace-with-keyframes",
+        animationId: arcAnim.id,
+        targetSelector: "#el",
+        position: 0,
+        duration: 2.5,
+        keyframes: [
+          { percentage: 0, properties: { x: 0, y: 0 } },
+          { percentage: 10, properties: { x: 50, y: 50 } },
+          { percentage: 20, properties: { x: 100, y: 0 } },
+          { percentage: 100, properties: { x: 100, y: 0 } },
+        ],
+        ease: "none",
+      },
+      { label: "Add keyframe", softReload: true, keyframeAction: "add" },
+    );
+  });
+});
+
 function renderEnableKeyframes(session: EnableKeyframesSession): () => Promise<void> {
   let enable: (() => Promise<void>) | null = null;
   function Probe() {
@@ -256,7 +383,10 @@ function makeElementSelection(): DomEditSelection {
   } as DomEditSelection;
 }
 
-function stubFlatTweenConversion(id: string): {
+function stubFlatTweenConversion(
+  id: string,
+  easeEach?: string,
+): {
   flat: GsapAnimation;
   converted: GsapAnimation;
 } {
@@ -271,6 +401,7 @@ function stubFlatTweenConversion(id: string): {
         { percentage: 0, properties: { x: 0 } },
         { percentage: 100, properties: { x: 10 } },
       ],
+      ...(easeEach && { easeEach }),
     },
   });
   flatTweenResponses(flat, converted);
@@ -278,6 +409,10 @@ function stubFlatTweenConversion(id: string): {
 }
 
 describe("useEnableKeyframes — flat tween transaction", () => {
+  beforeEach(() => {
+    usePlayerStore.setState({ timelineProjectId: "test-project", previewBooted: true });
+  });
+
   it("skips the convert reload and coalesces an outside-range terminal soft reload", async () => {
     window.location.hash = "#/project/test-project";
     usePlayerStore.setState({ currentTime: 3 });
@@ -311,6 +446,33 @@ describe("useEnableKeyframes — flat tween transaction", () => {
     expect(convertOptions?.coalesceKey).toEqual(expect.any(String));
   });
 
+  it("keeps the converted tween's easeEach when it extends it to the playhead", async () => {
+    window.location.hash = "#/project/test-project";
+    usePlayerStore.setState({ currentTime: 3 });
+    const { flat } = stubFlatTweenConversion("flat-1", "none");
+    const commitMutation = vi.fn(async () => undefined);
+    const enable = renderEnableKeyframes({
+      domEditSelection: makeElementSelection(),
+      selectedGsapAnimations: [flat],
+      previewIframeRef: {
+        current: {
+          contentWindow: { gsap: { getProperty: () => 10 } },
+        } as unknown as HTMLIFrameElement,
+      },
+      handleGsapAddAnimation: vi.fn(),
+      handleGsapConvertToKeyframes: vi.fn(async () => undefined),
+      handleGsapRemoveKeyframe: vi.fn(),
+      commitMutation,
+    });
+
+    await act(async () => enable());
+
+    expect(commitMutation.mock.calls[0]?.[0]).toMatchObject({
+      type: "replace-with-keyframes",
+      easeEach: "none",
+    });
+  });
+
   it("passes the convert coalesce key to an inside-range batch edit", async () => {
     window.location.hash = "#/project/test-project";
     usePlayerStore.setState({ currentTime: 1.5 });
@@ -342,5 +504,53 @@ describe("useEnableKeyframes — flat tween transaction", () => {
       // apply folds into one undo entry regardless of round-trip latency.
       coalesceMs: Infinity,
     });
+  });
+});
+
+describe("useEnableKeyframes — new tween on a class-only element", () => {
+  beforeEach(() => {
+    usePlayerStore.setState({ timelineProjectId: "test-project", previewBooted: true });
+  });
+
+  it("targets the selected sibling alone, not every element sharing its class", async () => {
+    window.location.hash = "#/project/test-project";
+    usePlayerStore.setState({ currentTime: 1 });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: true, json: async () => ({ animations: [] }) })),
+    );
+    const scene = document.body.appendChild(document.createElement("div"));
+    scene.id = "scene";
+    scene.innerHTML = '<i class="group"></i>'.repeat(5);
+    const groups = Array.from(scene.querySelectorAll<HTMLElement>(".group"));
+    const commitMutation = vi.fn(async () => undefined);
+    const enable = renderEnableKeyframes({
+      // A bare `.group` here writes `tl.to(".group", …)`, which animates all five
+      // siblings and reads back as all five — one add wiped the timeline.
+      domEditSelection: {
+        selector: ".group",
+        selectorIndex: 3,
+        sourceFile: "index.html",
+        element: groups[3],
+        dataAttributes: { start: "0", duration: "2" },
+      } as unknown as DomEditSelection,
+      selectedGsapAnimations: [],
+      previewIframeRef: {
+        current: {
+          contentWindow: { gsap: { getProperty: () => 7 } },
+        } as unknown as HTMLIFrameElement,
+      },
+      handleGsapAddAnimation: vi.fn(),
+      handleGsapConvertToKeyframes: vi.fn(),
+      handleGsapRemoveKeyframe: vi.fn(),
+      commitMutation,
+    });
+
+    await act(async () => enable());
+
+    const mutation = commitMutation.mock.calls[0]?.[0] as { targetSelector: string };
+    expect(mutation?.targetSelector).toBeTruthy();
+    expect(document.querySelectorAll(mutation.targetSelector)).toHaveLength(1);
+    expect(document.querySelector(mutation.targetSelector)).toBe(groups[3]);
   });
 });

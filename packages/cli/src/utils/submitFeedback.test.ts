@@ -6,7 +6,7 @@ vi.mock("./publishProject.js", () => ({
   getPublishApiBaseUrl: getPublishApiBaseUrlMock,
 }));
 
-import { submitFeedback } from "./submitFeedback.js";
+import { submitCatalogSearchMiss, submitFeedback } from "./submitFeedback.js";
 
 describe("submitFeedback", () => {
   beforeEach(() => {
@@ -16,6 +16,18 @@ describe("submitFeedback", () => {
   afterEach(() => {
     vi.clearAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  it("leaves the rating and its scale out of a report that has none", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => new Response(null, { status: 202 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await submitFeedback({ comment: "MISSING FEATURE: trim", cliVersion: "1.2.3" });
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(body).not.toHaveProperty("rating");
+    expect(body).not.toHaveProperty("rating_scale");
+    expect(body.comment).toBe("MISSING FEATURE: trim");
   });
 
   it("posts feedback to the backend endpoint", async () => {
@@ -35,7 +47,7 @@ describe("submitFeedback", () => {
       "https://api.example.com/v1/hyperframes/feedback",
       expect.objectContaining({
         method: "POST",
-        headers: { "content-type": "application/json", heygen_route: "canary" },
+        headers: { "content-type": "application/json" },
         body: JSON.stringify({
           rating: 4,
           rating_scale: 10,
@@ -46,6 +58,17 @@ describe("submitFeedback", () => {
         signal: expect.any(AbortSignal),
       }),
     );
+  });
+
+  it("sends who wrote it and the attached email, the email capped like the backend's", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => new Response(null, { status: 202 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await submitFeedback({ rating: 5, cliVersion: "1", source: "person", email: "e".repeat(300) });
+
+    const body = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+    expect(body.source).toBe("person");
+    expect(body.email).toHaveLength(254);
   });
 
   it.each([0, 10])("serializes the NPS boundary %i without changing it", async (rating) => {
@@ -96,5 +119,61 @@ describe("submitFeedback", () => {
 
     await expect(submitFeedback({ rating: 2, cliVersion: "1.2.3" })).resolves.toBeUndefined();
     await expect(submitFeedback({ rating: 3, cliVersion: "1.2.3" })).resolves.toBeUndefined();
+  });
+});
+
+describe("submitCatalogSearchMiss", () => {
+  beforeEach(() => {
+    getPublishApiBaseUrlMock.mockReturnValue("https://api.example.com");
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("posts the gap to the catalog endpoint", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => new Response(null, { status: 202 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await submitCatalogSearchMiss({
+      query: "typewriter that deletes",
+      wanted: "text that types then backspaces",
+      tier: "on-device",
+      cliVersion: "0.7.106",
+    });
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("https://api.example.com/v1/hyperframes/catalog_search_miss");
+    expect(JSON.parse(String(init?.body))).toEqual({
+      query: "typewriter that deletes",
+      wanted: "text that types then backspaces",
+      tier: "on-device",
+      cli_version: "0.7.106",
+    });
+  });
+
+  it("truncates a field the backend would reject outright", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () => new Response(null, { status: 202 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await submitCatalogSearchMiss({ query: "q".repeat(900), cliVersion: "0.7.106" });
+
+    const [, init] = fetchMock.mock.calls[0]!;
+    expect(JSON.parse(String(init?.body)).query).toHaveLength(500);
+  });
+
+  it("never throws when the forward fails", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(async () => {
+        throw new Error("offline");
+      }),
+    );
+
+    await expect(
+      submitCatalogSearchMiss({ query: "a query", cliVersion: "0.7.106" }),
+    ).resolves.toBeUndefined();
   });
 });

@@ -14,7 +14,11 @@ import {
   resolveDomEditRotationGesture,
 } from "./DomEditOverlay";
 import type { DomEditSelection } from "./domEditing";
-import { resolveResizeCenterAnchorOffset } from "./domEditOverlayGestures";
+import {
+  hoverCacheDescribesPoint,
+  resolveResizeCenterAnchorOffset,
+} from "./domEditOverlayGestures";
+import { usePlayerStore } from "../../player/store/playerStore";
 
 // React 19 warns unless the test environment opts into act().
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
@@ -239,6 +243,10 @@ function dispatchOverlayPointerDown(target: Element, clientX = 120, clientY = 80
   });
 }
 
+beforeEach(() => {
+  usePlayerStore.setState({ previewBooted: true });
+});
+
 describe("focusDomEditOverlayElement", () => {
   it("focuses the canvas overlay without scrolling", () => {
     const calls: Array<FocusOptions | undefined> = [];
@@ -278,7 +286,9 @@ describe("DomEditOverlay", () => {
     const host = document.createElement("div");
     document.body.append(host);
     const root = createRoot(host);
-    const iframeRef = { current: document.createElement("iframe") as HTMLIFrameElement | null };
+    const iframeRef: { current: HTMLIFrameElement | null } = {
+      current: document.createElement("iframe"),
+    };
     const onCanvasMouseDown = vi.fn();
     const onMarqueeSelect = vi.fn();
 
@@ -318,6 +328,44 @@ describe("DomEditOverlay", () => {
     act(() => {
       root.unmount();
     });
+    HTMLDivElement.prototype.setPointerCapture = originalPointerCapture;
+    restoreRect();
+    host.remove();
+  });
+
+  it("starts a marquee from outside the composition frame", async () => {
+    const restoreRect = stubViewportRect();
+    const originalPointerCapture = HTMLDivElement.prototype.setPointerCapture;
+    const setPointerCapture = vi.fn();
+    HTMLDivElement.prototype.setPointerCapture = setPointerCapture;
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    const iframeRef: { current: HTMLIFrameElement | null } = {
+      current: document.createElement("iframe"),
+    };
+
+    act(() => {
+      root.render(
+        React.createElement(DomEditOverlay, {
+          ...createOverlayProps({
+            iframeRef,
+            selection: null,
+            hoverSelection: null,
+            onSelectionChange: () => {},
+          }),
+          onMarqueeSelect: vi.fn(),
+        }),
+      );
+    });
+    await flushOverlayRaf();
+
+    // Negative x is outside the 0..800 composition frame but still reaches the
+    // overlay in a real pointer event when the user starts in the grey margin.
+    dispatchOverlayPointerDown(getOverlay(host), -40, 100);
+    expect(setPointerCapture).toHaveBeenCalledTimes(1);
+
+    act(() => root.unmount());
     HTMLDivElement.prototype.setPointerCapture = originalPointerCapture;
     restoreRect();
     host.remove();
@@ -428,6 +476,45 @@ describe("DomEditOverlay", () => {
       "drag",
       expect.objectContaining({ button: 0 }),
     );
+
+    act(() => {
+      root.unmount();
+    });
+    HTMLDivElement.prototype.setPointerCapture = originalPointerCapture;
+    restoreRect();
+    host.remove();
+  });
+
+  it.each([
+    { canvasInput: "overlay" as const, drags: true },
+    { canvasInput: "host" as const, drags: false },
+  ])("with body drag off, a $canvasInput canvas drags the body: $drags", async (c) => {
+    const restoreRect = stubViewportRect();
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    const selection = makeDomEditSelection();
+    const iframeRef = { current: document.createElement("iframe") as HTMLIFrameElement | null };
+    const originalPointerCapture = HTMLDivElement.prototype.setPointerCapture;
+    HTMLDivElement.prototype.setPointerCapture = () => {};
+    gestureSpies.startGesture.mockClear();
+
+    act(() => {
+      root.render(
+        React.createElement(DomEditOverlay, {
+          ...createOverlayProps({ iframeRef, selection, hoverSelection: null }),
+          allowBodyDrag: false,
+          canvasInput: c.canvasInput,
+        }),
+      );
+    });
+    await flushOverlayRaf();
+    const selectionBox = host.querySelector(
+      '[data-dom-edit-selection-box="true"]',
+    ) as HTMLDivElement;
+    dispatchOverlayPointerDown(selectionBox);
+
+    expect(gestureSpies.startGesture.mock.calls.some((call) => call[0] === "drag")).toBe(c.drags);
 
     act(() => {
       root.unmount();
@@ -610,7 +697,7 @@ describe("resolveDomEditRotationGesture", () => {
     ).toEqual({ angle: 15 });
   });
 
-  it("allows small pointer movements when the rounded angle changes", () => {
+  it("allows small pointer movements and keeps the exact angle", () => {
     const nextRotation = resolveDomEditRotationGesture({
       centerX: 0,
       centerY: 0,
@@ -622,9 +709,53 @@ describe("resolveDomEditRotationGesture", () => {
       snap: false,
     });
 
-    expect(nextRotation.angle).toBe(1.4);
+    expect(nextRotation.angle).toBe(1.432);
     expect(hasDomEditRotationChanged(0, nextRotation.angle)).toBe(true);
     expect(hasDomEditRotationChanged(0, 0)).toBe(false);
+  });
+});
+
+/**
+ * Shift-click reads the hover cache instead of hit-testing, and the cache is
+ * filled asynchronously as the pointer moves. Pass over one element on the way to
+ * another and the cache still names the one you left, so the shift-click added
+ * THAT element and the click looked like it selected something at random. The
+ * guard is what makes the cache usable only when it is about the point clicked.
+ */
+describe("hoverCacheDescribesPoint", () => {
+  const doc = new Window().document;
+
+  it("rejects a cache left behind by an element the pointer passed over", () => {
+    const passedOver = doc.createElement("div");
+    const clicked = doc.createElement("div");
+    doc.body.append(passedOver, clicked);
+
+    expect(hoverCacheDescribesPoint(passedOver, clicked)).toBe(false);
+  });
+
+  it("accepts the cache when it names the element at the point", () => {
+    const clicked = doc.createElement("div");
+    doc.body.append(clicked);
+
+    expect(hoverCacheDescribesPoint(clicked, clicked)).toBe(true);
+  });
+
+  // The resolver is allowed to hand back a clip ancestor of the raw target, which
+  // still describes the same click — rejecting it would drop the fast path on
+  // every element that has children.
+  it("accepts an ancestor of the element at the point", () => {
+    const clip = doc.createElement("div");
+    const child = doc.createElement("span");
+    clip.append(child);
+    doc.body.append(clip);
+
+    expect(hoverCacheDescribesPoint(clip, child)).toBe(true);
+  });
+
+  it("rejects a missing cache or an empty point", () => {
+    const el = doc.createElement("div");
+    expect(hoverCacheDescribesPoint(null, el)).toBe(false);
+    expect(hoverCacheDescribesPoint(el, null)).toBe(false);
   });
 });
 

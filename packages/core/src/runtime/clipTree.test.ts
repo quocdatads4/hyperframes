@@ -27,6 +27,28 @@ describe("createClipTree", () => {
     rootDuration: 10,
   };
 
+  it.each(["", "   ", "0s", "0abc", "0px", "-1s", "Infinity", "NaN"])(
+    "keeps a clip with invalid literal data-duration=%j on the fallback window",
+    (duration) => {
+      document.body.innerHTML = `
+        <div data-composition-id="root" data-duration="10" data-start="0" id="root">
+          <div data-start="0" data-duration="${duration}" id="clip"></div>
+        </div>`;
+      expect(createClipTree(params).roots.map((node) => node.id)).toContain("clip");
+    },
+  );
+
+  it("leaves out the explicit root when another composition comes first", () => {
+    document.body.innerHTML = `
+      <div data-composition-id="card" data-start="0" data-duration="3" id="card"></div>
+      <div data-composition-id="main" data-root="true" data-start="0" data-duration="10" id="main">
+        <div data-start="0" data-duration="5" id="clip"></div>
+      </div>`;
+    const ids = createClipTree(params).roots.map((node) => node.id);
+    expect(ids).toContain("card");
+    expect(ids).not.toContain("main");
+  });
+
   // Regression: id-less children (root index.html uses data-hf-id, not id) must
   // get their data-hf-id as the node id — not a synthetic `__clip-N` — so the
   // tree aligns with __clipManifest (which also keys on data-hf-id) and inline
@@ -47,4 +69,51 @@ describe("createClipTree", () => {
     expect(child!.id).not.toMatch(/^__clip-/);
     expect(child!.parentId).toBe("scene");
   });
+
+  it("keeps a timed image that starts at the end of the root, since it has its own default length", () => {
+    document.body.innerHTML = `
+      <div data-composition-id="root" data-duration="10" data-start="0" id="root">
+        <img id="late" data-start="10" />
+      </div>`;
+    const late = { resolveStartForElement: () => 10 };
+    expect(createClipTree({ ...params, startResolver: late }).roots.map((n) => n.id)).toContain(
+      "late",
+    );
+  });
+
+  it.each([
+    ["a number", { duration: 4, seek() {} }],
+    [
+      "a method that throws",
+      {
+        duration() {
+          throw new Error("boom");
+        },
+        seek() {},
+      },
+    ],
+  ])("keeps a sub-composition whose registered duration is %s on the root window", (_, tl) => {
+    document.body.innerHTML = `
+      <div data-composition-id="root" data-duration="10" data-start="0" id="root">
+        <div data-composition-id="extra" data-start="0" id="extra"></div>
+      </div>`;
+    const registry = { extra: tl } as unknown as typeof params.timelineRegistry;
+    expect(
+      createClipTree({ ...params, timelineRegistry: registry }).roots.map((n) => n.id),
+    ).toContain("extra");
+  });
+
+  it.each([10, 11])(
+    "does not replace a known zero media span with root duration (start=%s)",
+    (start) => {
+      document.body.innerHTML = `
+      <div data-composition-id="root" data-duration="100" data-start="0" id="root">
+        <video id="at-eof" data-start="0" data-media-start="${start}"></video>
+      </div>`;
+      const video = document.querySelector("video")!;
+      Object.defineProperty(video, "duration", { value: 10, configurable: true });
+
+      expect(createClipTree({ ...params, rootDuration: 100 }).roots).toEqual([]);
+    },
+  );
 });

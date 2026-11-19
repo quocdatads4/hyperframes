@@ -1,11 +1,18 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { cpSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
   escapeForMdx,
+  findSkippedReleaseTags,
+  releaseVersionsInSubjects,
   parseArgs,
   parseCommit,
   renderCommitBullet,
   renderMdxCommitBullet,
+  renderTags,
   shouldSkipCommit,
   type RawCommit,
 } from "./draft-changelog.ts";
@@ -82,7 +89,7 @@ describe("draft changelog rendering", () => {
 
     assert.equal(
       renderCommitBullet(parsed),
-      `- **CLI:** Add render hints ([1234567](${REPO_URL}/commit/1234567890abcdef1234567890abcdef12345678), [#42](${REPO_URL}/pull/42))`,
+      `- **CLI:** Add render hints ([1234567](${REPO_URL}/commit/1234567890abcdef1234567890abcdef12345678), [#42](${REPO_URL}/pull/42)).`,
     );
   });
 
@@ -91,7 +98,7 @@ describe("draft changelog rendering", () => {
 
     assert.equal(
       renderCommitBullet(parsed),
-      `- Repair playback ([1234567](${REPO_URL}/commit/1234567890abcdef1234567890abcdef12345678))`,
+      `- Repair playback ([1234567](${REPO_URL}/commit/1234567890abcdef1234567890abcdef12345678)).`,
     );
   });
 
@@ -106,5 +113,146 @@ describe("draft changelog rendering", () => {
       renderMdxCommitBullet(parsed).includes("Support \\<Update\\> blocks with \\{tags\\}"),
     );
     assert.ok(renderCommitBullet(parsed).includes("Support <Update> blocks with {tags}"));
+  });
+});
+
+describe("skipped release tags", () => {
+  const TAGS = ["0.8.49", "0.8.50", "0.8.51"];
+
+  it("names a tag the baseline skipped", () => {
+    // The v0.8.52 cut: a stale local v0.8.51 was unreachable, so describe fell
+    // back to v0.8.50 and the draft re-listed ~100 already-released commits.
+    assert.deepEqual(findSkippedReleaseTags(TAGS, "v0.8.50", "0.8.52"), ["0.8.51"]);
+  });
+
+  it("passes when the baseline is the immediately preceding release", () => {
+    assert.deepEqual(findSkippedReleaseTags(TAGS, "v0.8.51", "0.8.52"), []);
+  });
+
+  it("excludes the baseline and the release being drafted", () => {
+    // Both ends are exclusive: v0.8.50 is the baseline and v0.8.51 is the
+    // release, so neither counts as skipped.
+    assert.deepEqual(findSkippedReleaseTags(TAGS, "v0.8.50", "0.8.51"), []);
+  });
+
+  it("reports every skipped release in ascending order", () => {
+    assert.deepEqual(findSkippedReleaseTags(TAGS, "v0.8.48", "0.8.52"), [
+      "0.8.49",
+      "0.8.50",
+      "0.8.51",
+    ]);
+  });
+
+  it("compares numerically, not lexically", () => {
+    // "0.8.9" > "0.8.10" as strings; a string sort would miss this entirely.
+    assert.deepEqual(findSkippedReleaseTags(["0.8.9", "0.8.10"], "v0.8.8", "0.8.11"), [
+      "0.8.9",
+      "0.8.10",
+    ]);
+  });
+
+  it("accepts a baseline with or without the v prefix", () => {
+    assert.deepEqual(findSkippedReleaseTags(TAGS, "0.8.50", "0.8.52"), ["0.8.51"]);
+  });
+});
+
+describe("releases found by their commit", () => {
+  it("reads the version of each release commit, squash-merge suffix or not", () => {
+    assert.deepEqual(
+      releaseVersionsInSubjects([
+        "fix(core): a change (#1)",
+        "chore: release v0.9.37 (#7578)",
+        "chore: release v0.9.36",
+        "chore: release v0.9.35-alpha.1",
+      ]),
+      ["0.9.37", "0.9.36"],
+    );
+  });
+
+  it("names a release whose tag this clone never fetched", () => {
+    // The v0.9.38 cut: tags v0.9.32 to v0.9.37 were missing, so describe chose v0.9.31.
+    const released = releaseVersionsInSubjects(["chore: release v0.9.37 (#7578)"]);
+    assert.deepEqual(findSkippedReleaseTags(["0.9.31", ...released], "v0.9.31", "0.9.38"), [
+      "0.9.37",
+    ]);
+  });
+});
+
+describe("release tags", () => {
+  it("names Release once, even when a commit is scoped to the release itself", () => {
+    const commits = [
+      "fix(studio-server): inject page tags (#1)",
+      "docs(release): list the changes v1.2.3 also shipped (#2)",
+      "fix(core): wait for a loading video (#3)",
+      "fix(studio): open at Fit (#4)",
+    ].map((subject) => parseCommit(commit(subject)));
+
+    assert.deepEqual(renderTags(commits), ["Release", "Studio Server", "Core", "Studio"]);
+  });
+
+  it("names Release once whatever the case of the release scope", () => {
+    const commits = [
+      "chore(RELEASE): cut v1.2.3 (#5)",
+      "fix(core): wait for a loading video (#6)",
+    ].map((subject) => parseCommit(commit(subject)));
+
+    assert.deepEqual(renderTags(commits), ["Release", "Core"]);
+  });
+});
+
+describe("drafting from a checkout that is behind", () => {
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "tag.gpgSign=false",
+        "-c",
+        "commit.gpgSign=false",
+        ...args,
+      ],
+      {
+        cwd,
+        encoding: "utf-8",
+      },
+    ).trim();
+  const land = (cwd: string, subject: string) => {
+    writeFileSync(join(cwd, "file.txt"), subject);
+    git(cwd, "add", ".");
+    git(cwd, "commit", "-m", subject);
+  };
+
+  it("lists what merged on the remote since the checkout was last pulled", () => {
+    const dir = mkdtempSync(join(tmpdir(), "draft-changelog-"));
+    try {
+      const origin = join(dir, "origin.git");
+      const author = join(dir, "author");
+      const stale = join(dir, "stale");
+      git(dir, "init", "--bare", "-b", "main", origin);
+      git(dir, "clone", origin, author);
+      land(author, "chore: start");
+      git(author, "tag", "v0.0.1");
+      land(author, "feat: already pulled");
+      git(author, "push", "origin", "main", "--tags");
+      git(dir, "clone", origin, stale);
+      land(author, "fix: merged after the pull");
+      git(author, "push", "origin", "main");
+      cpSync(join(import.meta.dirname, "."), join(stale, "scripts"), { recursive: true });
+      writeFileSync(join(stale, "package.json"), '{"type":"module"}');
+
+      const run = execFileSync(
+        process.execPath,
+        ["--import", import.meta.resolve("tsx"), "scripts/draft-changelog.ts", "0.0.2"],
+        { cwd: stale, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] },
+      );
+      assert.match(run, /merged after the pull/i);
+      assert.match(run, /already pulled/i);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

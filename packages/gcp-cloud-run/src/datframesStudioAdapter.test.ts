@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "bun:test";
@@ -167,6 +167,69 @@ describe("DatframesStudioProjectProvider", () => {
 
     await expect(provider.resolveProject("project-1")).rejects.toThrow(
       /archive verification failed/,
+    );
+  });
+
+  it("forces immediate revalidation after invalidateProject and preserves renders directory across archive updates", async () => {
+    const cacheRoot = await mkdtemp(join(tmpdir(), "hf-datframes-provider-"));
+    temporaryRoots.push(cacheRoot);
+    let revision = "revision-1";
+    let html = "<html>v1</html>";
+    let bootstrapCalls = 0;
+
+    const provider = new DatframesStudioProjectProvider({
+      apiUrl: "https://frames-api.example.test",
+      serviceToken: "test-token",
+      cacheRoot,
+      maxArchiveBytes: 10_000,
+      requestTimeoutMs: 5_000,
+      revalidateMs: 60_000,
+      now: () => 1_000,
+      fetchImpl: async (input) => {
+        const pathname = new URL(input.toString()).pathname;
+        if (pathname.endsWith("/bootstrap")) {
+          bootstrapCalls += 1;
+          return Response.json({
+            projectId: "project-1",
+            title: "Data Project",
+            slug: "data-project",
+            sourceMode: "template",
+            templateVersionId: "template-v1",
+            dataChecksum: "a".repeat(64),
+            etag: `"${revision}"`,
+            revision,
+            entryFile: "index.html",
+          });
+        }
+        return Response.json({
+          format: "datframes-studio-archive-v1",
+          projectId: "project-1",
+          entryFile: "index.html",
+          revision,
+          dataChecksum: "a".repeat(64),
+          compiledManifestChecksum: "b".repeat(64),
+          etag: `"${revision}"`,
+          files: [archiveFile("index.html", html)],
+        });
+      },
+    });
+
+    const first = await provider.resolveProject("project-1");
+    expect(first).not.toBeNull();
+    await mkdir(join(first!.dir, "renders"), { recursive: true });
+    await writeFile(join(first!.dir, "renders", "job-1.mp4"), "fake-mp4-bytes");
+
+    revision = "revision-2";
+    html = "<html>v2</html>";
+    await provider.resolveProject("project-1");
+    expect(bootstrapCalls).toBe(1);
+
+    provider.invalidateProject("project-1");
+    const updated = await provider.resolveProject("project-1");
+    expect(bootstrapCalls).toBe(2);
+    expect(await readFile(join(updated!.dir, "index.html"), "utf8")).toBe("<html>v2</html>");
+    expect(await readFile(join(updated!.dir, "renders", "job-1.mp4"), "utf8")).toBe(
+      "fake-mp4-bytes",
     );
   });
 });

@@ -2,6 +2,9 @@ import { createStudioSaveHttpError } from "./studioSaveDiagnostics";
 import { serializeStudioFileMutation } from "./studioFileMutationCoordinator";
 import type { RecordEditInput } from "./studioFileHistory";
 import { buildProjectApiPath } from "./projectRouting";
+import { studioWriteHeaders } from "./studioFileVersion";
+import { deriveTimelineStoreKeyForDomId } from "../player/lib/timelineElementHelpers";
+import { studioApiFetch } from "./studioApiFetch";
 
 interface TimelineCompositionInsertionResult {
   path: string;
@@ -18,23 +21,25 @@ async function insertTimelineComposition(input: {
   start: number;
   track: number;
 }): Promise<TimelineCompositionInsertionResult> {
-  const current = await fetch(
+  const current = await studioApiFetch(
     buildProjectApiPath(input.projectId, `/files/${encodeURIComponent(input.targetPath)}`),
   );
   if (!current.ok) {
-    throw await createStudioSaveHttpError(current, `Failed to read ${input.targetPath}`);
+    throw await createStudioSaveHttpError(current, `Failed to read ${input.targetPath}`, {
+      path: input.targetPath,
+    });
   }
   const snapshot = (await current.json()) as { version?: string };
   if (typeof snapshot.version !== "string") throw new Error("Missing composition file version");
 
-  const response = await fetch(
+  const response = await studioApiFetch(
     buildProjectApiPath(
       input.projectId,
       `/file-mutations/insert-composition/${encodeURIComponent(input.targetPath)}`,
     ),
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...studioWriteHeaders() },
       body: JSON.stringify({
         sourcePath: input.sourcePath,
         start: input.start,
@@ -44,7 +49,9 @@ async function insertTimelineComposition(input: {
     },
   );
   if (!response.ok) {
-    throw await createStudioSaveHttpError(response, "Failed to add composition to timeline");
+    throw await createStudioSaveHttpError(response, "Failed to add composition to timeline", {
+      path: input.targetPath,
+    });
   }
   return (await response.json()) as TimelineCompositionInsertionResult;
 }
@@ -68,14 +75,13 @@ export async function commitTimelineCompositionInsertion(input: {
     try {
       await input.recordEdit({
         label: "Add composition to timeline",
-        kind: "timeline",
         files: { [input.targetPath]: { before: result.before, after: result.after } },
       });
     } catch (error) {
       await input.writeFile(input.targetPath, result.before, result.after);
       throw error;
     }
-    input.selectHost(`${input.targetPath}#${result.hostId}`);
+    input.selectHost(deriveTimelineStoreKeyForDomId(result.hostId, input.targetPath));
     try {
       input.resync?.();
     } catch (error) {

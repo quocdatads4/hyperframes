@@ -47,6 +47,10 @@ export function editabilityForProvenance(provenance?: GsapProvenance): KeyframeE
   return "unroll";
 }
 
+export function authorsKeyframes(anim: GsapAnimation): boolean {
+  return anim.keyframes !== undefined || anim.hasUnresolvedKeyframes === true;
+}
+
 export interface GsapAnimation {
   id: string;
   targetSelector: string;
@@ -57,9 +61,17 @@ export interface GsapAnimation {
   properties: Record<string, number | string>;
   fromProperties?: Record<string, number | string>;
   duration?: number;
+  /** A `duration` was authored but is not a static number: unknown, not the 0.5s default. */
+  durationUnresolved?: boolean;
   ease?: string;
   /** Non-editable GSAP config (stagger, yoyo, repeat, etc.) preserved for round-trips. */
   extras?: Record<string, unknown>;
+  inspectionTiming?: {
+    repeat: number | null;
+    repeatDelay: number | null;
+    delay: number | null;
+    stagger: { each: number } | { amount: number } | null;
+  };
   /** Native GSAP keyframes data — present when the tween uses keyframes: { ... }. */
   keyframes?: GsapKeyframesData;
   /** Arc motion path config — present when the tween uses motionPath for curved position interpolation. */
@@ -68,6 +80,7 @@ export interface GsapAnimation {
   hasUnresolvedKeyframes?: boolean;
   /** True when the tween's target selector couldn't be statically resolved (dynamic). */
   hasUnresolvedSelector?: boolean;
+  hasPartialSelector?: boolean;
   /** Absolute start time computed by walking the timeline chain (handles +=, -=, <, >, labels). */
   resolvedStart?: number;
   /** True when no position arg was authored — the tween is sequentially placed by GSAP. */
@@ -90,13 +103,71 @@ export interface GsapPercentageKeyframe {
   ease?: string;
 }
 
+export interface WritableGsapPercentageKeyframe extends GsapPercentageKeyframe {
+  auto?: boolean;
+}
+
+/**
+ * A keyframe that still knows which tween emitted it, and where inside that
+ * tween it sat. Merging several tweens onto one timeline row drops that
+ * provenance unless it rides along on the keyframe, and an editor needs it to
+ * route an edit back to the animation the user actually clicked. Required, not
+ * optional: a keyframe that reaches a merge without it cannot be attributed at
+ * all, and silently treating that as "no collision" is how an edit lands on the
+ * wrong tween.
+ */
+export interface SourcedGsapPercentageKeyframe extends GsapPercentageKeyframe {
+  animationId: string;
+  tweenPercentage: number;
+}
+
+/**
+ * Collapse duplicate percentage entries before serializing an object literal.
+ * Matches addKeyframeToScript's merge contract: later properties/ease win while
+ * unrelated authored properties and an earlier ease survive. An explicit later
+ * `auto` value wins, and output is always sorted by percentage.
+ */
+export function mergePercentageKeyframes(
+  keyframes: readonly WritableGsapPercentageKeyframe[],
+): WritableGsapPercentageKeyframe[] {
+  const byPercentage = new Map<number, WritableGsapPercentageKeyframe>();
+  for (const keyframe of keyframes) {
+    const existing = byPercentage.get(keyframe.percentage);
+    if (!existing) {
+      byPercentage.set(keyframe.percentage, {
+        ...keyframe,
+        properties: { ...keyframe.properties },
+      });
+      continue;
+    }
+    existing.properties = { ...existing.properties, ...keyframe.properties };
+    if (keyframe.ease !== undefined) existing.ease = keyframe.ease;
+    if (keyframe.auto !== undefined) existing.auto = keyframe.auto;
+  }
+  return [...byPercentage.values()].sort((a, b) => a.percentage - b.percentage);
+}
+
+export function distributeArrayKeyframes(
+  channels: ReadonlyMap<string, readonly (number | string)[]>,
+): GsapPercentageKeyframe[] {
+  return mergePercentageKeyframes(
+    [...channels].flatMap(([key, values]) =>
+      values.map((value, index) => ({
+        percentage: values.length > 1 ? Math.round((index / (values.length - 1)) * 100) : 0,
+        properties: { [key]: value },
+      })),
+    ),
+  );
+}
+
 export type GsapKeyframeFormat = "percentage" | "object-array" | "simple-array";
 
-export interface GsapKeyframesData {
+export interface GsapKeyframesData<K extends GsapPercentageKeyframe = GsapPercentageKeyframe> {
   format: GsapKeyframeFormat;
-  keyframes: GsapPercentageKeyframe[];
+  keyframes: K[];
   ease?: string;
   easeEach?: string;
+  fromMotionPath?: true;
 }
 
 export interface ArcPathSegment {
@@ -178,10 +249,21 @@ export interface SplitAnimationsResult {
 
 // ── Serialization ───────────────────────────────────────────────────────────
 
+/**
+ * Construct executable JavaScript from trusted composition-author inputs.
+ * __raw: values, preamble, postamble, and timelineVar are code-bearing inputs
+ * and are deliberately not sanitized. Never populate them from untrusted data.
+ * Quoting ordinary values does not sandbox authored code or its side effects.
+ */
 export function serializeGsapAnimations(
   animations: GsapAnimation[],
   timelineVar = "tl",
-  options?: { includeMediaSync?: boolean; preamble?: string; postamble?: string },
+  options?: {
+    includeMediaSync?: boolean;
+    mediaElementLeadSeconds?: number;
+    preamble?: string;
+    postamble?: string;
+  },
 ): string {
   const sorted = [...animations].sort((a, b) => {
     const aNum =
@@ -192,7 +274,7 @@ export function serializeGsapAnimations(
   });
   // fallow-ignore-next-line complexity
   const lines = sorted.map((anim) => {
-    const selector = `"${anim.targetSelector}"`;
+    const selector = scriptJson(anim.targetSelector);
     const props: Record<string, number | string> = { ...anim.properties };
     if (anim.duration !== undefined) props.duration = anim.duration;
     if (anim.ease) props.ease = anim.ease;
@@ -206,7 +288,7 @@ export function serializeGsapAnimations(
         propsStr = propsStr.slice(0, -2) + `, ${extrasStr} }`;
       }
     }
-    const posStr = typeof anim.position === "string" ? `"${anim.position}"` : anim.position;
+    const posStr = scriptJson(anim.position);
     switch (anim.method) {
       case "set":
         // A global set is a base `gsap.set` — off the timeline, no position arg.
@@ -235,7 +317,7 @@ export function serializeGsapAnimations(
         const mediaTime = time - start;
         if (time >= start && time < end) {
           if (Math.abs(media.currentTime - mediaTime) > 0.1) {
-            media.currentTime = mediaTime;
+            media.currentTime = mediaTime + ${Number(options.mediaElementLeadSeconds ?? 0)};
           }
           if (media.paused && !${timelineVar}.paused()) {
             media.play().catch(function() {});
@@ -256,16 +338,36 @@ ${lines.join("\n")}${mediaSync}${postamble}
   `;
 }
 
+/** `JSON.stringify` whose output cannot end, or open a comment in, the inline script it lands in. */
+export function scriptJson(value: unknown): string {
+  return String(JSON.stringify(value)).replace(/<(\/script|!--)/gi, "\\u003c$1");
+}
+
+const TWEEN_METHODS: ReadonlySet<string> = new Set<GsapMethod>(["set", "to", "from", "fromTo"]);
+
+/** The method name, checked against the four tween methods because it is emitted as code. */
+export function tweenMethodCode(method: string): GsapMethod {
+  if (!TWEEN_METHODS.has(method))
+    throw new TypeError(`Unsupported tween method: ${scriptJson(method)}`);
+  return method as GsapMethod;
+}
+
 export function serializeValue(value: unknown): string {
   if (typeof value === "string" && value.startsWith("__raw:")) {
     return value.slice(6);
   }
-  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "string") return scriptJson(value);
   return String(value);
 }
 
+export function plainPercentKey(percentage: number): string {
+  const text =
+    Math.abs(percentage) < 1e-6 ? percentage.toFixed(20).replace(/\.?0+$/, "") : String(percentage);
+  return `${text}%`;
+}
+
 export function safeJsKey(key: string): string {
-  return /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(key) ? key : JSON.stringify(key);
+  return /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(key) ? key : scriptJson(key);
 }
 
 function serializeObject(obj: Record<string, number | string>): string {
@@ -515,6 +617,24 @@ export function resolveConversionProps(
 
 // ── Arc path serialization helpers (shared by recast + acorn writers) ─────────
 
+/** Rejects a motion path whose coordinates or curviness are not numbers, since they are emitted as code. */
+export function assertMotionPathNumbers(config: {
+  waypoints: Array<{ x: number; y: number }>;
+  segments: ArcPathSegment[];
+}): void {
+  const points = [
+    ...config.waypoints,
+    ...config.segments.flatMap((s) => [s.cp1, s.cp2].filter((p) => p !== undefined)),
+  ];
+  const values = [
+    ...points.flatMap((p): unknown[] => [p.x, p.y]),
+    ...config.segments.map((s): unknown => s.curviness ?? 1),
+  ];
+  if (values.some((v) => typeof v !== "number")) {
+    throw new TypeError("Motion path coordinates and curviness must be numbers");
+  }
+}
+
 function numericXY(props: Record<string, number | string>): { x: number; y: number } | null {
   const vx = props.x;
   const vy = props.y;
@@ -583,6 +703,7 @@ export function buildMotionPathObjectCode(config: {
   segments: ArcPathSegment[];
   autoRotate: boolean | number;
 }): string {
+  assertMotionPathNumbers(config);
   const { waypoints, segments, autoRotate } = config;
   const arSuffix = autoRotateSuffix(autoRotate);
   // GSAP's simple `path` array supports only ONE scalar `curviness` for the whole

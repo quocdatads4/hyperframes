@@ -1,9 +1,11 @@
 import { statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import {
+  DISTRIBUTED_FPS,
   formatRenderOutputTimestamp,
   fpsToNumber,
   isAspectAgnosticResolutionAlias,
+  isDistributedFps,
   normalizeResolutionFlag,
   parseFps,
   type CanvasResolution,
@@ -15,24 +17,42 @@ import {
   MAX_VP9_CPU_USED,
   MIN_VP9_CPU_USED,
   isVideoFrameFormat,
+  type ChromaSubsampling,
+  type ProresProfile,
   type VideoFrameFormat,
 } from "@hyperframes/engine";
 import { errorBox } from "../../ui/format.js";
+import { parseDeliveryFlags } from "../../utils/deliveryFlags.js";
+import { parseEnumFlag } from "../../cloud/parsing.js";
 import { failUsage } from "../../utils/commandResult.js";
 import { resolveProject } from "../../utils/project.js";
 import {
-  hasExplicitCompositionArg,
   parseGifLoopArg,
+  parseHlsSegmentSecondsArg,
   resolveBrowserTimeoutMsArg,
-  resolveCompositionEntryArg,
   resolveDefaultFpsArg,
 } from "../../utils/renderArgs.js";
+import {
+  hasExplicitCompositionArg,
+  resolveCompositionEntryArg,
+} from "../../utils/compositionEntry.js";
 import { normalizeSkillSlug } from "../../telemetry/skill.js";
+import { loadProjectConfig } from "../../utils/projectConfig.js";
+import { type CatalogUsage, summarizeCatalogUsage } from "../../utils/catalogUsage.js";
 
-const VALID_QUALITY = new Set(["draft", "standard", "high"]);
-const RENDER_FORMATS = ["mp4", "webm", "mov", "png-sequence", "gif"] as const;
+const QUALITY_ALIASES = {
+  draft: { quality: "draft" as const },
+  standard: { quality: "standard" as const },
+  high: { quality: "high" as const },
+  looks: { quality: "standard" as const, crf: 16 },
+  delivery: { quality: "high" as const },
+} as const;
+const RENDER_FORMATS = ["mp4", "webm", "mov", "png-sequence", "gif", "hls"] as const;
 const VALID_FORMAT = new Set<string>(RENDER_FORMATS);
-const RENDER_FORMAT_LABEL = "mp4, webm, mov, png-sequence, or gif";
+const RENDER_FORMAT_LABEL = "mp4, webm, mov, png-sequence, gif, or hls";
+
+/** Mirrors the producer's `DEFAULT_HLS_SEGMENT_SECONDS`; the plan is built before the producer loads. */
+const DEFAULT_HLS_SEGMENT_SECONDS = 4;
 
 export type RenderFormat = (typeof RENDER_FORMATS)[number];
 export type RenderQuality = "draft" | "standard" | "high";
@@ -46,6 +66,8 @@ const FORMAT_EXT: Record<RenderFormat, string> = {
   mov: ".mov",
   "png-sequence": "",
   gif: ".gif",
+  // Directory output, like png-sequence: playlists and .ts segments go inside.
+  hls: "",
 };
 
 export interface RenderCommandArgs {
@@ -57,21 +79,34 @@ export interface RenderCommandArgs {
   skill?: string;
   format?: string;
   "gif-loop"?: string;
+  "hls-segment-seconds"?: string;
   "video-frame-format"?: string;
+  "page-motion-blur"?: string;
   workers?: string;
   docker?: boolean;
   hdr?: boolean;
   sdr?: boolean;
   crf?: string;
+  start?: string;
+  end?: string;
   "video-bitrate"?: string;
+  "keyframe-interval"?: string;
+  "max-bitrate"?: string;
+  "buffer-size"?: string;
+  "prores-profile"?: string;
   "vp9-cpu-used"?: string;
+  "chroma-subsampling"?: string;
   gpu?: boolean;
   "browser-gpu"?: boolean;
   quiet?: boolean;
   debug?: boolean;
   "best-effort"?: boolean;
+  wait?: boolean;
   strict?: boolean;
   "strict-all"?: boolean;
+  "include-outside-files"?: boolean;
+  "refuse-outside-files"?: boolean;
+  "lint-verbose"?: boolean;
   "max-concurrent-renders"?: string;
   variables?: string;
   "variables-file"?: string;
@@ -85,6 +120,8 @@ export interface RenderCommandArgs {
   "browser-timeout"?: string;
   "protocol-timeout"?: string;
   "player-ready-timeout"?: string;
+  resume?: boolean;
+  "keep-segments"?: boolean;
   "low-memory-mode"?: boolean;
   "experimental-fast-capture"?: boolean;
   "frames-cache-dir"?: string;
@@ -96,12 +133,20 @@ export interface RenderPlan {
   renderTarget: string;
   fps: Fps;
   quality: RenderQuality;
+  qualityPreset: keyof typeof QUALITY_ALIASES;
   authoringSkill?: string;
   invalidAuthoringSkill?: string;
+  /** Which resolution step provided authoringSkill: an explicit --skill flag, or the project's own config. */
+  authoringSkillSource?: "flag" | "project-config";
+  /** Catalog items installed in this project, and those the entry reaches. */
+  catalogUsage: CatalogUsage;
   format: RenderFormat;
   gifLoop?: number;
   gifFpsCapped: boolean;
+  /** HLS target segment length in seconds; only set for `format: "hls"`. */
+  hlsSegmentSeconds?: number;
   videoFrameFormat: VideoFrameFormat;
+  pageMotionBlur?: "off";
   outputResolution?: CanvasResolution;
   outputResolutionAspectAgnostic: boolean;
   outputResolutionRaw?: string;
@@ -118,8 +163,16 @@ export interface RenderPlan {
   useGpu: boolean;
   browserGpuMode: BrowserGpuMode;
   quiet: boolean;
+  lintVerbose: boolean;
   debug: boolean;
+  /** Segmented capture: reuse a prior run's validated segments. */
+  resumeSegments: boolean;
+  /** Segmented capture: keep the segment directory after success. */
+  keepSegments: boolean;
   bestEffort: boolean;
+  includeOutsideScripts: boolean;
+  refuseOutsideFiles: boolean;
+  waitForRenderSlot: boolean;
   batchJson: boolean;
   effectiveQuiet: boolean;
   strictAll: boolean;
@@ -127,6 +180,12 @@ export interface RenderPlan {
   crf?: number;
   vp9CpuUsed?: number;
   videoBitrate?: string;
+  keyframeIntervalSeconds?: number;
+  range?: RenderRange;
+  proresProfile?: ProresProfile;
+  maxBitrate?: string;
+  bufferSize?: string;
+  chromaSubsampling: ChromaSubsampling;
   hdrMode: HdrMode;
   pageSideCompositing: boolean;
   experimentalFastCapture: boolean;
@@ -134,6 +193,8 @@ export interface RenderPlan {
   variablesFileArg?: string;
   strictVariables: boolean;
   environment: Readonly<Record<string, string>>;
+  /** Names of HF_-/HYPERFRAMES_-prefixed env vars present at plan time (never values), capped at 20. */
+  hfEnvOverrides: readonly string[];
 }
 
 function formatFpsParseError(
@@ -161,6 +222,53 @@ function parseRenderFormat(input: string): RenderFormat | undefined {
   return RENDER_FORMATS.find((format) => format === input);
 }
 
+export interface RenderRange {
+  startSeconds: number;
+  endSeconds?: number;
+}
+
+function parseRenderRange(
+  args: Pick<RenderCommandArgs, "start" | "end">,
+  format: RenderFormat,
+  fps: Fps,
+  hdr: boolean | undefined,
+): RenderRange | undefined {
+  if (args.start === undefined && args.end === undefined) return undefined;
+  const seconds = (flag: string, raw: string): number => {
+    const parsed = raw.trim() === "" ? Number.NaN : Number(raw);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      errorBox(`Invalid ${flag}`, `Got "${raw}". Must be a number of seconds, 0 or more.`);
+      failUsage();
+    }
+    return parsed;
+  };
+  const startSeconds = args.start === undefined ? 0 : seconds("--start", args.start);
+  const endSeconds = args.end === undefined ? undefined : seconds("--end", args.end);
+  if (endSeconds !== undefined && endSeconds <= startSeconds) {
+    errorBox("Invalid range", `--end (${endSeconds}) must be after --start (${startSeconds}).`);
+    failUsage();
+  }
+  const limit = rangeLimit(format, fps, hdr);
+  if (limit) {
+    errorBox(
+      "A range renders what chunked renders can",
+      limit,
+      "Remove --start/--end to render the whole film.",
+    );
+    failUsage();
+  }
+  return { startSeconds, endSeconds };
+}
+
+function rangeLimit(format: RenderFormat, fps: Fps, hdr: boolean | undefined): string | undefined {
+  if (format !== "mp4") return `--start/--end render MP4 only, not ${format}.`;
+  if (fps.den !== 1 || !isDistributedFps(fps.num)) {
+    return `--start/--end need a whole frame rate in ${DISTRIBUTED_FPS.join(", ")}, not ${fps.num}/${fps.den}.`;
+  }
+  if (hdr) return "--start/--end render SDR only, not --hdr.";
+  return undefined;
+}
+
 function positiveInteger(raw: string, title: string, message: string, min = 1): number {
   const parsed = Number(raw);
   if (!Number.isInteger(parsed) || parsed < min) {
@@ -170,9 +278,58 @@ function positiveInteger(raw: string, title: string, message: string, min = 1): 
   return parsed;
 }
 
+const HF_ENV_OVERRIDE_RE = /^(HF|HYPERFRAMES)_/;
+const MAX_REPORTED_ENV_OVERRIDES = 20;
+
+/** HF_-prefixed keys the CLI sets for itself during bootstrap rather than keys an operator
+ * set to steer a render: cli.ts points shaderTransitionWorkerPool at the worker bundled
+ * next to cli.js, so that key is present on essentially every built-CLI run and says
+ * nothing about how this render was configured. */
+const CLI_INTERNAL_HF_ENV_KEYS = new Set(["HF_SHADER_WORKER_ENTRY"]);
+
+/** Names (never values, since some could hold paths or secrets) of HF_-/HYPERFRAMES_-prefixed
+ * env vars present when this plan resolves, snapshotted before this render's own preflight
+ * injects its ffmpeg/ffprobe path overrides, which would otherwise always read back as
+ * operator-set. */
+function resolveHfEnvOverrides(): readonly string[] {
+  return Object.keys(process.env)
+    .filter((name) => HF_ENV_OVERRIDE_RE.test(name) && !CLI_INTERNAL_HF_ENV_KEYS.has(name))
+    .sort()
+    .slice(0, MAX_REPORTED_ENV_OVERRIDES);
+}
+
+/** 4:4:4 needs SDR MP4 from the software encoder; the producer refuses other pairings too. */
+function parseChromaSubsamplingArg(
+  args: RenderCommandArgs,
+  format: RenderFormat,
+): ChromaSubsampling {
+  const raw = args["chroma-subsampling"] ?? "420";
+  if (raw !== "420" && raw !== "444") {
+    errorBox("Invalid chroma-subsampling", `Got "${raw}". Must be 420 or 444.`);
+    failUsage();
+  }
+  if (raw === "420") return raw;
+  const conflict =
+    format !== "mp4" ? `--format ${format}` : args.gpu ? "--gpu" : args.hdr ? "--hdr" : undefined;
+  if (conflict) {
+    errorBox(
+      "Unsupported 4:4:4 output",
+      `--chroma-subsampling 444 cannot be combined with ${conflict}. ` +
+        "4:4:4 needs SDR MP4 from the software encoder (libx264).",
+      `Drop ${conflict}, or drop --chroma-subsampling 444.`,
+    );
+    failUsage();
+  }
+  return raw;
+}
+
 /** Parse and validate command input into an immutable execution plan. */
 // fallow-ignore-next-line complexity
 export function createRenderPlan(args: RenderCommandArgs, now = new Date()): RenderPlan {
+  const pageMotionBlur = parseEnumFlag(args["page-motion-blur"], ["off"] as const, {
+    flag: "--page-motion-blur",
+  });
+  const hfEnvOverrides = resolveHfEnvOverrides();
   const hasExplicitComposition = hasExplicitCompositionArg(args.composition);
   const project = resolveProject(args.dir, { requireIndex: !hasExplicitComposition });
   const entryFile = resolveCompositionEntryArg(args.composition, project.dir, statSync);
@@ -185,18 +342,39 @@ export function createRenderPlan(args: RenderCommandArgs, now = new Date()): Ren
   }
   let fps = fpsParse.value;
 
-  const qualityRaw = args.quality ?? "standard";
-  if (!VALID_QUALITY.has(qualityRaw)) {
-    errorBox("Invalid quality", `Got "${qualityRaw}". Must be draft, standard, or high.`);
+  const qualityRaw = args.quality ?? "looks";
+  if (!(qualityRaw in QUALITY_ALIASES)) {
+    errorBox(
+      "Invalid quality",
+      `Got "${qualityRaw}". Must be draft, looks, delivery, standard, or high.`,
+    );
     failUsage();
   }
-  const quality = qualityRaw as RenderQuality;
+  const qualityAlias = QUALITY_ALIASES[qualityRaw as keyof typeof QUALITY_ALIASES];
+  const quality = qualityAlias.quality;
 
-  const authoringSkill = normalizeSkillSlug(args.skill);
+  // Attribution resolves the explicit --skill flag first, then falls back to
+  // the owning skill persisted in hyperframes.json — so re-renders, batch
+  // renders, and `npm run render` (which never re-pass the flag) stay
+  // attributed to the workflow that created the project.
+  const flagSkill = normalizeSkillSlug(args.skill);
+  const projectConfigSkill = loadProjectConfig(project.dir).authoringSkill;
+  const authoringSkill = flagSkill ?? projectConfigSkill;
   const invalidAuthoringSkill =
-    typeof args.skill === "string" && args.skill.trim() !== "" && !authoringSkill
+    typeof args.skill === "string" && args.skill.trim() !== "" && !flagSkill
       ? args.skill
       : undefined;
+  // Same flag-then-project-config resolution as authoringSkill above, named
+  // for telemetry (which attribution actually won, not just its value).
+  const authoringSkillSource = flagSkill
+    ? "flag"
+    : projectConfigSkill
+      ? "project-config"
+      : undefined;
+
+  // Resolved here, once, from the same entry the render will use: batch rows
+  // vary only their variables, so every row shares this composition tree.
+  const catalogUsage = summarizeCatalogUsage(project.dir, renderTarget);
 
   const formatRaw = args.format ?? "mp4";
   const format = parseRenderFormat(formatRaw);
@@ -217,6 +395,15 @@ export function createRenderPlan(args: RenderCommandArgs, now = new Date()): Ren
   }
   const gifLoop = gifLoopParse.value ?? (format === "gif" ? 0 : undefined);
 
+  const hlsSegmentParse = parseHlsSegmentSecondsArg(args["hls-segment-seconds"]);
+  if (!hlsSegmentParse.ok) {
+    errorBox("Invalid hls-segment-seconds", hlsSegmentParse.message);
+    failUsage();
+  }
+  const hlsSegmentSeconds =
+    format === "hls" ? (hlsSegmentParse.value ?? DEFAULT_HLS_SEGMENT_SECONDS) : undefined;
+  const chromaSubsampling = parseChromaSubsamplingArg(args, format);
+
   const videoFrameFormatRaw = args["video-frame-format"] ?? "auto";
   if (!isVideoFrameFormat(videoFrameFormatRaw)) {
     errorBox(
@@ -233,8 +420,9 @@ export function createRenderPlan(args: RenderCommandArgs, now = new Date()): Ren
     if (!outputResolution) {
       errorBox(
         "Invalid resolution",
-        `Got "${args.resolution}". Must be one of: landscape, portrait, landscape-4k, portrait-4k, square, square-4k ` +
-          `(or aliases 1080p, 4k, uhd, 1080p-square, square-1080p, 4k-square).`,
+        `Got "${args.resolution}". Must be one of: landscape, portrait, landscape-4k, portrait-4k, square, square-4k, ` +
+          `landscape-1440p, portrait-1440p, square-1440p ` +
+          `(or aliases 1080p, 4k, uhd, 1440p, qhd, 1080p-square, square-1080p, 4k-square, 1440p-portrait, 1440p-square).`,
       );
       failUsage();
     }
@@ -250,6 +438,24 @@ export function createRenderPlan(args: RenderCommandArgs, now = new Date()): Ren
   }
   if (args.hdr && args.sdr) {
     errorBox("Conflicting flags", "--hdr and --sdr are mutually exclusive.");
+    failUsage();
+  }
+  if (format === "hls" && args.hdr) {
+    errorBox(
+      "Unsupported HLS output",
+      "--hdr cannot be combined with --format hls. HLS output is SDR only (H.264 + AAC in MPEG-TS); HDR10 would need fMP4 segments and HEVC.",
+      "Render HDR to MP4, or drop --hdr.",
+    );
+    failUsage();
+  }
+  // Fixed-length segments come from the software encoder's forced-keyframe
+  // lock, which GPU encoders ignore; the producer rejects the pair too.
+  if (format === "hls" && args.gpu) {
+    errorBox(
+      "Unsupported HLS output",
+      "--gpu cannot be combined with --format hls. Fixed-length segments require the software encoder's forced-keyframe lock, which GPU encoders ignore.",
+      "Re-run without --gpu.",
+    );
     failUsage();
   }
 
@@ -340,7 +546,7 @@ export function createRenderPlan(args: RenderCommandArgs, now = new Date()): Ren
         )
       : 1;
 
-  const rendersDir = resolve("renders");
+  const rendersDir = join(project.dir, "renders");
   const ext = FORMAT_EXT[format];
   const timestamp = formatRenderOutputTimestamp(now);
   const batchOutputTemplate = args.output
@@ -375,7 +581,11 @@ export function createRenderPlan(args: RenderCommandArgs, now = new Date()): Ren
           `Got "${args.crf}". Must be a non-negative integer.`,
           0,
         )
-      : undefined;
+      : format === "mov" || args["video-bitrate"]
+        ? undefined
+        : "crf" in qualityAlias
+          ? qualityAlias.crf
+          : undefined;
   let vp9CpuUsed: number | undefined;
   if (args["vp9-cpu-used"] != null) {
     const parsed = Number(args["vp9-cpu-used"]);
@@ -395,7 +605,36 @@ export function createRenderPlan(args: RenderCommandArgs, now = new Date()): Ren
     );
     failUsage();
   }
+  if (format === "mov" && (crf !== undefined || videoBitrate !== undefined)) {
+    const flag = crf !== undefined ? "--crf" : "--video-bitrate";
+    errorBox(
+      "Unsupported ProRes rate control",
+      `${flag} does not apply to MOV. MOV rate is set by the ProRes profile; see --prores-profile.`,
+      `Remove ${flag}, or choose MP4/WebM when you need CRF or target-bitrate control.`,
+    );
+    failUsage();
+  }
 
+  const delivery = parseDeliveryFlags(args);
+  const { proresProfile, ...mp4Delivery } = delivery;
+  if (proresProfile !== undefined && format !== "mov") {
+    errorBox(
+      "ProRes profile applies to MOV",
+      `--prores-profile sets the ProRes profile of a MOV file, not ${format}.`,
+      "Remove it, or render --format mov.",
+    );
+    failUsage();
+  }
+  if (Object.keys(mp4Delivery).length > 0 && format !== "mp4") {
+    errorBox(
+      "Delivery options apply to MP4",
+      "--keyframe-interval, --max-bitrate and --buffer-size set how the MP4 encoder delivers the file.",
+      "Remove them, or render --format mp4.",
+    );
+    failUsage();
+  }
+
+  const range = parseRenderRange(args, format, fps, args.hdr);
   const quiet = args.quiet ?? false;
   const batchJson = args.json ?? false;
   return Object.freeze({
@@ -404,12 +643,17 @@ export function createRenderPlan(args: RenderCommandArgs, now = new Date()): Ren
     renderTarget,
     fps,
     quality,
+    qualityPreset: qualityRaw as keyof typeof QUALITY_ALIASES,
     authoringSkill,
     invalidAuthoringSkill,
+    authoringSkillSource,
+    catalogUsage,
     format,
     gifLoop,
     gifFpsCapped,
+    hlsSegmentSeconds,
     videoFrameFormat: videoFrameFormatRaw,
+    pageMotionBlur,
     outputResolution,
     outputResolutionAspectAgnostic,
     outputResolutionRaw: args.resolution,
@@ -426,15 +670,24 @@ export function createRenderPlan(args: RenderCommandArgs, now = new Date()): Ren
     useGpu,
     browserGpuMode,
     quiet,
+    lintVerbose: args["lint-verbose"] ?? false,
     debug: args.debug ?? false,
+    resumeSegments: args.resume ?? false,
+    keepSegments: args["keep-segments"] ?? false,
     bestEffort: args["best-effort"] ?? true,
+    includeOutsideScripts: args["include-outside-files"] ?? false,
+    refuseOutsideFiles: args["refuse-outside-files"] ?? false,
+    waitForRenderSlot: args.wait ?? true,
     batchJson,
-    effectiveQuiet: quiet || (batchPath != null && batchJson),
+    effectiveQuiet: quiet || batchJson,
     strictAll: args["strict-all"] ?? false,
     strictErrors: (args.strict ?? false) || (args["strict-all"] ?? false),
     crf,
     vp9CpuUsed,
     videoBitrate,
+    ...delivery,
+    range,
+    chromaSubsampling,
     hdrMode: args.sdr ? "force-sdr" : args.hdr ? "force-hdr" : "auto",
     pageSideCompositing: args["page-side-compositing"] !== false,
     experimentalFastCapture: args["experimental-fast-capture"] === true,
@@ -442,6 +695,7 @@ export function createRenderPlan(args: RenderCommandArgs, now = new Date()): Ren
     variablesFileArg: args["variables-file"],
     strictVariables: args["strict-variables"] ?? false,
     environment: Object.freeze(environment),
+    hfEnvOverrides,
   });
 }
 
@@ -455,7 +709,6 @@ export function renderOutputDirectory(plan: RenderPlan): string {
 
 /** Resolve browser GPU mode from Docker, CLI, env, then the auto default. */
 // Re-exported by render.ts to preserve its tested public seam.
-// fallow-ignore-next-line unused-export
 export function resolveBrowserGpuForCli(
   useDocker: boolean,
   browserGpuArg: boolean | undefined,

@@ -1,36 +1,50 @@
-import { join, relative, resolve } from "node:path";
-import { setCommandExitCode } from "../utils/commandResult.js";
+import { assertLegacyPublishOwner, checkPublishTransition } from "../share/publishTransition.js";
+import { join, posix, relative, resolve } from "node:path";
+import { failCommand, setCommandExitCode } from "../utils/commandResult.js";
 import { existsSync } from "node:fs";
-import { defineCommand } from "citty";
-import * as clack from "@clack/prompts";
+import { terminalLines, terminalText } from "@hyperframes/core";
+import { defineCommand } from "../utils/defineCommand.js";
+import * as clack from "../ui/prompts.js";
 
 import type { Example } from "./_examples.js";
 import { c } from "../ui/colors.js";
-import { lintProject } from "../utils/lintProject.js";
-import { formatLintFindings } from "../utils/lintFormat.js";
+import { isUnattended } from "../utils/attendedTerminal.js";
+import {
+  definitiveEntryMismatchComposition,
+  hasDefinitiveEntryMismatch,
+  lintProject,
+} from "../utils/lintProject.js";
+import { formatLintStartupMessage } from "../utils/lintFormat.js";
+import { envCredentialVar } from "../auth/resolver.js";
 import {
   buildPublishFileMap,
   publishProjectArchive,
+  resolvePublishCredential,
   zipPublishFileMap,
 } from "../utils/publishProject.js";
 import { bakeMediaProxies } from "../utils/publishProxyBake.js";
+import type { ResolvedCredential } from "../auth/resolver.js";
 import { resolveAutoProxy } from "../utils/projectConfig.js";
-import { tryResolveCredential } from "../auth/index.js";
 import {
   ensureProjectId,
   readProjectLink,
   readTeamProject,
   writeTeamProject,
 } from "../utils/projectLink.js";
+import { cliSourced } from "../utils/sourceTag.js";
+import { type LeftOutReference, outsideFilesNotice } from "../utils/leftOutReference.js";
+import { trackUploadLeftOut } from "../telemetry/uploadLeftOut.js";
+import { confirmOutsideFiles, stageWithOutsideFileApproval } from "../utils/outsideFileApproval.js";
 
 export const examples: Example[] = [
-  ["Publish the current project with a public URL", "hyperframes publish"],
+  ["Publish the current project privately to a stable URL", "hyperframes publish"],
   ["Publish a specific directory", "hyperframes publish ./my-video"],
   ["Make the claimed project public to anyone", "hyperframes publish --public"],
   ["Update an existing published project in place", "hyperframes publish --update <url|id>"],
   ["Publish to a shared team space", "hyperframes publish --space <space-id>"],
   ["Skip the consent prompt (scripts)", "hyperframes publish --yes"],
   ["Skip baking H.264 proxies for browser-hostile video codecs", "hyperframes publish --no-proxy"],
+  ["Show full lint findings instead of the summary line", "hyperframes publish --lint-verbose"],
 ];
 
 /** Extract a project id from a published URL (with or without scheme, query, or hash) or accept a bare id. */
@@ -52,7 +66,7 @@ export function parseUpdateTarget(value: string): string {
 export default defineCommand({
   meta: {
     name: "publish",
-    description: "Upload the project and return a stable public URL",
+    description: "Legacy source publishing; use share for new video reviews",
   },
   args: {
     dir: { type: "positional", description: "Project directory", required: false },
@@ -80,28 +94,140 @@ export default defineCommand({
       description:
         "Bake H.264 proxies for browser-hostile video codecs (e.g. HEVC) into the published archive. Default: on, unless disabled via hyperframes.json media.autoProxy. Pass --no-proxy to skip.",
     },
+    "lint-verbose": {
+      type: "boolean",
+      description: "Show full lint findings before publishing instead of a one-line summary",
+      default: false,
+    },
+    "include-outside-files": {
+      type: "boolean",
+      description:
+        "Upload the files the project uses from outside its folder without asking. Otherwise they are left out unless you approve them.",
+      default: false,
+    },
   },
   async run({ args }) {
+    const publishPhase = checkPublishTransition(args);
+    if (args.yes !== true && isUnattended()) {
+      clack.confirmationRequired("hyperframes publish", "Pass --yes to publish without asking.");
+    }
     const rawArg = args.dir;
     const dir = resolve(rawArg ?? ".");
     const indexPath = join(dir, "index.html");
     if (existsSync(indexPath)) {
       const lintResult = await lintProject(dir);
+      const definitiveEntryMismatch = hasDefinitiveEntryMismatch(lintResult);
       if (lintResult.totalErrors > 0 || lintResult.totalWarnings > 0) {
         console.log();
-        for (const line of formatLintFindings(lintResult)) console.log(line);
+        const verbose = Boolean(args["lint-verbose"]) || definitiveEntryMismatch;
+        for (const line of formatLintStartupMessage(
+          lintResult,
+          verbose ? { kind: "verbose" } : { kind: "summary" },
+        ))
+          console.log(line);
         console.log();
+      }
+      if (definitiveEntryMismatch) {
+        const candidate = definitiveEntryMismatchComposition(lintResult);
+        console.log(c.error("  Aborting publish because the default index.html entry is blank."));
+        if (candidate && posix.basename(candidate) === "index.html") {
+          const candidateDir = posix.dirname(candidate);
+          const target = `<project>/${terminalText(candidateDir)}`;
+          console.log(
+            c.dim(
+              `  Move or mount the authored file, or publish its directory directly: hyperframes publish ${target}. Only use the directory form when its assets are self-contained under that directory; otherwise mount it from the project root.`,
+            ),
+          );
+        } else if (candidate) {
+          console.log(
+            c.dim(
+              `  Move or mount ${terminalText(candidate)} as a project index.html before publishing; publish accepts project directories, not individual HTML files.`,
+            ),
+          );
+        }
+        console.log();
+        failCommand();
       }
     }
 
+    const updateTarget =
+      typeof args.update === "string" && args.update.trim()
+        ? parseUpdateTarget(args.update)
+        : undefined;
+    const committedTeam = readTeamProject(dir);
+    const priorLink = readProjectLink(dir);
+    const spaceOverride =
+      typeof args.space === "string" && args.space.trim() ? args.space.trim() : undefined;
+
+    // Resolved once and passed to the upload: a second lookup after the bake could fall back
+    // from an expired login to a saved API key and silently drop --update / --space.
+    let credential: ResolvedCredential | null;
+    try {
+      credential = await resolvePublishCredential();
+    } catch (err: unknown) {
+      console.error();
+      console.error(`  ${(err as Error).message}`);
+      console.error();
+      setCommandExitCode(1);
+      return;
+    }
+
+    assertLegacyPublishOwner(publishPhase, credential?.type === "oauth");
+
+    // --update / --space only take effect for a login (an API-key publish is never owned).
+    // Fail loudly rather than silently minting a fresh URL.
+    if (updateTarget || spaceOverride) {
+      if (credential?.type !== "oauth") {
+        const flag = updateTarget ? "--update" : "--space";
+        const envKey = credential && envCredentialVar(credential.source);
+        console.log();
+        console.log(
+          `  ${c.error(
+            !credential
+              ? `${flag} requires authentication. Run 'hyperframes auth login' first.`
+              : envKey
+                ? `${flag} requires a login; ${envKey} cannot own a project. Run 'hyperframes auth login'.`
+                : `${flag} requires a login; an API key cannot own a project. Run 'hyperframes auth login'.`,
+          )}`,
+        );
+        console.log();
+        setCommandExitCode(1);
+        return;
+      }
+    }
+
+    const existingTarget =
+      credential?.type === "oauth"
+        ? (
+            updateTarget ??
+            committedTeam?.projectId ??
+            (priorLink?.url ? priorLink.projectId : undefined)
+          )?.replace(/[^!-~]/g, "?")
+        : undefined;
+
     if (args.yes !== true) {
       console.log();
-      console.log(
-        `  ${c.bold("hyperframes publish uploads this project and creates a stable public URL.")}`,
-      );
-      console.log(
-        `  ${c.dim("Anyone with the URL can open the published project and claim it after authenticating.")}`,
-      );
+      if (args.public === true) {
+        console.log(
+          `  ${c.bold("hyperframes publish uploads this project and requests public visibility at a stable URL.")}`,
+        );
+        console.log(`  ${c.dim("Anyone with the URL can open a claimed public project.")}`);
+      } else if (!existingTarget) {
+        console.log(
+          `  ${c.bold("hyperframes publish uploads this project privately to a stable URL.")}`,
+        );
+        console.log(
+          `  ${c.dim("Viewing requires authentication and access. Pass --public to allow anyone with the URL.")}`,
+        );
+      }
+      if (existingTarget) {
+        const keeps =
+          args.public === true ? "" : " and keeps its current visibility, which may be public";
+        const created = args.public === true ? "public" : "private";
+        console.log(
+          `  ${c.bold(`If you can access project ${existingTarget}, this updates it in place${keeps}. Otherwise it creates a new ${created} project.`)}`,
+        );
+      }
       console.log();
       const approved = await clack.confirm({ message: "Publish this project?" });
       if (clack.isCancel(approved) || approved !== true) {
@@ -112,29 +238,6 @@ export default defineCommand({
       }
     }
 
-    const updateTarget =
-      typeof args.update === "string" && args.update.trim()
-        ? parseUpdateTarget(args.update)
-        : undefined;
-    const spaceOverride =
-      typeof args.space === "string" && args.space.trim() ? args.space.trim() : undefined;
-
-    // --update / --space only take effect for an authenticated owner. Fail loudly rather
-    // than silently minting a fresh URL — the exact failure mode this feature removes.
-    if (updateTarget || spaceOverride) {
-      const credential = await tryResolveCredential();
-      if (!credential) {
-        console.log();
-        console.log(
-          `  ${c.error(`${updateTarget ? "--update" : "--space"} requires authentication. Run 'hyperframes auth login' first.`)}`,
-        );
-        console.log();
-        setCommandExitCode(1);
-        return;
-      }
-    }
-
-    const committedTeam = readTeamProject(dir);
     // Stable id: explicit --update wins, else the committed team id, else this machine's stored/minted id.
     const requestedProjectId = updateTarget ?? committedTeam?.projectId ?? ensureProjectId(dir);
     // Team space: explicit --space wins, else the committed space id, else the personal space.
@@ -142,7 +245,6 @@ export default defineCommand({
 
     // Continuity cue: if this directory was published before, show where it lives so the
     // user knows a re-publish updates that same link (when logged in).
-    const priorLink = readProjectLink(dir);
     if (priorLink?.url) {
       console.log();
       console.log(`  ${c.dim(`Previously published at ${priorLink.url}`)}`);
@@ -158,30 +260,69 @@ export default defineCommand({
       // committed config, else on by default.
       const proxyFlagValue = typeof args.proxy === "boolean" ? args.proxy : undefined;
       const autoProxy = resolveAutoProxy(dir, proxyFlagValue);
-      const fileMap = buildPublishFileMap(dir);
+      const { staged, outsideFiles } = await stageWithOutsideFileApproval(
+        dir,
+        {
+          includeAll: args["include-outside-files"] === true,
+          ask:
+            args.yes === true
+              ? undefined
+              : (files) => {
+                  publishSpinner.stop("Project prepared");
+                  return confirmOutsideFiles(files).finally(() =>
+                    publishSpinner.start("Preparing project..."),
+                  );
+                },
+        },
+        (onOutsideFile) => {
+          const leftOut: string[] = [];
+          const references: LeftOutReference[] = [];
+          const fileMap = buildPublishFileMap(
+            dir,
+            (warning, reference) => {
+              leftOut.push(warning);
+              references.push(reference);
+            },
+            onOutsideFile,
+          );
+          return { fileMap, leftOut, references };
+        },
+      );
+      const { fileMap, leftOut, references } = staged;
+      trackUploadLeftOut("publish", references);
       let proxyBakeManifest: Awaited<ReturnType<typeof bakeMediaProxies>> | undefined;
       if (autoProxy) {
         proxyBakeManifest = await bakeMediaProxies(dir, fileMap);
       }
       const archive = zipPublishFileMap(fileMap);
-      publishSpinner.message("Uploading project...");
+      if (outsideFiles.length > 0) {
+        publishSpinner.stop("Project prepared");
+        clack.log.info(outsideFilesNotice(outsideFiles));
+        publishSpinner.start("Uploading project...");
+      } else {
+        publishSpinner.message("Uploading project...");
+      }
 
       const published = await publishProjectArchive(dir, {
         public: args.public === true,
         projectId: requestedProjectId,
         spaceId,
         archive,
+        credential,
       });
       publishSpinner.stop(c.success("Project published"));
+      for (const warning of leftOut) clack.log.warn(c.warn(terminalLines(warning)));
 
       console.log();
-      console.log(`  ${c.dim("Project")}    ${c.accent(published.title)}`);
-      console.log(`  ${c.dim("Files")}      ${String(published.fileCount)}`);
+      console.log(`  ${c.dim("Project")}              ${c.accent(terminalText(published.title))}`);
+      console.log(`  ${c.dim("Files")}                ${String(published.fileCount)}`);
       if (proxyBakeManifest) {
-        console.log(`  ${c.dim("Proxies")}    ${String(proxyBakeManifest.proxied.length)} baked`);
+        console.log(
+          `  ${c.dim("Proxies")}              ${String(proxyBakeManifest.proxied.length)} baked`,
+        );
         if (proxyBakeManifest.skippedAlpha.length > 0) {
           console.log(
-            `  ${c.dim("Proxy note")} ${String(proxyBakeManifest.skippedAlpha.length)} alpha source(s) kept original`,
+            `  ${c.dim("Proxy note")}           ${String(proxyBakeManifest.skippedAlpha.length)} alpha source(s) kept original`,
           );
         }
       }
@@ -189,10 +330,26 @@ export default defineCommand({
       if (published.claimed) {
         // The server returns the same id on an in-place update, a fresh id on create.
         const updatedInPlace = published.projectId === requestedProjectId;
-        console.log(`  ${c.dim("URL")}        ${c.accent(published.url)}`);
+        console.log(`  ${c.dim("URL")}                  ${c.accent(terminalText(published.url))}`);
+        // The CLI only ever states what it ASKED for: no response field carries the project's
+        // actual visibility. A re-publish without --public sends no visibility at all, so the
+        // server keeps whatever the project already had — saying "Private" there would claim
+        // a state we neither requested nor observed.
+        const requestedVisibility =
+          args.public === true
+            ? "Public — anyone with the URL"
+            : updatedInPlace
+              ? "Unchanged — keeps this project's current setting"
+              : "Private — authentication and access required";
+        console.log(`  ${c.dim("Requested visibility")} ${c.accent(requestedVisibility)}`);
         console.log(
-          `  ${c.dim("Status")}     ${c.accent(updatedInPlace ? "Updated existing project" : "Created new project")}`,
+          `  ${c.dim("Status")}               ${c.accent(updatedInPlace ? "Updated existing project" : "Created new project")}`,
         );
+        if (args.public !== true) {
+          console.log(
+            `  ${c.dim("Tip")}                  ${c.dim("Re-publish with --public to allow anyone with the URL.")}`,
+          );
+        }
         // Warn whenever we aimed at a KNOWN existing project (an explicit --update target or
         // a committed team id) but the server created a fresh one instead — so a teammate
         // whose space doesn't own the committed project doesn't silently lose the shared link.
@@ -224,34 +381,25 @@ export default defineCommand({
       } else {
         const claimUrl = new URL(published.url);
         claimUrl.searchParams.set("claim_token", published.claimToken);
-        console.log(`  ${c.dim("Public")}     ${c.accent(claimUrl.toString())}`);
+        console.log(`  ${c.dim("Claim URL")}  ${c.accent(cliSourced(claimUrl.toString()))}`);
+        console.log(`  ${c.dim("Access")}     ${c.accent("Sign in required to claim")}`);
         console.log();
-        if (updateTarget || spaceOverride) {
-          // The pre-publish gate saw a credential, but the server didn't accept it (expired
-          // or invalid) and fell back to anonymous — say so loudly instead of pretending the
-          // requested update happened.
-          console.log(
-            `  ${c.error(`Your login looks expired or invalid, so ${updateTarget ? "--update" : "--space"} was ignored and a NEW url was created above.`)}`,
-          );
-          console.log(
-            `  ${c.dim("Run 'hyperframes auth login' again, then re-publish to update in place.")}`,
-          );
-        } else {
-          console.log(
-            `  ${c.dim("Open the URL on hyperframes.dev to claim the project and continue editing.")}`,
-          );
-          console.log();
-          console.log(
-            `  ${c.dim("Tip: run 'hyperframes auth login' first for a stable link you can re-publish to.")}`,
-          );
-        }
+        console.log(
+          `  ${c.dim("Open the claim URL on hyperframes.studio, sign in, and claim the project to continue editing.")}`,
+        );
+        console.log();
+        const visibilityTip =
+          args.public === true
+            ? "--public applies to the claimed project; this claim URL still requires sign-in."
+            : "Run 'hyperframes auth login' first for a stable link you can re-publish to; add --public to allow signed-out viewing.";
+        console.log(`  ${c.dim(`Tip: ${visibilityTip}`)}`);
         console.log();
       }
       return;
     } catch (err: unknown) {
       publishSpinner.stop(c.error("Publish failed"));
       console.error();
-      console.error(`  ${(err as Error).message}`);
+      console.error(`  ${terminalLines((err as Error).message)}`);
       console.error();
       setCommandExitCode(1);
       return;

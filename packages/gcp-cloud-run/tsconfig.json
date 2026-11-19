@@ -12,9 +12,16 @@
     "paths": {
       "@hyperframes/core": ["../core/src/index.ts"],
       "@hyperframes/core/*": ["../core/src/*"],
+      "@hyperframes/lint": ["../lint/src/index.ts"],
       "@hyperframes/producer": ["../producer/src/index.ts"],
       "@hyperframes/producer/distributed": ["../producer/src/distributed.ts"],
-      "@hyperframes/studio-server": ["../studio-server/src/index.ts"]
+      "@hyperframes/studio-server": ["../studio-server/src/index.ts"],
+      "@hyperframes/studio-server/encoder-options": [
+        "../studio-server/src/helpers/encoderOptions.ts"
+      ],
+      "@hyperframes/studio-server/request-identity": [
+        "../studio-server/src/helpers/requestIdentity.ts"
+      ]
     }
   },
   "include": ["src/**/*"],

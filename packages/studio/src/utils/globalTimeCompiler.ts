@@ -1,4 +1,6 @@
 import type { GsapAnimation } from "@hyperframes/core/gsap-parser";
+import { GSAP_DEFAULT_DURATION } from "@hyperframes/parsers/gsap-parser";
+import { progressAtTime, runEaseOf, timeAtProgress } from "./gsapKeyframeEases";
 
 export function absoluteToPercentage(
   time: number,
@@ -7,7 +9,7 @@ export function absoluteToPercentage(
 ): number {
   if (tweenDuration <= 0) return 0;
   const raw = ((time - tweenStart) / tweenDuration) * 100;
-  return Math.max(0, Math.min(100, Math.round(raw * 10) / 10));
+  return Math.max(0, Math.min(100, Math.round(raw * 1000) / 1000));
 }
 
 export function percentageToAbsolute(
@@ -35,7 +37,7 @@ export function resolveTweenStart(animation: GsapAnimation): number | null {
 }
 
 export function resolveTweenDuration(animation: GsapAnimation): number {
-  return animation.duration ?? 0.5;
+  return animation.duration ?? GSAP_DEFAULT_DURATION;
 }
 
 export function findTweenAtTime(
@@ -60,7 +62,7 @@ export function absoluteToPercentageForAnimation(
   const start = resolveTweenStart(animation);
   if (start === null) return null;
   const duration = resolveTweenDuration(animation);
-  return absoluteToPercentage(time, start, duration);
+  return progressAtTime(runEaseOf(animation), absoluteToPercentage(time, start, duration));
 }
 
 export function percentageToAbsoluteForAnimation(
@@ -70,7 +72,7 @@ export function percentageToAbsoluteForAnimation(
   const start = resolveTweenStart(animation);
   if (start === null) return null;
   const duration = resolveTweenDuration(animation);
-  return percentageToAbsolute(pct, start, duration);
+  return percentageToAbsolute(timeAtProgress(runEaseOf(animation), pct), start, duration);
 }
 
 function matchesSelector(tweenSelector: string, querySelector: string): boolean {

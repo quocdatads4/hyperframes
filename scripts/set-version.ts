@@ -15,16 +15,18 @@
  */
 
 import { existsSync, readFileSync, writeFileSync } from "fs";
-import { join } from "path";
+import { join, posix } from "path";
 import { execFileSync } from "child_process";
 import { pathToFileURL } from "url";
 import { CLI_SEMVER_PATTERN } from "./cli-options.ts";
 
 const PACKAGES = [
+  "packages/share",
   "packages/parsers",
   "packages/lint",
   "packages/studio-server",
   "packages/core",
+  "packages/inspector",
   "packages/engine",
   "packages/player",
   "packages/producer",
@@ -36,10 +38,25 @@ const PACKAGES = [
   "packages/sdk",
 ];
 
-const PLUGINS = [".claude-plugin", ".codex-plugin", ".cursor-plugin"];
+const PLUGINS = [
+  ".claude-plugin/plugin.json",
+  ".codex-plugin/plugin.json",
+  ".cursor-plugin/plugin.json",
+  "plugin.json",
+  "gemini-extension.json",
+];
 
 const ROOT = join(import.meta.dirname, "..");
 export const CHANGELOG_REVIEW_TODO = "<!-- TODO: write a 1-2 sentence release summary here. -->";
+
+/**
+ * Emitted directly under CHANGELOG_REVIEW_TODO by the draft generator. The
+ * generator cannot write the summary itself, so this carries the writing bar to
+ * whoever does. It is checked alongside the TODO so a half-finished review that
+ * drops one marker but not the other still fails the release gate.
+ */
+export const CHANGELOG_STYLE_NOTE =
+  "<!-- Style bar: keep sentences under 25 words. Use everyday words. Avoid semicolons. Say what changed for the user, then why it matters. -->";
 
 type ReleaseOptions = {
   version: string;
@@ -109,7 +126,7 @@ function updatePluginVersions(version: string) {
   // short arrays inline, but JSON.stringify expands them, which would fail the
   // pre-commit format check on the release commit this script creates.
   for (const plugin of PLUGINS) {
-    const pluginPath = join(ROOT, plugin, "plugin.json");
+    const pluginPath = join(ROOT, plugin);
     const text = readFileSync(pluginPath, "utf-8");
     const oldVersion = text.match(/"version"\s*:\s*"([^"]*)"/)?.[1] ?? "unknown";
     writeFileSync(pluginPath, text.replace(/("version"\s*:\s*)"[^"]*"/, `$1"${version}"`));
@@ -217,7 +234,9 @@ function assertTagMonotonicity(version: string) {
   process.exit(1);
 }
 
-export function releaseRequiresChangelog(options: ReleaseOptions) {
+export function releaseRequiresChangelog(
+  options: Pick<ReleaseOptions, "version" | "skipTag" | "skipChangelogCheck">,
+) {
   return !options.skipTag && !options.skipChangelogCheck && !isPrerelease(options.version);
 }
 
@@ -248,7 +267,7 @@ export function missingChangelogArtifacts(version: string) {
 }
 
 export function changelogArtifacts(version: string) {
-  return [join("releases", `v${version}.md`), `docs/changelog.mdx#HyperFrames v${version}`];
+  return [posix.join("releases", `v${version}.md`), `docs/changelog.mdx#HyperFrames v${version}`];
 }
 
 export function unreviewedChangelogArtifacts(version: string) {
@@ -258,7 +277,7 @@ export function unreviewedChangelogArtifacts(version: string) {
 }
 
 function artifactExists(artifact: string) {
-  const [path, marker] = artifact.split("#");
+  const [path = artifact, marker] = artifact.split("#");
   const absolutePath = join(ROOT, path);
 
   if (!existsSync(absolutePath)) {
@@ -268,7 +287,7 @@ function artifactExists(artifact: string) {
 }
 
 function artifactHasGeneratedTodo(artifact: string) {
-  const [path, marker] = artifact.split("#");
+  const [path = artifact, marker] = artifact.split("#");
   const content = readFileSync(join(ROOT, path), "utf-8");
   if (!marker) {
     return hasGeneratedChangelogTodo(content);
@@ -278,7 +297,7 @@ function artifactHasGeneratedTodo(artifact: string) {
 }
 
 export function hasGeneratedChangelogTodo(content: string) {
-  return content.includes(CHANGELOG_REVIEW_TODO);
+  return content.includes(CHANGELOG_REVIEW_TODO) || content.includes(CHANGELOG_STYLE_NOTE);
 }
 
 export function docsChangelogEntryHasGeneratedTodo(content: string, marker: string) {
@@ -299,10 +318,11 @@ export function docsChangelogEntryHasGeneratedTodo(content: string, marker: stri
 
 export function releaseAllowedPaths(version: string) {
   return [
-    ...PACKAGES.map((pkg) => join(pkg, "package.json")),
-    ...PLUGINS.map((plugin) => join(plugin, "plugin.json")),
+    // These values are compared with Git's slash-separated path output.
+    ...PACKAGES.map((pkg) => posix.join(pkg, "package.json")),
+    ...PLUGINS,
     "docs/changelog.mdx",
-    join("releases", `v${version}.md`),
+    posix.join("releases", `v${version}.md`),
   ];
 }
 
@@ -352,11 +372,27 @@ function printReleaseNextSteps(version: string) {
     console.log(`Consumers install with: npm install @hyperframes/core@${distTag}`);
     console.log(`\nRun 'git push origin v${version}' to trigger the publish workflow.`);
   } else {
-    console.log(`\nRun the following to trigger the publish workflow:`);
-    console.log(`  git push origin main`);
-    console.log(`  git push origin v${version}`);
+    // A stable tag push does NOT publish — publish.yml's push trigger is
+    // `v*-*` (prerelease-only), and stable publishes exclusively from a merged
+    // release/v* PR. Printing the tag-push flow here sent a release straight to
+    // main with an unpublishable tag: the workflow never fired, and the stray
+    // tag then fails the next release's verify_remote_tag check.
+    console.log(`\nStable releases publish from a reviewed release PR, NOT a tag push.`);
+    console.log(`\nDo NOT push the local tag. Run:`);
+    console.log(`  git push origin HEAD:refs/heads/release/v${version}`);
+    console.log(`  gh pr create --base main --head release/v${version} --fill`);
+    // Every release bumps packages/studio and packages/player, which the
+    // captures gate watches, so it asks a version bump for before/after media.
+    // Its own hatch covers this: the watched diff is 4 lines of package.json.
     console.log(
-      `(push the specific tag, NOT 'git push --tags' — that fails on any pre-existing tag).`,
+      `\nThe PR body needs a '## No visible change' section — a release bumps` +
+        `\npackages/studio and packages/player, so scripts/check-pr-captures.mjs` +
+        `\notherwise demands before/after captures for a version bump.`,
+    );
+    console.log(
+      `\nMerging that PR publishes: the workflow checks out the merge SHA, creates` +
+        `\nthe v${version} tag there, publishes npm, and cuts the GitHub release.` +
+        `\nSee docs/contributing/release-channels.mdx.`,
     );
   }
 }

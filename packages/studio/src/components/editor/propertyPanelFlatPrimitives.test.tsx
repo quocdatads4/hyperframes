@@ -60,7 +60,7 @@ describe("FlatRow", () => {
       />,
     );
     const value = host.querySelector('[data-flat-row-value="true"]');
-    expect(value?.className).toContain("text-panel-accent");
+    expect(value?.className).toContain("text-accent-ink");
     const reset = host.querySelector<HTMLButtonElement>('[data-flat-row-reset="true"]');
     expect(reset).not.toBeNull();
     act(() => reset?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
@@ -87,6 +87,75 @@ describe("FlatRow", () => {
       input.dispatchEvent(new Event("focusout", { bubbles: true }));
     });
     expect(onCommit).toHaveBeenCalledWith("24px");
+    act(() => root.unmount());
+  });
+
+  it("restores its durable value when an async commit rejects", async () => {
+    let rejectCommit: ((error: Error) => void) | null = null;
+    const onCommit = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectCommit = reject;
+        }),
+    );
+    const row = (value: string) => (
+      <FlatRow label="X" value={value} tier="explicitDefault" onCommit={onCommit} />
+    );
+    const { host, root } = renderInto(row("22px"));
+    const input = host.querySelector<HTMLInputElement>("input");
+    if (!input) throw new Error("expected an input");
+    act(() => {
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value",
+      )?.set;
+      nativeInputValueSetter?.call(input, "99px");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("focusout", { bubbles: true }));
+    });
+    // The parent can echo the preview before persistence settles. That is not a
+    // durable acknowledgement and must not invalidate the pending rollback.
+    act(() => root.render(row("99px")));
+    await act(async () => {
+      rejectCommit?.(new Error("save failed"));
+      await Promise.resolve();
+    });
+
+    expect(onCommit).toHaveBeenCalledWith("99px");
+    expect(input.value).toBe("22px");
+    act(() => root.unmount());
+  });
+
+  it("does not let an older rejected commit overwrite a newer draft", async () => {
+    let rejectCommit: ((error: Error) => void) | null = null;
+    const onCommit = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectCommit = reject;
+        }),
+    );
+    const { host, root } = renderInto(
+      <FlatRow label="X" value="22px" tier="explicitDefault" onCommit={onCommit} />,
+    );
+    const input = host.querySelector<HTMLInputElement>("input");
+    if (!input) throw new Error("expected an input");
+    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype,
+      "value",
+    )?.set;
+    act(() => {
+      nativeInputValueSetter?.call(input, "99px");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("focusout", { bubbles: true }));
+      nativeInputValueSetter?.call(input, "100px");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {
+      rejectCommit?.(new Error("old save failed"));
+      await Promise.resolve();
+    });
+
+    expect(input.value).toBe("100px");
     act(() => root.unmount());
   });
 
@@ -287,7 +356,7 @@ describe("FlatSlider", () => {
     const fill = host.querySelector<HTMLElement>('[data-flat-slider-fill="true"]');
     expect(fill?.style.width).toBe("100%");
     const knob = host.querySelector<HTMLElement>('[data-flat-slider-knob="true"]');
-    expect(knob?.className).toContain("bg-white");
+    expect(knob?.className).toContain("bg-text-0");
     act(() => root.unmount());
   });
 
@@ -1103,7 +1172,7 @@ describe("FlatSelectRow", () => {
       />,
     );
     const select = host.querySelector<HTMLSelectElement>("select");
-    expect(select?.className).toContain("text-panel-accent");
+    expect(select?.className).toContain("text-accent-ink");
     const reset = host.querySelector<HTMLButtonElement>('[data-flat-select-reset="true"]');
     act(() => reset?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
     expect(onReset).toHaveBeenCalledTimes(1);
@@ -1159,20 +1228,20 @@ describe("FlatSelectRow — label/value options", () => {
     const { host, root } = renderInto(
       <FlatSelectRow
         label="Preset"
-        value="natural-lift"
+        value="clean-studio"
         options={[
           { value: "neutral", label: "Neutral" },
-          { value: "natural-lift", label: "Natural Lift" },
-          { value: "fresh-pop", label: "Fresh Pop" },
+          { value: "clean-studio", label: "Clean Studio" },
+          { value: "bright-pop", label: "Bright Pop" },
         ]}
         tier="explicitCustom"
         onChange={vi.fn()}
       />,
     );
     const select = host.querySelector("select");
-    expect(select?.value).toBe("natural-lift");
+    expect(select?.value).toBe("clean-studio");
     const options = Array.from(host.querySelectorAll("option")).map((o) => o.textContent);
-    expect(options).toEqual(["Neutral", "Natural Lift", "Fresh Pop"]);
+    expect(options).toEqual(["Neutral", "Clean Studio", "Bright Pop"]);
     act(() => root.unmount());
   });
 
@@ -1216,3 +1285,96 @@ describe("FlatSelectRow — label/value options", () => {
     act(() => root.unmount());
   });
 });
+
+describe("FlatSlider — typed value", () => {
+  it("keeps the readout inert without onCommitText", () => {
+    const { host, root } = renderInto(
+      <FlatSlider
+        label="Opacity"
+        value={10}
+        min={0}
+        max={100}
+        tier="default"
+        displayValue="10%"
+        onCommit={vi.fn()}
+      />,
+    );
+    const readout = host.querySelector<HTMLElement>('[data-flat-slider-value="true"]');
+    expect(readout?.getAttribute("role")).toBeNull();
+    act(() => readout?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(host.querySelector('[data-flat-slider-input="true"]')).toBeNull();
+    act(() => root.unmount());
+  });
+
+  it("turns the readout into an input on click and commits the typed text on Enter", () => {
+    const onCommitText = vi.fn().mockReturnValue(true);
+    const { host, root } = renderInto(
+      <FlatSlider
+        label="Volume"
+        value={0}
+        min={-100}
+        max={100}
+        tier="default"
+        displayValue="0 dB"
+        onCommit={vi.fn()}
+        onCommitText={onCommitText}
+      />,
+    );
+    const readout = host.querySelector<HTMLElement>('[data-flat-slider-value="true"]');
+    expect(readout?.getAttribute("role")).toBe("button");
+    act(() => readout?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    const input = host.querySelector<HTMLInputElement>('[data-flat-slider-input="true"]');
+    if (!input) throw new Error("expected the readout to become an input");
+    expect(input.value).toBe("0 dB");
+    act(() => {
+      setReactInputValue(input, "-6 dB");
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    expect(onCommitText).toHaveBeenCalledWith("-6 dB");
+    expect(host.querySelector('[data-flat-slider-input="true"]')).toBeNull();
+    act(() => root.unmount());
+  });
+
+  it("stays open and marks itself invalid when the text is refused, and closes on Escape", () => {
+    const onCommitText = vi.fn().mockReturnValue(false);
+    const { host, root } = renderInto(
+      <FlatSlider
+        label="Speed"
+        value={500}
+        min={0}
+        max={1000}
+        tier="default"
+        displayValue="1x"
+        onCommit={vi.fn()}
+        onCommitText={onCommitText}
+      />,
+    );
+    act(() =>
+      host
+        .querySelector<HTMLElement>('[data-flat-slider-value="true"]')
+        ?.dispatchEvent(new MouseEvent("click", { bubbles: true })),
+    );
+    const input = host.querySelector<HTMLInputElement>('[data-flat-slider-input="true"]');
+    if (!input) throw new Error("expected an input");
+    act(() => {
+      setReactInputValue(input, "fast");
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    expect(onCommitText).toHaveBeenCalledWith("fast");
+    const still = host.querySelector<HTMLInputElement>('[data-flat-slider-input="true"]');
+    expect(still).not.toBeNull();
+    expect(still?.getAttribute("aria-invalid")).toBe("true");
+    expect(still?.className).toContain("border-dashed");
+    act(() => still?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(host.querySelector('[data-flat-slider-input="true"]')).toBeNull();
+    expect(host.querySelector('[data-flat-slider-value="true"]')?.textContent).toBe("1x");
+    act(() => root.unmount());
+  });
+});
+
+/** Drives React's controlled input the way a keystroke would. */
+function setReactInputValue(input: HTMLInputElement, value: string) {
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+  setter?.call(input, value);
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+}

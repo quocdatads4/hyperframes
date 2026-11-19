@@ -55,6 +55,11 @@ const fullObservability: NonNullable<RenderPerfSummary["observability"]> = {
     protocolTimeoutMs: 300_000,
     pageNavigationTimeoutMs: 60_000,
     playerReadyTimeoutMs: 45_000,
+    adaptersUsed: ["gsap"],
+    audioCount: 2,
+    imageCount: 3,
+    rootBodyMismatch: true,
+    rootBodyDeltaPxBucket: "11-50",
   },
   extraction: {
     videoCount: 6,
@@ -116,6 +121,10 @@ const fullPerf: RenderPerfSummary = {
   },
   tmpPeakBytes: 1024,
   captureAvgMs: 13,
+  captureSeekAvgMs: 3,
+  captureBeforeCaptureAvgMs: 1,
+  captureScreenshotAvgMs: 8,
+  encoderWaitAvgMs: 2,
   capturePeakMs: 25,
   observability: fullObservability,
 };
@@ -160,6 +169,10 @@ describe("studioRenderTelemetry", () => {
       // speedRatio = compositionDurationMs / elapsedMs = 10000 / 5000 = 2
       expect(p.speedRatio).toBe(2);
       expect(p.captureAvgMs).toBe(13);
+      expect(p.captureSeekAvgMs).toBe(3);
+      expect(p.captureBeforeCaptureAvgMs).toBe(1);
+      expect(p.captureScreenshotAvgMs).toBe(8);
+      expect(p.encoderWaitAvgMs).toBe(2);
       expect(p.capturePeakMs).toBe(25);
       expect(p.tmpPeakBytes).toBe(1024);
       // stages
@@ -211,6 +224,15 @@ describe("studioRenderTelemetry", () => {
       expect(p.observabilityExtractCacheMisses).toBe(6);
       expect(p.observabilityInitDurationMs).toBe(1234);
       expect(p.observabilityInitTweenCount).toBe(42);
+      // capture.audioCount / imageCount / rootBodyMismatch / adaptersUsed are the
+      // only source for these on a studio render, since no drawElement resolves here.
+      // events.ts's trackRenderComplete falls back to captureXxx precisely because
+      // this path only ever supplies these, never the direct field.
+      expect(p.captureAdaptersUsed).toEqual(["gsap"]);
+      expect(p.captureAudioCount).toBe(2);
+      expect(p.captureImageCount).toBe(3);
+      expect(p.captureRootBodyMismatch).toBe(true);
+      expect(p.captureRootBodyDeltaPxBucket).toBe("11-50");
     });
 
     it("omits all perf-derived fields when perfSummary is undefined", () => {
@@ -243,6 +265,14 @@ describe("studioRenderTelemetry", () => {
       const p = trackRenderComplete.mock.calls[0]![0];
       expect(p.speedRatio).toBeUndefined();
     });
+  });
+
+  it("forwards the render's CPU use on both events", () => {
+    const cpu = { cpuBusyAvgPct: 57, cpuBusyPeakPct: 90, cpuCoresBusyPeak: 2 };
+    emitStudioRenderComplete(opts, 5000, fullPerf, cpu);
+    emitStudioRenderError(opts, 100, "encode", new Error("x"), undefined, cpu);
+    expect(trackRenderComplete.mock.calls[0]![0]).toMatchObject(cpu);
+    expect(trackRenderError.mock.calls[0]![0]).toMatchObject(cpu);
   });
 
   describe("emitStudioRenderError", () => {
@@ -311,5 +341,42 @@ describe("studioRenderTelemetry", () => {
       expect(p.observabilityExtractTotalFrames).toBe(167_400);
       expect(p.observabilityExtractVfrPreflightCount).toBe(6);
     });
+  });
+
+  // The browser profile's opt-out is invisible to the CLI's own policy, so
+  // without an explicit signal these fired for an opted-out user — attributed
+  // to the install id, which is worse than attributing them correctly.
+  describe("browser telemetry opt-out", () => {
+    it("emits nothing for a render whose browser opted out", () => {
+      emitStudioRenderComplete({ ...opts, telemetryOptOut: true }, 5000, fullPerf);
+      emitStudioRenderError(
+        { ...opts, telemetryOptOut: true },
+        1200,
+        "encode",
+        new Error("boom"),
+        undefined,
+      );
+      expect(trackRenderComplete).not.toHaveBeenCalled();
+      expect(trackRenderError).not.toHaveBeenCalled();
+    });
+
+    // An older client sends no flag at all. That is not consent withdrawn, and
+    // treating it as such would silently drop every pre-upgrade render.
+    it.each([undefined, false])("still emits when telemetryOptOut is %s", (flag) => {
+      emitStudioRenderComplete({ ...opts, telemetryOptOut: flag }, 5000, fullPerf);
+      expect(trackRenderComplete).toHaveBeenCalledTimes(1);
+    });
+  });
+});
+
+describe("studio render telemetry: GPU encoding", () => {
+  it("reports whether the render asked for GPU encoding, on success and on failure", () => {
+    trackRenderComplete.mockClear();
+    trackRenderError.mockClear();
+    emitStudioRenderComplete({ ...opts, useGpu: true }, 1000, undefined);
+    emitStudioRenderError({ ...opts, useGpu: true }, 1000, "capture", new Error("x"), undefined);
+    emitStudioRenderComplete(opts, 1000, undefined);
+    expect(trackRenderComplete.mock.calls.map(([props]) => props.gpu)).toEqual([true, false]);
+    expect(trackRenderError.mock.calls[0]?.[0]).toMatchObject({ gpu: true });
   });
 });

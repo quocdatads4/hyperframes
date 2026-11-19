@@ -1,8 +1,17 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, posix, relative } from "node:path";
 import AdmZip from "adm-zip";
+import { parseHTML } from "linkedom";
 
 const authMocks = vi.hoisted(() => ({
   tryResolveCredential: vi.fn(),
@@ -20,12 +29,26 @@ vi.mock("./projectLink.js", () => ({
   writeProjectLink: linkMocks.writeProjectLink,
 }));
 
+const oauthMocks = vi.hoisted(() => ({
+  refreshTokens: vi.fn(),
+}));
+
+vi.mock("../auth/oauth.js", () => ({
+  refreshTokens: oauthMocks.refreshTokens,
+}));
+
+import { ErrRefreshFailed } from "../auth/errors.js";
+import { setupTempAuthEnv } from "../auth/_test-utils.js";
+import { writeStore } from "../auth/store.js";
+
 import {
   buildPublishFileMap,
   createPublishArchive,
   getPublishApiBaseUrl,
   localizeExternalAssets,
   publishProjectArchive,
+  readStaged,
+  stagePublishFiles,
   uploadTimeoutMs,
   zipPublishFileMap,
 } from "./publishProject.js";
@@ -129,6 +152,9 @@ function publishedResponse(overrides?: Record<string, unknown>): Response {
   );
 }
 
+/** What the server returns when it accepted the credential and owns the project. */
+const OWNED = { claim_token: "", claimed: true };
+
 /** Full staged flow: upload, S3 PUT, complete. */
 function stagedFetch(completeData?: Record<string, unknown>, uploadData?: Record<string, unknown>) {
   return vi
@@ -144,6 +170,16 @@ function directFetch(completeData?: Record<string, unknown>) {
     .fn()
     .mockResolvedValueOnce(new Response("not found", { status: 404 }))
     .mockResolvedValueOnce(publishedResponse(completeData));
+}
+
+function networkFailure(
+  code: string,
+  message: string,
+  metadata: Record<string, unknown> = {},
+): TypeError {
+  return new TypeError("fetch failed", {
+    cause: Object.assign(new Error(message), { code, ...metadata }),
+  });
 }
 
 /** Asserts the Nth fetch call, always requiring an AbortSignal alongside the given init. */
@@ -189,6 +225,117 @@ async function runAuthenticatedPublish(
 }
 
 describe("createPublishArchive", () => {
+  it.each([
+    { filename: "poster art.svg", reference: "poster%20art.svg" },
+    { filename: "封面.svg", reference: "%E5%B0%81%E9%9D%A2.svg" },
+    { filename: "100%.svg", reference: "100%.svg" },
+    { filename: "poster%20art.svg", reference: "poster%20art.svg" },
+    { filename: "poster#art.svg", reference: "poster%23art.svg" },
+    { filename: "poster#art.svg", reference: "poster#art.svg" },
+  ])("archives $filename referenced as $reference", ({ filename, reference }) => {
+    const projectDir = makeProjectDir();
+    const extDir = mkdtempSync(join(tmpdir(), "hf-ext-"));
+    try {
+      const entryPath = "compositions/scene.html";
+      const htmlDir = join(projectDir, dirname(entryPath));
+      mkdirSync(htmlDir, { recursive: true });
+      stageExternalAsset(extDir, htmlDir, filename, "POSTER_DATA");
+      if (reference !== filename) {
+        stageExternalAsset(extDir, htmlDir, reference, "LITERAL_DECOY");
+      }
+      const assetPath = relative(htmlDir, join(extDir, reference)).replaceAll("\\", "/");
+      const html = `<html><body><img src="${assetPath}"><video src="../clip.mp4" poster="${assetPath}"></video></body></html>`;
+      writeFileSync(join(projectDir, "index.html"), "<html></html>");
+      writeFileSync(join(projectDir, entryPath), html);
+      writeFileSync(join(projectDir, "clip.mp4"), "MP4_DATA");
+
+      const archive = createPublishArchive(projectDir);
+      const zip = new AdmZip(archive.buffer);
+      const { document } = parseHTML(zip.readAsText(entryPath));
+      const src = document.querySelector("img")?.getAttribute("src");
+      if (!src) throw new Error("Archived image has no src");
+      expect(document.querySelector("video")?.getAttribute("poster")).toBe(src);
+      const url = new URL(src, `https://archive.example/${entryPath}`);
+      expect(url.hash).toBe("");
+      expect(url.search).toBe("");
+      const archivedPath = decodeURIComponent(url.pathname.slice(1));
+      expect(archivedPath).toMatch(/^_ext\//);
+      expect(posix.basename(archivedPath)).toBe(filename);
+      expect(zip.readFile(archivedPath)).toEqual(Buffer.from("POSTER_DATA"));
+      expect(archive.fileCount).toBe(4);
+      expect(readFileSync(join(projectDir, entryPath), "utf-8")).toBe(html);
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+      rmSync(extDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["index.html", "compositions/scene.html"])(
+    "includes external video posters referenced from %s",
+    (entryPath) => {
+      const projectDir = makeProjectDir();
+      const extDir = mkdtempSync(join(tmpdir(), "hf-ext-"));
+      try {
+        const htmlDir = join(projectDir, dirname(entryPath));
+        mkdirSync(htmlDir, { recursive: true });
+        if (entryPath !== "index.html") {
+          writeFileSync(join(projectDir, "index.html"), "<html></html>");
+        }
+        const posterPath = stageExternalAsset(extDir, htmlDir, "poster.png", "PNG_DATA");
+        const videoPath = posix.relative(posix.dirname(entryPath), "clip.mp4");
+        const html = `<html><body><video src="${videoPath}" poster="${posterPath}"></video></body></html>`;
+        writeFileSync(join(projectDir, entryPath), html);
+        writeFileSync(join(projectDir, "clip.mp4"), "MP4_DATA");
+
+        const archive = createPublishArchive(projectDir);
+        const zip = new AdmZip(archive.buffer);
+        const posterEntries = zip
+          .getEntries()
+          .filter((entry) => entry.entryName.startsWith("_ext/") && entry.name === "poster.png");
+
+        expect(posterEntries).toHaveLength(1);
+        const archivedPoster = posterEntries[0]!;
+        expect(archivedPoster.getData()).toEqual(Buffer.from("PNG_DATA"));
+        expect(zip.readAsText(entryPath)).toContain(
+          `poster="${posix.relative(posix.dirname(entryPath), archivedPoster.entryName)}"`,
+        );
+        expect(zip.readAsText(entryPath)).toContain(`src="${videoPath}"`);
+        expect(archive.fileCount).toBe(entryPath === "index.html" ? 3 : 4);
+        expect(readFileSync(join(projectDir, entryPath), "utf-8")).toBe(html);
+      } finally {
+        rmSync(projectDir, { recursive: true, force: true });
+        rmSync(extDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("preserves internal, remote, and inline video posters", () => {
+    const projectDir = makeProjectDir();
+    try {
+      const posters = [
+        "poster.png",
+        "poster%20art.png",
+        "https://cdn.example.com/poster.png",
+        "https://cdn.example.com/poster%20art.png",
+        "data:image/png;base64,AA==",
+      ];
+      const html = `<html><body>${posters.map((poster) => `<video src="clip.mp4" poster="${poster}"></video>`).join("")}</body></html>`;
+      writeFileSync(join(projectDir, "index.html"), html);
+      writeFileSync(join(projectDir, "poster.png"), "PNG_DATA");
+      writeFileSync(join(projectDir, "poster art.png"), "ENCODED_PNG_DATA");
+      writeFileSync(join(projectDir, "clip.mp4"), "MP4_DATA");
+
+      const archive = createPublishArchive(projectDir);
+      const zip = new AdmZip(archive.buffer);
+
+      expect(archive.fileCount).toBe(4);
+      expect(zip.readAsText("index.html")).toBe(html);
+      expect(zip.getEntries().some((entry) => entry.entryName.startsWith("_ext/"))).toBe(false);
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
   it("packages the project and skips hidden files and node_modules", () => {
     const dir = makeProjectDir();
     try {
@@ -273,6 +420,35 @@ describe("createPublishArchive", () => {
     }
   });
 
+  it("allows .hyperframesignore to re-include a hidden directory", () => {
+    const dir = makeProjectDir();
+    try {
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+      mkdirSync(join(dir, ".media"));
+      writeFileSync(join(dir, ".media", "logo.png"), "logo", "utf-8");
+      writeFileSync(join(dir, ".hyperframesignore"), "!/.media/\n!/.media/**\n", "utf-8");
+
+      const zip = new AdmZip(createPublishArchive(dir).buffer);
+      expect(zip.getEntries().map((entry) => entry.entryName)).toContain(".media/logo.png");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still excludes an unmatched hidden directory by default", () => {
+    const dir = makeProjectDir();
+    try {
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+      mkdirSync(join(dir, ".cache"));
+      writeFileSync(join(dir, ".cache", "entry.bin"), "cache", "utf-8");
+
+      const zip = new AdmZip(createPublishArchive(dir).buffer);
+      expect(zip.getEntries().map((entry) => entry.entryName)).not.toContain(".cache/entry.bin");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("fails clearly when .hyperframesignore excludes index.html", () => {
     const dir = makeProjectDir();
     try {
@@ -294,6 +470,33 @@ describe("createPublishArchive (U6 cloud-render regression guard)", () => {
   // `createPublishArchive` is exactly the thin composition of
   // `buildPublishFileMap` + `zipPublishFileMap` with no baking hook, and that
   // a local video asset's original bytes/HTML pass through unmodified.
+  it("zips the same files to the same bytes across a two-second boundary", () => {
+    // The flake this pins: adm-zip stamps each entry with `new Date()` as it is
+    // constructed, and a ZIP timestamp resolves to two seconds — so two runs
+    // either side of a boundary produced different bytes for identical content.
+    // The byte-identity assertion below could only ever fail this way, and did,
+    // rarely enough to survive since July.
+    //
+    // Moving the clock is what reproduces it: back-to-back builds land in the
+    // same bucket almost always, which is exactly why it hid.
+    const dir = makeProjectDir();
+    try {
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+        const first = createPublishArchive(dir);
+        vi.setSystemTime(new Date("2026-01-01T00:00:03.000Z"));
+        const second = createPublishArchive(dir);
+        expect(first.buffer.equals(second.buffer)).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps a source video byte-identical and excludes proxies from the cloud-render archive", () => {
     const dir = makeProjectDir();
     try {
@@ -531,9 +734,11 @@ describe("uploadTimeoutMs", () => {
 // nested in a describe) so the reset logic isn't duplicated per group.
 beforeEach(() => {
   authMocks.tryResolveCredential.mockReset().mockResolvedValue(null);
+  oauthMocks.refreshTokens.mockReset();
   linkMocks.writeProjectLink.mockReset();
   vi.stubEnv("HYPERFRAMES_PUBLISHED_PROJECTS_API_URL", "");
   vi.stubEnv("HEYGEN_API_URL", "");
+  vi.stubEnv("HYPERFRAMES_ENV", "prod");
 });
 
 afterEach(() => {
@@ -541,11 +746,43 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-const jsonHeaders = { "content-type": "application/json", heygen_route: "canary" };
+const jsonHeaders = { "content-type": "application/json" };
 const signedStagedS3Url =
   "https://s3.example.com/upload?X-Amz-SignedHeaders=content-length;content-type;host;x-amz-server-side-encryption";
 
 describe("publishProjectArchive", () => {
+  // fails without the fix: with no archive passed in, files from outside the project were uploaded unasked.
+  it("leaves files from outside the project out of an archive it builds itself", async () => {
+    const dir = makeProjectDir();
+    const outside = mkdtempSync(join(tmpdir(), "hf-outside-"));
+    const fetchMock = directFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      writeFileSync(join(outside, "logo.png"), "png", "utf-8");
+      writeFileSync(join(dir, "index.html"), `<img src="${join(outside, "logo.png")}">`, "utf-8");
+      writeFileSync(join(dir, "styles.css"), "body {}", "utf-8");
+
+      await publishProjectArchive(dir);
+
+      const file = (fetchMock.mock.calls[1]![1].body as FormData).get("file") as File;
+      const entries = new AdmZip(Buffer.from(await file.arrayBuffer()))
+        .getEntries()
+        .map((entry) => entry.entryName);
+      expect(entries).toContain("styles.css");
+      expect(entries.filter((name) => name.includes("logo.png"))).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("takes the publish service from the environment under HYPERFRAMES_ENV=dev", () => {
+    vi.stubEnv("HYPERFRAMES_ENV", "dev");
+    expect(getPublishApiBaseUrl()).toBe("https://api2.heygen.com");
+    vi.stubEnv("HEYGEN_API_URL", "https://api2.example.test");
+    expect(getPublishApiBaseUrl()).toBe("https://api2.example.test");
+  });
+
   it("uploads through the staged publish flow and returns the stable project URL", async () => {
     const dir = makeProjectDir();
     const fetchMock = stagedFetch(
@@ -605,9 +842,33 @@ describe("publishProjectArchive", () => {
 });
 
 describe("publishProjectArchive", () => {
+  it("keeps server-sent upload headers in any case without adding duplicates", async () => {
+    const dir = makeProjectDir();
+    const serverHeaders = {
+      "Content-Type": "application/zip",
+      "Content-Length": "123",
+      "X-Amz-Server-Side-Encryption": "AES256",
+    };
+    const fetchMock = stagedFetch(
+      { file_count: 1 },
+      { upload_url: signedStagedS3Url, upload_headers: serverHeaders },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+      await publishProjectArchive(dir);
+      expect(fetchMock.mock.calls[1]![1].headers).toEqual(serverHeaders);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("publishProjectArchive", () => {
   it("authenticates staged metadata requests but not the presigned S3 upload", async () => {
     const dir = makeProjectDir();
-    const fetchMock = stagedFetch();
+    const fetchMock = stagedFetch(OWNED);
 
     try {
       await runAuthenticatedPublish(fetchMock, dir);
@@ -623,7 +884,7 @@ describe("publishProjectArchive", () => {
 
   it("authenticates the direct fallback request", async () => {
     const dir = makeProjectDir();
-    const fetchMock = directFetch();
+    const fetchMock = directFetch(OWNED);
 
     try {
       await runAuthenticatedPublish(fetchMock, dir);
@@ -652,7 +913,7 @@ describe("publishProjectArchive", () => {
       expect(fetchMock).toHaveBeenCalledTimes(2);
       expectFetchCall(fetchMock, 2, "https://api2.heygen.com/v1/hyperframes/projects/publish", {
         method: "POST",
-        headers: { heygen_route: "canary" },
+        headers: {},
       });
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -729,6 +990,190 @@ describe("publishProjectArchive", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("retries a transient presigned upload network failure once", async () => {
+    const dir = makeProjectDir();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(uploadResponse())
+      .mockRejectedValueOnce(networkFailure("ECONNRESET", "socket disconnected"))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(publishedResponse());
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+
+      const result = await publishProjectArchive(dir);
+
+      expect(result.projectId).toBe("hfp_123");
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(fetchMock.mock.calls[1]![0]).toBe("https://s3.example.com/upload");
+      expect(fetchMock.mock.calls[2]![0]).toBe("https://s3.example.com/upload");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("waits briefly before retrying a transport failure", async () => {
+    vi.useFakeTimers();
+    const dir = makeProjectDir();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(uploadResponse())
+      .mockRejectedValueOnce(networkFailure("EAI_AGAIN", "temporary DNS failure"))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(publishedResponse());
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+
+      const publish = publishProjectArchive(dir);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(199);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(publish).resolves.toMatchObject({ projectId: "hfp_123" });
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+    } finally {
+      await vi.runAllTimersAsync();
+      vi.useRealTimers();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports the upload stage and transport cause after the retry is exhausted", async () => {
+    const dir = makeProjectDir();
+    const signedUrl =
+      "https://s3.example.com/upload?X-Amz-Credential=secret&X-Amz-Signature=do-not-print";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(uploadResponse({ upload_url: signedUrl }))
+      .mockRejectedValueOnce(
+        networkFailure("EAI_AGAIN", "getaddrinfo EAI_AGAIN s3.example.com", {
+          errno: -3001,
+          syscall: "getaddrinfo",
+        }),
+      )
+      .mockRejectedValueOnce(
+        networkFailure("EAI_AGAIN", "getaddrinfo EAI_AGAIN s3.example.com", {
+          errno: -3001,
+          syscall: "getaddrinfo",
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+
+      const promise = publishProjectArchive(dir);
+      await expect(promise).rejects.toThrow(
+        "Failed to upload project archive after 2 attempts: fetch failed (EAI_AGAIN, syscall=getaddrinfo, errno=-3001: getaddrinfo EAI_AGAIN s3.example.com)",
+      );
+      await expect(promise).rejects.not.toThrow("do-not-print");
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports the prepare stage and explains disabled Node proxy support", async () => {
+    const dir = makeProjectDir();
+    vi.stubEnv("HTTPS_PROXY", "http://proxy.example.com:8080");
+    vi.stubEnv("NODE_USE_ENV_PROXY", "");
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(networkFailure("ENETUNREACH", "network is unreachable"))
+      .mockRejectedValueOnce(networkFailure("ENETUNREACH", "network is unreachable"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+
+      await expect(publishProjectArchive(dir)).rejects.toThrow(
+        "Failed to prepare project upload after 2 attempts: fetch failed (ENETUNREACH: network is unreachable). Proxy variables are set but ignored by Node fetch; if this network requires them, retry with NODE_USE_ENV_PROXY=1",
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("retries a transient prepare-upload network failure once", async () => {
+    const dir = makeProjectDir();
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(networkFailure("EAI_AGAIN", "temporary DNS failure"))
+      .mockResolvedValueOnce(uploadResponse())
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(publishedResponse());
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+
+      const result = await publishProjectArchive(dir);
+
+      expect(result.projectId).toBe("hfp_123");
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(fetchMock.mock.calls[0]![0]).toBe(
+        "https://api2.heygen.com/v1/hyperframes/projects/publish/upload",
+      );
+      expect(fetchMock.mock.calls[1]![0]).toBe(
+        "https://api2.heygen.com/v1/hyperframes/projects/publish/upload",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not retry a request that reached its timeout", async () => {
+    const dir = makeProjectDir();
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new DOMException("The operation was aborted due to timeout", "TimeoutError"),
+      )
+      .mockResolvedValueOnce(uploadResponse())
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(publishedResponse());
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+
+      await expect(publishProjectArchive(dir)).rejects.toThrow(
+        "Failed to prepare project upload: The operation was aborted due to timeout",
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports the finalize stage and transport cause", async () => {
+    const dir = makeProjectDir();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(uploadResponse())
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockRejectedValueOnce(networkFailure("ECONNRESET", "socket disconnected"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+
+      await expect(publishProjectArchive(dir)).rejects.toThrow(
+        "Failed to finalize project publish: fetch failed (ECONNRESET: socket disconnected)",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 /** Staged flow returning an already-owned, already-claimed stable project. */
@@ -736,8 +1181,7 @@ function ownedStagedFetch() {
   return stagedFetch({
     project_id: "hfp_stable",
     url: "https://hyperframes.dev/p/hfp_stable",
-    claim_token: "",
-    claimed: true,
+    ...OWNED,
   });
 }
 
@@ -770,7 +1214,7 @@ describe("publishProjectArchive", () => {
   it("never sends a project id or persists a link when anonymous", async () => {
     // Default credential is null (anonymous).
     const dir = makeProjectDir();
-    const fetchMock = ownedStagedFetch();
+    const fetchMock = stagedFetch();
     vi.stubGlobal("fetch", fetchMock);
 
     try {
@@ -815,5 +1259,389 @@ describe("publishProjectArchive", () => {
     const anon = await publishWithTeamSpace(false);
     expect(anon.mock.calls[0]![1].headers).not.toHaveProperty("x-space-id");
     expect(anon.mock.calls[2]![1].headers).not.toHaveProperty("x-space-id");
+  });
+});
+
+describe("publishProjectArchive with a credential the server rejects", () => {
+  const EXPIRED = "Your login expired. Run hyperframes auth login, then publish again.";
+  const unauthorized = () =>
+    new Response(JSON.stringify({ message: "Unauthorized" }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+
+  async function publishExpecting(fetchMock: ReturnType<typeof vi.fn>, message: string) {
+    const dir = makeProjectDir();
+    try {
+      await expect(runAuthenticatedPublish(fetchMock, dir)).rejects.toThrow(message);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it("stops at the first request, before any upload, with a re-login message", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(unauthorized());
+    await publishExpecting(fetchMock, EXPIRED);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expectAuthorizedHeaders(fetchMock, 0);
+  });
+
+  it("says the same when the final publish request is refused", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(uploadResponse())
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(unauthorized());
+    await publishExpecting(fetchMock, EXPIRED);
+  });
+
+  it("says the same on the legacy multipart publish", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("not found", { status: 404 }))
+      .mockResolvedValueOnce(unauthorized());
+    await publishExpecting(fetchMock, EXPIRED);
+  });
+
+  it("asks a signed-out publish to log in when the upload route answers 401, with no fallback", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(unauthorized());
+    vi.stubGlobal("fetch", fetchMock);
+    const dir = makeProjectDir();
+    try {
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+      await expect(publishProjectArchive(dir)).rejects.toThrow(
+        "Publishing needs an account. Run hyperframes auth login to publish.",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]![0]).toMatch(/\/publish\/upload$/);
+  });
+
+  it("does not blame the login for a 401 from the storage upload, which carries no credential", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(uploadResponse())
+      .mockResolvedValueOnce(new Response("denied", { status: 401 }));
+    await publishExpecting(fetchMock, "Failed to upload project archive");
+  });
+
+  it("refuses an anonymous result for a signed-in publish and links nothing", async () => {
+    await publishExpecting(stagedFetch(), EXPIRED);
+    await publishExpecting(directFetch(), EXPIRED);
+    expect(linkMocks.writeProjectLink).not.toHaveBeenCalled();
+  });
+
+  it("publishes with an API key, which the server never marks as owned, and links nothing", async () => {
+    const dir = makeProjectDir();
+    try {
+      authMocks.tryResolveCredential.mockResolvedValue({
+        type: "api_key",
+        key: "k",
+        source: "env",
+      });
+      vi.stubGlobal("fetch", stagedFetch());
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+      const result = await publishProjectArchive(dir);
+      expect(result.claimToken).toBe("claim-token");
+      expect(linkMocks.writeProjectLink).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("names the environment API key instead of asking for a login it would not use", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(unauthorized());
+    const dir = makeProjectDir();
+    try {
+      authMocks.tryResolveCredential.mockResolvedValue({
+        type: "api_key",
+        key: "k",
+        source: "env",
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+      await expect(publishProjectArchive(dir)).rejects.toThrow(
+        "HEYGEN_API_KEY was rejected. Fix or unset it, then publish again.",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it("names a rejected host access token instead of asking for a login it would not use", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(unauthorized());
+    const dir = makeProjectDir();
+    try {
+      authMocks.tryResolveCredential.mockResolvedValue({
+        type: "oauth",
+        access_token: "host-token",
+        source: "env_oauth",
+        refreshable: false,
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+      await expect(publishProjectArchive(dir)).rejects.toThrow(
+        "HEYGEN_ACCESS_TOKEN was rejected. Fix or unset it, then publish again.",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("publishProjectArchive with an expired login it can refresh", () => {
+  const expiredLogin = {
+    type: "oauth",
+    access_token: "stale-token",
+    refresh_token: "refresh-token",
+    source: "file_json",
+    refreshable: true,
+  };
+
+  it("refreshes the login and publishes with the new token", async () => {
+    oauthMocks.refreshTokens.mockResolvedValueOnce({ access_token: "fresh-token" });
+    authMocks.tryResolveCredential.mockResolvedValue(expiredLogin);
+    const fetchMock = stagedFetch(OWNED);
+    vi.stubGlobal("fetch", fetchMock);
+    const dir = makeProjectDir();
+    try {
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+      await publishProjectArchive(dir);
+      expect(oauthMocks.refreshTokens).toHaveBeenCalledWith("refresh-token");
+      expect(fetchMock.mock.calls[0]![1].headers).toEqual(
+        expect.objectContaining({ authorization: "Bearer fresh-token" }),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The command checks the login before a proxy bake that can outlast it.
+  it("refreshes a passed login that expired since it was checked, without resolving again", async () => {
+    oauthMocks.refreshTokens.mockResolvedValueOnce({ access_token: "fresh-token" });
+    const fetchMock = stagedFetch(OWNED);
+    vi.stubGlobal("fetch", fetchMock);
+    const dir = makeProjectDir();
+    try {
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+      await publishProjectArchive(dir, {
+        credential: {
+          ...expiredLogin,
+          expires_at: new Date(Date.now() - 1000),
+          refreshable: false,
+        },
+      } as never);
+      expect(authMocks.tryResolveCredential).not.toHaveBeenCalled();
+      expect(fetchMock.mock.calls[0]![1].headers).toEqual(
+        expect.objectContaining({ authorization: "Bearer fresh-token" }),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("asks for a new login, without sending anything, when a passed login expired and cannot refresh", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const { refresh_token: _none, ...noRefresh } = expiredLogin;
+    const dir = makeProjectDir();
+    try {
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+      await expect(
+        publishProjectArchive(dir, {
+          credential: { ...noRefresh, expires_at: new Date(Date.now() - 1000), refreshable: false },
+        } as never),
+      ).rejects.toThrow("Your login expired. Run hyperframes auth login, then publish again.");
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("asks for a new login, without sending anything, when the refresh is refused", async () => {
+    oauthMocks.refreshTokens.mockRejectedValueOnce(ErrRefreshFailed("invalid_grant"));
+    authMocks.tryResolveCredential.mockResolvedValue(expiredLogin);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const dir = makeProjectDir();
+    try {
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+      await expect(publishProjectArchive(dir)).rejects.toThrow(
+        "Your login expired. Run hyperframes auth login, then publish again.",
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("publishProjectArchive with an expired login and no refresh token", () => {
+  let fixture: Awaited<ReturnType<typeof setupTempAuthEnv>>;
+
+  beforeEach(async () => {
+    fixture = await setupTempAuthEnv("hf-publish-expired-");
+    const { tryResolveCredential } =
+      await vi.importActual<typeof import("../auth/resolver.js")>("../auth/resolver.js");
+    authMocks.tryResolveCredential.mockImplementation(tryResolveCredential);
+  });
+
+  afterEach(async () => {
+    await fixture.restore();
+  });
+
+  it("asks for a new login instead of publishing anonymously", async () => {
+    const past = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    await writeStore({ oauth: { access_token: "stale-token", expires_at: past } });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const dir = makeProjectDir();
+    try {
+      writeFileSync(join(dir, "index.html"), "<html></html>", "utf-8");
+      await expect(publishProjectArchive(dir)).rejects.toThrow(
+        "Your login expired. Run hyperframes auth login, then publish again.",
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("readStaged", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "hf-staged-"));
+    writeFileSync(join(dir, "index.html"), "<html></html>");
+    writeFileSync(join(dir, "clip.bin"), "staged bytes");
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("reads a file left on disk only while it is the file that was staged", () => {
+    const staged = stagePublishFiles(dir, 4).get("clip.bin")!;
+    expect(Buffer.isBuffer(staged)).toBe(false);
+    expect(readStaged(staged).toString()).toBe("staged bytes");
+
+    writeFileSync(join(dir, "swap.bin"), "other  bytes");
+    utimesSync(join(dir, "swap.bin"), 1, 1);
+    renameSync(join(dir, "swap.bin"), join(dir, "clip.bin"));
+    expect(() => readStaged(staged)).toThrow(/changed on disk/);
+  });
+});
+
+describe("createPublishArchive referenced dot-paths", () => {
+  const clip = ".hyperframes/prepared-assets/clip.mp4";
+
+  function projectWith(html: string, files: Record<string, string>): string {
+    const dir = makeProjectDir();
+    writeFileSync(join(dir, "index.html"), html, "utf-8");
+    for (const [name, body] of Object.entries(files)) {
+      mkdirSync(dirname(join(dir, name)), { recursive: true });
+      writeFileSync(join(dir, name), body, "utf-8");
+    }
+    return dir;
+  }
+
+  const names = (dir: string) =>
+    new AdmZip(createPublishArchive(dir).buffer).getEntries().map((e) => e.entryName);
+
+  it("carries a referenced file under a dot-folder", () => {
+    const dir = projectWith(`<video src="${clip}"></video>`, { [clip]: "v" });
+    expect(names(dir)).toContain(clip);
+  });
+
+  it("fails before upload when a referenced file is missing", () => {
+    const dir = projectWith(`<video src="${clip}"></video>`, {});
+    expect(() => createPublishArchive(dir)).toThrow(clip);
+  });
+
+  it("does not fail on a missing href, source fallback, srcset candidate or CSS url", () => {
+    const dir = projectWith(
+      `<link rel="stylesheet" href="s.css"><a href="notes.html">n</a><video><source src="a.webm"><source src="a.mp4"></video>` +
+        `<img src="a.png" srcset="a.png 1x, a@2x.png 2x"><style>.a{background:url(gone.jpg)}</style>`,
+      { "a.mp4": "v", "a.png": "p", "s.css": ".a{background:url(gone.jpg)}" },
+    );
+    expect(() => createPublishArchive(dir)).not.toThrow();
+    expect(names(dir)).not.toContain("notes.html");
+  });
+
+  it("fails on a missing video, audio, img src or poster, naming the file", () => {
+    for (const tag of [
+      'video src="gone.mp4"',
+      'audio src="gone.mp3"',
+      'img src="gone.png"',
+      'video poster="gone.jpg"',
+    ]) {
+      const name = /"(gone\.[a-z0-9]+)"/.exec(tag)![1]!;
+      expect(() =>
+        createPublishArchive(projectWith(`<${tag}></${tag.split(" ")[0]}>`, {})),
+      ).toThrow(name);
+    }
+  });
+
+  it("leaves out an unreferenced .env", () => {
+    const dir = projectWith(`<video src="${clip}"></video>`, { [clip]: "v", ".env": "SECRET=1" });
+    expect(names(dir)).not.toContain(".env");
+  });
+
+  it("leaves out an env file or a tool record even when the markup names it", () => {
+    const dir = projectWith(
+      `<link href=".env"><img src=".env.local"><a href=".hyperframes/history-turn.json">h</a>`,
+      { ".env": "SECRET=1", ".env.local": "SECRET=1", ".hyperframes/history-turn.json": "{}" },
+    );
+    expect(names(dir)).toEqual(["index.html"]);
+  });
+});
+
+describe("archive keys for names written in either Unicode form", () => {
+  // "é" as one code point (composed) and as e + a combining accent (decomposed): macOS file pickers store the latter.
+  const composed = "assets/Photos et vidéos 1.mp4";
+  const decomposed = "assets/Photos et vidéos 1.mp4";
+
+  it("keys a file stored decomposed by the composed name a page uses, so the renderer finds it", () => {
+    const dir = makeProjectDir();
+    mkdirSync(join(dir, "assets"), { recursive: true });
+    writeFileSync(join(dir, decomposed), "video");
+    writeFileSync(join(dir, "index.html"), `<video src="${composed}"></video>`);
+
+    const map = buildPublishFileMap(dir);
+
+    expect([...map.keys()].sort()).toEqual([composed, "index.html"]);
+    expect(map.get(composed)?.toString()).toBe("video");
+    const entries = new AdmZip(zipPublishFileMap(map).buffer).getEntries().map((e) => e.entryName);
+    expect(entries).toContain(composed);
+  });
+
+  it("rewrites a page and a stylesheet that name a decomposed file the way the disk lists it", () => {
+    const dir = makeProjectDir();
+    mkdirSync(join(dir, "assets"), { recursive: true });
+    writeFileSync(join(dir, decomposed), "video");
+    writeFileSync(
+      join(dir, "assets/styles.css"),
+      `.a { background: url("${decomposed.slice(7)}"); }`,
+    );
+    writeFileSync(
+      join(dir, "index.html"),
+      `<video src="${decomposed}"></video><img src="${encodeURI(decomposed)}">`,
+    );
+
+    const map = buildPublishFileMap(dir);
+
+    expect([...map.keys()].sort()).toEqual([composed, "assets/styles.css", "index.html"]);
+    expect(map.get("index.html")?.toString()).toBe(
+      `<video src="${composed}"></video><img src="${encodeURI(composed)}">`,
+    );
+    expect(map.get("assets/styles.css")?.toString()).toContain(composed.slice(7));
+  });
+
+  it("refuses two files that differ only by Unicode form instead of letting one overwrite the other", () => {
+    const dir = makeProjectDir();
+    mkdirSync(join(dir, "assets"), { recursive: true });
+    writeFileSync(join(dir, composed), "first");
+    writeFileSync(join(dir, decomposed), "second");
+    writeFileSync(join(dir, "index.html"), "<html></html>");
+
+    expect(() => buildPublishFileMap(dir)).toThrow(/same name|differ only/i);
   });
 });

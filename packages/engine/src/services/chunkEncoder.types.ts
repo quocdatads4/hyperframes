@@ -10,6 +10,8 @@ export interface EncoderOptions {
   preset?: string;
   quality?: number;
   bitrate?: string;
+  maxBitrate?: string;
+  bufferSize?: string;
   pixelFormat?: string;
   /** libvpx-vp9 -cpu-used value. Defaults to the engine VP9 setting. */
   vp9CpuUsed?: number;
@@ -35,6 +37,8 @@ export interface EncoderOptions {
    * for compression and break concat-copy seams.
    */
   lockGopForChunkConcat?: boolean;
+  softwareEncoderThreads?: number;
+
   /**
    * Required when `lockGopForChunkConcat` is `true`. Number of frames per
    * GOP — set to `chunkSize` so every chunk starts on an IDR keyframe and
@@ -50,6 +54,8 @@ export interface EncodeResult {
   framesEncoded: number;
   fileSize: number;
   error?: string;
+  /** Stable machine-readable cause for failures safe to retry on a fresh host. */
+  failureReason?: "external_interruption";
 }
 
 export interface MuxResult {
@@ -57,4 +63,6 @@ export interface MuxResult {
   outputPath: string;
   durationMs: number;
   error?: string;
+  /** Stable machine-readable cause for failures safe to retry on a fresh host. */
+  failureReason?: "external_interruption";
 }

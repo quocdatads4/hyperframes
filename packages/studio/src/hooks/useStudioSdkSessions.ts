@@ -1,6 +1,7 @@
-import { useEffect, type MutableRefObject } from "react";
+import { useEffect } from "react";
 import { useSdkSession } from "./useSdkSession";
 import { usePreviewVariablesStore } from "./previewVariablesStore";
+import { useStableHandlers } from "./useStableHandlers";
 
 /**
  * Open the studio's SDK session with master-view semantics.
@@ -17,8 +18,10 @@ import { usePreviewVariablesStore } from "./previewVariablesStore";
 export function useStudioSdkSessions(
   projectId: string | null,
   activeCompPath: string | null,
-  domEditSaveTimestampRef: MutableRefObject<number>,
   masterCompPath: string | null,
+  fileTree: readonly string[] = [],
+  fileTreeLoaded = false,
+  refreshFileTree?: () => void | Promise<void>,
 ) {
   // On the master view (no explicit comp) the schema panels target the project's
   // resolved main composition — the first `.html` in the tree, not a hardcoded
@@ -27,11 +30,13 @@ export function useStudioSdkSessions(
   const sdkHandle = useSdkSession(
     projectId,
     activeCompPath ?? masterCompPath,
-    domEditSaveTimestampRef,
+    fileTree,
+    fileTreeLoaded,
+    refreshFileTree,
   );
   const editFlowSdkSession = activeCompPath ? sdkHandle.session : null;
   useEffect(() => {
     usePreviewVariablesStore.getState().setValues(null);
   }, [projectId, activeCompPath]);
-  return { sdkHandle, editFlowSdkSession };
+  return { sdkHandle: useStableHandlers(sdkHandle, projectId), editFlowSdkSession };
 }

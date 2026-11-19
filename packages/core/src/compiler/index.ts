@@ -33,11 +33,16 @@ export {
   type BundledHostCompositionIdentity,
   bundleToSingleHtml,
   type BundleOptions,
+  type BundlePrivateFiles,
+  type BundleScriptProvenance,
   prepareFlattenedInnerRoot,
   FLATTENED_INNER_ROOT_STRIP_ATTRS,
   emitRootCompositionVariableStyles,
+  MAX_COMPOSITION_VARIABLE_STYLE_BYTES,
+  parsesAsScript,
 } from "./htmlBundler";
 export { readDeclaredDefaults, parseHostVariableValues } from "../runtime/getVariables";
+export { boundMediaSrc } from "../runtime/applyVariableBindings";
 
 export {
   extractCompiledHtmlParityContract,
@@ -50,10 +55,31 @@ export {
 export {
   RUNTIME_BOOTSTRAP_ATTR,
   injectScriptsAtHeadStart,
+  injectTagsAtHeadStart,
   injectScriptsIntoHtml,
+  insertBeforeCloseTag,
+  insertRuntimeTag,
+  isRuntimeFileUrl,
   parseHTMLContent,
   stripEmbeddedRuntimeScripts,
 } from "./htmlDocument";
+
+export { addScenePartsManifest } from "./scenePartsManifest";
+
+// Script ordering shared by the bundler and the producer coalescers
+export {
+  AFTER_FONTS_SCRIPT_TYPE,
+  compositionStyle,
+  cssStyleMergeKey,
+  isAlwaysAppliedStyle,
+  deferScriptsUntilFonts,
+  headStyleRuns,
+  inlineScriptRuns,
+  styleElementsFor,
+  type CompositionStyle,
+  type InlineScriptRun,
+} from "./scriptRuns";
+export { isJavaScriptType } from "./compositionAssembly";
 
 // Static guard
 export {
@@ -65,16 +91,20 @@ export {
 // Composition isolation helpers
 export {
   buildVariablesByCompScript,
+  emitVariablesByCompScript,
+  dedupeFontFaceRules,
   scopeCssToComposition,
   wrapScopedCompositionScript,
 } from "./compositionScoping";
 
 // Sub-composition inlining (shared between bundler and producer)
 export {
+  ensureExternalLinkTag,
   inlineSubCompositions,
   type InlineSubCompositionsOptions,
   type InlineSubCompositionsResult,
 } from "./inlineSubCompositions";
+export { extractStandaloneEntryFromIndex, isTemplateEntry } from "./standaloneEntry";
 
 // Sub-composition usability check (shared between the inliner, lint, and the
 // render pre-flight abort) — single source of truth for "is this
@@ -88,3 +118,12 @@ export {
 
 // Asset-path primitives (shared across core, producer, CLI)
 export { CSS_URL_RE, PATH_ATTRS, isNonRelativeUrl, isPathInside } from "./assetPaths";
+
+export {
+  AUDIO_GROUP_RENDER_ID_ATTR,
+  MEDIA_RENDER_ID_ATTR,
+  assignMediaRenderIds,
+} from "./mediaRenderIds";
+
+export { ensureExternalScriptTag } from "./externalScripts";
+export { emitMountedModuleScripts } from "./importMaps";

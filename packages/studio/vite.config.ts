@@ -1,9 +1,29 @@
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
-import { readFileSync, readdirSync, existsSync, lstatSync, realpathSync } from "node:fs";
+import tailwindcss from "@tailwindcss/vite";
+import {
+  copyFileSync,
+  readFileSync,
+  readdirSync,
+  existsSync,
+  lstatSync,
+  realpathSync,
+} from "node:fs";
+import { isIP } from "node:net";
 import { join, resolve } from "node:path";
 import { readNodeRequestBody } from "./vite.request-body.js";
-import { createViteAdapter, isPathWithin } from "./vite.adapter";
+import { bindNodeRequestSignal } from "./vite.request-signal.js";
+import { watch } from "chokidar";
+import { createProjectSignatureCache, createViteAdapter } from "./vite.adapter";
+import { previewConfigPayload } from "./vite.preview-config";
+import { loadStudioServerDevModule } from "./vite.studio-server-module";
+import type { openProjectHistory } from "@hyperframes/studio-server";
+import { previewChangeOwner } from "./vite.preview-watch";
+import {
+  hostHeaderAllowed,
+  PREVIEW_ALLOWED_HOSTS_ENV,
+  previewAllowedHostsFromEnv,
+} from "../studio-server/src/helpers/requestIdentity";
 
 async function loadRuntimeSourceForDev(
   server: import("vite").ViteDevServer,
@@ -22,6 +42,30 @@ async function loadRuntimeSourceForDev(
 }
 
 const studioPkg = JSON.parse(readFileSync(resolve(__dirname, "package.json"), "utf-8"));
+
+/**
+ * Copies the build's one CSS asset, unhashed, to `dist/styles.css` for the
+ * `./styles.css` export. Throws if the build ever emits more than one.
+ */
+export function stableStylesCssPlugin(): Plugin {
+  return {
+    name: "studio-stable-styles-css",
+    writeBundle(options, bundle) {
+      const cssAssets = Object.values(bundle).filter(
+        (item) => item.type === "asset" && item.fileName.endsWith(".css"),
+      );
+      if (cssAssets.length !== 1) {
+        throw new Error(
+          `stableStylesCssPlugin: expected exactly one CSS asset for the ./styles.css ` +
+            `export, found ${cssAssets.length} (${cssAssets.map((a) => a.fileName).join(", ") || "none"}). ` +
+            `Scope this plugin to the entry stylesheet instead of assuming a single emit.`,
+        );
+      }
+      const outDir = options.dir ?? "dist";
+      copyFileSync(join(outDir, cssAssets[0]!.fileName), join(outDir, "styles.css"));
+    },
+  };
+}
 
 // ── Bridge Hono fetch → Node http response ───────────────────────────────────
 
@@ -53,6 +97,17 @@ async function bridgeHonoResponse(
   res.end();
 }
 
+// Vite's own rule (IP literals, *.localhost, leading-dot entries), so the API serves every Host Vite serves the page on.
+function viteAllowsHost(host: string, allowedHosts: readonly string[]): boolean {
+  const bracketed = /^\[([^\]]+)\]/.exec(host);
+  if (bracketed) return isIP(bracketed[1]!) === 6;
+  const name = host.split(":")[0]!.toLowerCase();
+  if (isIP(name) === 4 || name === "localhost" || name.endsWith(".localhost")) return true;
+  return allowedHosts.some(
+    (allowed) => allowed.startsWith(".") && (name === allowed.slice(1) || name.endsWith(allowed)),
+  );
+}
+
 // ── Vite plugin ──────────────────────────────────────────────────────────────
 
 function devProjectApi(): Plugin {
@@ -62,26 +117,133 @@ function devProjectApi(): Plugin {
   return {
     name: "studio-dev-api",
     configureServer(server): void {
+      // Watch project directories on a watcher of our own. Vite's is told to
+      // ignore them (see `server.watch.ignored`), because it answers an html
+      // change with a full page reload; this one only announces the change and
+      // lets Studio decide what to do with it.
+      const watchedProjects = new Map<string, string>();
+      try {
+        for (const entry of readdirSync(dataDir, { withFileTypes: true })) {
+          const full = join(dataDir, entry.name);
+          try {
+            watchedProjects.set(
+              lstatSync(full).isSymbolicLink() ? realpathSync(full) : full,
+              entry.name,
+            );
+          } catch {
+            /* skip broken symlinks */
+          }
+        }
+      } catch {
+        /* dataDir doesn't exist yet */
+      }
+
+      const projectWatcher = watch([...watchedProjects.keys()], {
+        ignoreInitial: true,
+        // A project write is a whole-file replace; wait for it to settle so a
+        // half-written composition is never announced.
+        awaitWriteFinish: { stabilityThreshold: 40, pollInterval: 10 },
+      });
+
+      // This watcher, and not Vite's, is what clears the preview signature.
+      // Vite's ignores `data/projects/**`, so subscribing the cache to it left
+      // the ETag frozen for the life of the dev server: the preview answered
+      // every revalidation with 304 and thumbnails regenerated after an edit
+      // still rendered the pre-edit composition. Every event type counts, since
+      // an added or deleted asset changes the signature as surely as an edit.
+      const signatureCache = createProjectSignatureCache({
+        watch: (projectDir) => void projectWatcher.add(projectDir),
+      });
+      for (const event of ["add", "change", "unlink", "addDir", "unlinkDir"] as const) {
+        projectWatcher.on(event, (filePath: string) => signatureCache.invalidate(filePath));
+      }
+
       let _api: { fetch: (req: Request) => Promise<Response> } | null = null;
       let _studioServerModule: {
-        createStudioApi: (adapter: ReturnType<typeof createViteAdapter>) => {
+        createStudioApi: (
+          adapter: ReturnType<typeof createViteAdapter>,
+          options?: { allowedHosts?: readonly string[] },
+        ) => {
           fetch: (req: Request) => Promise<Response>;
         };
-        consumeFileWriteReceipt?: (path: string) => {
-          path: string;
-          version: string;
-          writeToken: string;
-        } | null;
+        previewAllowedHostsFromEnv: () => string[];
+        identifyFileWrite: (
+          path: string,
+          expectedVersion: string,
+        ) => { path: string; version: string; writeToken: string } | null;
+        fileContentVersion: (content: string) => string;
+        affectsPreview: (projectDir: string, changedPath: string) => boolean;
+        DELETED_VERSION: string;
+        openProjectHistory: typeof openProjectHistory;
       } | null = null;
       const getApi = async () => {
         if (!_api) {
-          const mod = await server.ssrLoadModule("@hyperframes/studio-server");
-          _studioServerModule = mod as typeof _studioServerModule;
-          const adapter = createViteAdapter(dataDir, server);
-          _api = mod.createStudioApi(adapter);
+          // The package's `node` condition resolves to ignored dist output,
+          // which may predate the source under test. Studio dev owns a source
+          // workspace, so load that producer explicitly.
+          const mod = (await loadStudioServerDevModule(server, __dirname)) as NonNullable<
+            typeof _studioServerModule
+          >;
+          // The cast above is the only thing standing between a renamed export and
+          // a dev server that silently reports every Studio write as external.
+          for (const name of [
+            "identifyFileWrite",
+            "fileContentVersion",
+            "affectsPreview",
+            "openProjectHistory",
+            "previewAllowedHostsFromEnv",
+          ] as const) {
+            if (typeof mod[name] !== "function") {
+              throw new Error(`@hyperframes/studio-server dev module is missing ${name}()`);
+            }
+          }
+          _studioServerModule = mod;
+          // The engine records its write receipts in this module, where the watcher below reads them.
+          const adapter = createViteAdapter(dataDir, server, signatureCache, {
+            openHistory: mod.openProjectHistory,
+            // Projects can be created or imported after startup. Keep the canonical
+            // id and real root before the signature cache starts watching them.
+            onResolveProject: (project) => watchedProjects.set(project.dir, project.id),
+          });
+          // Same env var as the CLI preview server: extra hosts whose
+          // writes the API accepts (Codespaces, tunnels).
+          _api = mod.createStudioApi(adapter, {
+            allowedHosts: mod.previewAllowedHostsFromEnv(),
+            sandboxThumbnailCaptures: true,
+          });
         }
         return _api;
       };
+
+      // Vite runs its own Host check after the middlewares added here, so the
+      // plugin's routes check Host first: the CLI preview server's rule plus Vite's.
+      const allowedHosts = [...previewAllowedHostsFromEnv()];
+      if (typeof server.config.server.host === "string")
+        allowedHosts.push(server.config.server.host);
+      server.middlewares.use((req, res, next) => {
+        const url = req.url ?? "";
+        if (url !== "/__hyperframes_config" && !url.startsWith("/api/")) return next();
+        const host = req.headers.host ?? "";
+        if (hostHeaderAllowed(host, allowedHosts) || viteAllowsHost(host, allowedHosts))
+          return next();
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error:
+              `forbidden: host "${host}" is not allowed. ` +
+              `Set ${PREVIEW_ALLOWED_HOSTS_ENV}=${host} to allow it ` +
+              `(comma separated for several hosts).`,
+          }),
+        );
+      });
+
+      server.middlewares.use((req, res, next) => {
+        if (req.url !== "/__hyperframes_config") return next();
+        const payload = previewConfigPayload(process.env, process.pid, studioPkg.version, req);
+        if (!payload) return next();
+        res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify(payload));
+      });
 
       // Runtime endpoint — prefer source build over dist artifact
       server.middlewares.use((req, res, next) => {
@@ -114,6 +276,7 @@ function devProjectApi(): Plugin {
       // API middleware
       server.middlewares.use(async (req, res, next) => {
         if (!req.url?.startsWith("/api/")) return next();
+        const requestSignal = bindNodeRequestSignal(res);
         try {
           const api = await getApi();
           const url = new URL(req.url, `http://${req.headers.host}`);
@@ -131,6 +294,7 @@ function devProjectApi(): Plugin {
             method: req.method,
             headers,
             body,
+            signal: requestSignal.signal,
           });
           const response = await api.fetch(fetchReq);
           await bridgeHonoResponse(response, res);
@@ -140,55 +304,70 @@ function devProjectApi(): Plugin {
             res.writeHead(500, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "Internal server error" }));
           }
+        } finally {
+          requestSignal.dispose();
         }
       });
 
-      // Watch project directories for file changes → HMR
-      const realProjectPaths: string[] = [];
-      try {
-        for (const entry of readdirSync(dataDir, { withFileTypes: true })) {
-          const full = join(dataDir, entry.name);
-          try {
-            const real = lstatSync(full).isSymbolicLink() ? realpathSync(full) : full;
-            realProjectPaths.push(real);
-            server.watcher.add(real);
-          } catch {
-            /* skip broken symlinks */
-          }
-        }
-      } catch {
-        /* dataDir doesn't exist yet */
-      }
-
-      server.watcher.on("change", (filePath: string) => {
-        const isProjectFile = realProjectPaths.some((p) => isPathWithin(p, filePath));
+      projectWatcher.on("change", (filePath: string) => {
+        const owner = previewChangeOwner(watchedProjects, filePath);
+        if (!owner) return;
         if (
-          isProjectFile &&
-          (filePath.endsWith(".html") ||
-            filePath.endsWith(".css") ||
-            filePath.endsWith(".js") ||
-            filePath.endsWith(".json"))
-        ) {
-          console.log(`[Studio] File changed: ${filePath}`);
-          const receipt = _studioServerModule?.consumeFileWriteReceipt?.(filePath) ?? null;
-          server.ws.send({
-            type: "custom",
-            event: "hf:file-change",
-            data: receipt ?? { path: filePath },
-          });
+          !filePath.endsWith(".html") &&
+          !filePath.endsWith(".css") &&
+          !filePath.endsWith(".js") &&
+          !filePath.endsWith(".json")
+        )
+          return;
+        console.log(`[Studio] File changed: ${filePath}`);
+        // The receipt is matched on the file's current bytes, not just its path,
+        // so a write is only recognised as ours when the version agrees. Calling
+        // this without the version could never match, which left every Studio
+        // write looking external and reloaded the preview on each edit.
+        const studioServer = _studioServerModule;
+        let version: string | null = null;
+        try {
+          version = studioServer?.fileContentVersion(readFileSync(filePath, "utf-8")) ?? null;
+        } catch {
+          // A deletion has no current bytes to match a write receipt against.
         }
+        const receipt = studioServer
+          ? studioServer.identifyFileWrite(filePath, version ?? studioServer.DELETED_VERSION)
+          : null;
+        // The API records what the preview loaded in this same module, so ask it here.
+        const reloads = studioServer?.affectsPreview(owner.projectDir, filePath) ?? true;
+        server.ws.send({
+          type: "custom",
+          event: "hf:file-change",
+          data: {
+            path: filePath,
+            version,
+            projectId: owner.projectId,
+            affectsPreview: reloads,
+            ...(reloads ? {} : { affectedCompositions: [] }),
+            ...receipt,
+          },
+        });
       });
+      server.httpServer?.on("close", () => void projectWatcher.close());
     },
   };
 }
 
 export default defineConfig({
-  plugins: [react(), devProjectApi()],
+  plugins: [react(), tailwindcss(), devProjectApi()],
   define: {
     __STUDIO_VERSION__: JSON.stringify(studioPkg.version),
   },
   resolve: {
     alias: {
+      // linkedom's HTMLCanvasElement constructor calls createCanvas(300, 150)
+      // from the Node-only `canvas` package, behind a
+      // `try { require('canvas') } catch { shim }` guard. A bundler resolves
+      // that require statically, so the catch never fires and createCanvas is
+      // undefined — every composition containing a <canvas> then throws inside
+      // openComposition and silently loses its SDK session. See the stub.
+      canvas: resolve(__dirname, "src/shims/canvasBrowserStub.js"),
       "@hyperframes/player": resolve(__dirname, "../player/src/hyperframes-player.ts"),
       "@hyperframes/studio-server/source-mutation": resolve(
         __dirname,
@@ -199,12 +378,26 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
-  },
-  optimizeDeps: {
-    include: ["bpm-detective"],
+    rollupOptions: {
+      // /assets/* caches by filename alone, immutably, for a year
+      // (studioServer.ts). Keep every hash; copy one CSS file, unhashed,
+      // to the dist ROOT instead for the ./styles.css export.
+      plugins: [stableStylesCssPlugin()],
+    },
   },
   server: {
     port: 5190,
+    // Vite's defaults (localhost, IP literals) still apply on top of this list.
+    allowedHosts: previewAllowedHostsFromEnv(),
+    watch: {
+      // A composition lives under this package's root, so Vite's HMR sees a
+      // write to one as an html page dependency changing and full-reloads the
+      // browser. That reload is the flash after every edit in the canvas, and
+      // it is not Studio's to make: the app already decides whether a write of
+      // its own needs the preview refreshed, and the plugin below announces
+      // project writes as `hf:file-change` off its own watcher.
+      ignored: ["**/data/projects/**"],
+    },
   },
   ssr: {
     // recast / @babel/parser are CommonJS and call `require("fs")`. They are
@@ -218,5 +411,8 @@ export default defineConfig({
   test: {
     exclude: ["data/**", "node_modules/**"],
     setupFiles: ["src/test-setup.ts"],
+    environmentOptions: {
+      happyDOM: { settings: { enableIframePageLoading: true } },
+    },
   },
 });

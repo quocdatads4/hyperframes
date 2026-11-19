@@ -30,16 +30,18 @@ const sharedOpts = {
   target: "node22",
   format: "esm",
   minify: false,
-  sourcemap: true,
   external: [
     "@google-cloud/storage",
     "@google-cloud/workflows",
     "@hono/node-server",
     "@hyperframes/core",
     "@hyperframes/core/compiler",
+    "@hyperframes/lint",
     "@hyperframes/producer",
     "@hyperframes/producer/distributed",
     "@hyperframes/studio-server",
+    "@hyperframes/studio-server/encoder-options",
+    "@hyperframes/studio-server/request-identity",
     "hono",
     "puppeteer-core",
     "tar",
@@ -58,6 +60,9 @@ await Promise.all([
 // through node_modules to the sibling package's already-built `dist/`
 // types instead of pulling its full source tree into emit (which would
 // violate rootDir).
-execSync("tsc -p tsconfig.build.json --emitDeclarationOnly", { stdio: "inherit" });
+execSync(
+  "tsc -p tsconfig.build.json --emitDeclarationOnly && node ../../scripts/rewrite-relative-import-extensions.mjs dist",
+  { stdio: "inherit" },
+);
 
 console.log("[Build] Complete: dist/{index,server,sdk/index,terraform}.js + .d.ts");

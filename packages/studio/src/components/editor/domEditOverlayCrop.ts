@@ -1,4 +1,15 @@
-import { parseInsetClipPathSides, type ClipPathInsetSides } from "./clipPathHelpers";
+import {
+  composeElementTransform,
+  type PlanarTransformOps,
+} from "@hyperframes/core/runtime/editing-port";
+import {
+  parseInsetClipPathSides,
+  type ClipPathInsetSides,
+  type ParsedInsetClipPathSides,
+} from "./clipPathHelpers";
+import { MAX_DRAFT_PX, MAX_ELEMENT_VALUE } from "@hyperframes/core/runtime/editing-port";
+import { previewRequest } from "../../player/lib/previewChannel";
+import { previewStandIn } from "./previewDrafts";
 
 export type CropEdge = "top" | "right" | "bottom" | "left";
 
@@ -28,21 +39,127 @@ export function cropRectFromInsets(
   };
 }
 
-/**
- * Current inset crop of an element (inline first, computed fallback).
- * Zeros = no clip (croppable, nothing cropped yet). `null` = the element
- * carries a clip-path this tool cannot represent (circle/polygon/non-px
- * inset) — croppers must not lift, edit, or restore it, or the clip gets
- * silently replaced or destroyed on deselect.
- */
-export function readElementCropInsets(
-  element: HTMLElement,
-): (ClipPathInsetSides & { radius: number }) | null {
-  const inline = element.style.getPropertyValue("clip-path").trim();
-  const value =
-    inline || element.ownerDocument.defaultView?.getComputedStyle(element).clipPath.trim() || "";
+// A selected croppable element shows uncropped so the crop UI can dim what is cut away. A rule keyed on its
+// identity does that, so the element's own clip-path stays the one record undo, redo and panel edits rewrite.
+// A sealed preview's lift is that rule in the frame (core `editing/cropLift.ts`), and `rule` is null.
+// A frame lift is kept until the frame says it is gone, so a lost reply never leaves the crop hidden there.
+type CropLift = { rule: HTMLStyleElement | null; sheetClip?: string; dropped?: boolean };
+const cropLifts = new WeakMap<HTMLElement, CropLift>();
+const UNLIFT_TRIES = 3;
+
+function liftSelector(element: HTMLElement): string | null {
+  const quote = (value: string) => `"${value.replace(/["\\]/g, "\\$&")}"`;
+  const hfId = element.getAttribute("data-hf-id");
+  if (hfId) return `[data-hf-id=${quote(hfId)}]`;
+  return element.id ? `[id=${quote(element.id)}]` : null;
+}
+
+function unliftInFrame(element: HTMLElement, record: CropLift, tries = UNLIFT_TRIES): void {
+  const target = previewStandIn(element);
+  if (!target) return;
+  void previewRequest(target.iframe, "crop-lift", { handle: target.handle, lift: false }).then(
+    (reply) => {
+      if (cropLifts.get(element) !== record) return;
+      if (reply?.lifted === false) cropLifts.delete(element);
+      else if (tries > 1) unliftInFrame(element, record, tries - 1);
+    },
+  );
+}
+
+function liftInFrame(element: HTMLElement): boolean {
+  const target = previewStandIn(element);
+  if (!target) return false;
+  // Until the frame answers, the clip it last reported is the one under the lift.
+  const record: CropLift = { rule: null, sheetClip: frameClipPaths.get(element)?.computed ?? "" };
+  cropLifts.set(element, record);
+  void previewRequest(target.iframe, "crop-lift", { handle: target.handle, lift: true }).then(
+    (reply) => {
+      if (cropLifts.get(element) !== record || !reply) return;
+      if (!reply.lifted) cropLifts.delete(element);
+      else if (typeof reply.clipPath === "string" && reply.clipPath.length <= MAX_ELEMENT_VALUE)
+        record.sheetClip = reply.clipPath.trim();
+    },
+  );
+  return true;
+}
+
+export function liftElementCrop(element: HTMLElement): void {
+  const held = cropLifts.get(element);
+  if ((held && !held.dropped) || liftInFrame(element)) return;
+  const selector = liftSelector(element);
+  if (!selector || cropLifts.has(element)) return;
+  const doc = element.ownerDocument;
+  const rule = doc.createElement("style");
+  rule.textContent = `${selector}{clip-path:none!important}`;
+  (doc.head ?? doc.documentElement).append(rule);
+  cropLifts.set(element, { rule });
+}
+
+export function dropElementCropLift(element: HTMLElement): void {
+  const lift = cropLifts.get(element);
+  if (!lift || lift.dropped) return;
+  if (lift.rule) {
+    lift.rule.remove();
+    cropLifts.delete(element);
+    return;
+  }
+  lift.dropped = true;
+  unliftInFrame(element, lift);
+}
+
+export function isElementCropLifted(element: HTMLElement): boolean {
+  const lift = cropLifts.get(element);
+  return !!lift && !lift.dropped;
+}
+
+// A sealed preview's stand-in has no styles of its own: its clip-path is the one the frame reported.
+const frameClipPaths = new WeakMap<Element, { inline: string; computed: string }>();
+
+export function rememberFrameClipPath(element: HTMLElement, inline: string, computed: string) {
+  frameClipPaths.set(element, { inline: inline.trim(), computed: computed.trim() });
+}
+
+const computedClipPath = (element: HTMLElement) => {
+  const view = element.ownerDocument.defaultView;
+  if (!view) return frameClipPaths.get(element)?.computed ?? "";
+  return view.getComputedStyle(element).clipPath.trim();
+};
+
+/** The stylesheet's clip under a lift, read once per lift: only inline writes happen while selected. */
+function sheetClipUnder(element: HTMLElement, lift: CropLift): string {
+  if (lift.sheetClip === undefined && lift.rule) {
+    const { parentNode, nextSibling } = lift.rule;
+    lift.rule.remove();
+    lift.sheetClip = computedClipPath(element);
+    parentNode?.insertBefore(lift.rule, nextSibling);
+  }
+  return lift.sheetClip ?? "";
+}
+
+/** The element's clip-path, inline first, then the stylesheet's as it is without the lift. */
+function readElementClipPath(element: HTMLElement): string {
+  const inline =
+    element.style.getPropertyValue("clip-path").trim() || frameClipPaths.get(element)?.inline;
+  if (inline) return inline;
+  const lift = cropLifts.get(element);
+  return lift && !lift.dropped ? sheetClipUnder(element, lift) : computedClipPath(element);
+}
+
+/** Zeros = no clip yet. `null` = a clip this tool cannot represent (circle/polygon/non-px inset):
+ *  croppers must not lift, edit, or restore it, or deselect silently replaces or destroys it. */
+function parseCropClipPath(value: string): ParsedInsetClipPathSides | null {
   if (!value || value === "none") return { top: 0, right: 0, bottom: 0, left: 0, radius: 0 };
-  return parseInsetClipPathSides(value);
+  const sides = parseInsetClipPathSides(value);
+  const sane = sides && Object.values(sides).every((side) => Math.abs(side) <= MAX_DRAFT_PX);
+  return sane ? sides : null;
+}
+
+export function readElementCropInsets(element: HTMLElement): ParsedInsetClipPathSides | null {
+  return parseCropClipPath(readElementClipPath(element));
+}
+
+export function hasCropInsets(insets: ClipPathInsetSides): boolean {
+  return insets.top > 0 || insets.right > 0 || insets.bottom > 0 || insets.left > 0;
 }
 
 export interface CropInsetDragInput {
@@ -116,8 +233,19 @@ export function hugRectForElement(
   rect: CropScreenRect & { editScaleX: number; editScaleY: number },
   element: HTMLElement,
 ): CropScreenRect {
-  const insets = readElementCropInsets(element);
-  // Uneditable clip (null) can't be hugged — show the full element rect.
+  // A lifted clip shows the full element rect.
+  return isElementCropLifted(element)
+    ? rect
+    : hugRectForClipPath(rect, readElementClipPath(element));
+}
+
+/** `hugRectForElement` for a clip-path read elsewhere; null is one that could not be read. */
+export function hugRectForClipPath(
+  rect: CropScreenRect & { editScaleX: number; editScaleY: number },
+  clipPath: string | null,
+): CropScreenRect {
+  const insets = clipPath === null ? null : parseCropClipPath(clipPath);
+  // Uneditable clip — show the full element rect.
   if (!insets || (insets.top <= 0 && insets.right <= 0 && insets.bottom <= 0 && insets.left <= 0))
     return rect;
   return cropRectFromInsets(rect, insets, rect.editScaleX, rect.editScaleY);
@@ -147,6 +275,96 @@ export interface CropFrame {
   scaleY: number;
 }
 
+/**
+ * The element's own 2D transform as matrix components, plus the `rotate`
+ * property's angle.
+ *
+ * `rotate` is a separate CSS property, not part of `transform`, and it is the
+ * one Studio's rotate handle writes — reading `transform` alone reported a
+ * turned element as upright, so the crop outline drew square across it.
+ *
+ * Null means there is nothing planar to draw against: no transform and no
+ * rotation, or a 3D/unparseable matrix. The caller falls back to the
+ * axis-aligned box rather than guessing an angle.
+ */
+const IDENTITY = { a: 1, b: 0, c: 0, d: 1 };
+
+/** Perspective terms this far from zero mean the mapping is not affine. */
+const PERSPECTIVE_EPSILON = 1e-6;
+
+type Planar2D = { a: number; b: number; c: number; d: number };
+
+/**
+ * The 2D components of a computed transform, or null when it cannot be used.
+ *
+ * Accepts `matrix3d` as well as `matrix`, taking the same 2D projection the
+ * rest of the overlay reads through DOMMatrix. GSAP writes a 3D matrix for an
+ * ordinary 2D move or spin (force3D), and a composition that flips an element
+ * writes one with a negative z scale — treating either as unmeasurable left the
+ * crop outline square on an element every other piece of chrome drew rotated.
+ *
+ * Only a perspective term rules the matrix out, because that is where the
+ * mapping stops being affine and a single angle stops describing it.
+ */
+function parseMatrixComponents(transform: string): Planar2D | null {
+  const flat = /^matrix\(([^)]+)\)$/.exec(transform);
+  if (flat) {
+    const [a, b, c, d] = flat[1]!.split(",").map((v) => Number.parseFloat(v));
+    return [a, b, c, d].every(Number.isFinite) ? { a: a!, b: b!, c: c!, d: d! } : null;
+  }
+  const spatial = /^matrix3d\(([^)]+)\)$/.exec(transform);
+  if (!spatial) return null;
+  const m = spatial[1]!.split(",").map((v) => Number.parseFloat(v));
+  if (m.length !== 16 || !m.every(Number.isFinite)) return null;
+  const affine = [m[3], m[7], m[11]].every((v) => Math.abs(v!) < PERSPECTIVE_EPSILON);
+  if (!affine) return null;
+  return { a: m[0]!, b: m[1]!, c: m[4]!, d: m[5]! };
+}
+
+/** The crop frame only needs an angle and a scale, so it composes plain 2D components. */
+const PLANAR_2D_OPS: PlanarTransformOps<Planar2D> = {
+  identity: () => IDENTITY,
+  fromTransform: parseMatrixComponents,
+  fromRotate: (degrees) => {
+    const rad = (degrees * Math.PI) / 180;
+    return { a: Math.cos(rad), b: Math.sin(rad), c: -Math.sin(rad), d: Math.cos(rad) };
+  },
+  compose: (outer, inner) => ({
+    a: outer.a * inner.a + outer.c * inner.b,
+    b: outer.b * inner.a + outer.d * inner.b,
+    c: outer.a * inner.c + outer.c * inner.d,
+    d: outer.b * inner.c + outer.d * inner.d,
+  }),
+};
+
+/** Whether the matrix leaves the box exactly as it found it. */
+function isIdentity(m: Planar2D): boolean {
+  return (
+    Math.abs(m.a - 1) < PERSPECTIVE_EPSILON &&
+    Math.abs(m.b) < PERSPECTIVE_EPSILON &&
+    Math.abs(m.c) < PERSPECTIVE_EPSILON &&
+    Math.abs(m.d - 1) < PERSPECTIVE_EPSILON
+  );
+}
+
+/**
+ * The transform the element paints under, in 2D components.
+ *
+ * Null when nothing up the chain transforms it: the caller's axis-aligned rect
+ * already describes it, and that comes from real layout rather than the
+ * element's untransformed box.
+ */
+function readPlanarTransform(element: HTMLElement): Planar2D | null {
+  const acc = composeElementTransform(element, PLANAR_2D_OPS, (node) => {
+    try {
+      return node.ownerDocument.defaultView?.getComputedStyle(node) ?? null;
+    } catch {
+      return null;
+    }
+  });
+  return acc && !isIdentity(acc) ? acc : null;
+}
+
 export function readElementCropFrame(
   element: HTMLElement,
   overlayRect: CropScreenRect & { editScaleX: number; editScaleY: number },
@@ -162,22 +380,15 @@ export function readElementCropFrame(
     scaleX: editX,
     scaleY: editY,
   };
-  let transform = "";
-  try {
-    transform = element.ownerDocument.defaultView?.getComputedStyle(element).transform ?? "";
-  } catch {
-    return aabb;
-  }
-  if (!transform || transform === "none") return aabb;
-  const m = /^matrix\(([^)]+)\)$/.exec(transform);
-  if (!m) return aabb; // matrix3d or unparseable → axis-aligned fallback
-  const [a, b, c, d] = m[1]!.split(",").map((v) => Number.parseFloat(v));
-  if (![a, b, c, d].every(Number.isFinite)) return aabb;
-  const elScaleX = Math.hypot(a!, b!);
-  const det = a! * d! - b! * c!;
-  const elScaleY = elScaleX !== 0 ? det / elScaleX : 1;
+  const planar = readPlanarTransform(element);
+  if (!planar) return aabb;
+  const { a, b, c, d } = planar;
+  const elScaleX = Math.hypot(a, b);
+  const det = a * d - b * c;
+  // |det| : a flipped element (negative determinant) still has a real size.
+  const elScaleY = elScaleX !== 0 ? Math.abs(det) / elScaleX : 1;
   if (elScaleX <= 0 || elScaleY <= 0) return aabb;
-  const angleDeg = (Math.atan2(b!, a!) * 180) / Math.PI;
+  const angleDeg = (Math.atan2(b, a) * 180) / Math.PI;
   const scaleX = elScaleX * editX;
   const scaleY = elScaleY * editY;
   const width = element.offsetWidth * scaleX;

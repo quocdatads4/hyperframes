@@ -1,7 +1,9 @@
 /**
  * @vitest-environment jsdom
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import { Parser } from "acorn";
+import { ensureHfIds } from "./hfIds.js";
 import {
   parseHtml,
   updateElementInHtml,
@@ -12,6 +14,34 @@ import {
 } from "./htmlParser.js";
 
 describe("parseHtml", () => {
+  it("preserves runtime HTML normalization for mixed-case attributes", () => {
+    const result = parseHtml(`<!doctype html><HTML DATA-RESOLUTION="square"><BODY>
+      <DIV ID="x" DATA-START="2" DATA-DURATION="3" DATA-TRACK-INDEX="4" DATA-NAME="UP"><DIV>hello</DIV></DIV>
+    </BODY></HTML>`);
+    expect(result.resolution).toBe("square");
+    expect(result.elements).toHaveLength(1);
+    expect(result.elements[0]).toMatchObject({
+      startTime: 2,
+      duration: 3,
+      zIndex: 4,
+      name: "UP",
+      content: "hello",
+    });
+  });
+
+  it.each([
+    `<DIV ID="x" DATA-START="2" DATA-DURATION="3" DATA-NAME="UP"><DIV>hello</DIV></DIV>`,
+    `<DIV ID="x" DATA-START="2" DATA-HF-ID="pinned" DATA-HF-STATE="ignored"><DIV>hello</DIV></DIV>`,
+  ])("matches persisted and runtime IDs for mixed-case HTML: %s", (body) => {
+    const html = `<!doctype html><html><body>${body}</body></html>`;
+    const first = parseHtml(html);
+    const persisted = parseHtml(ensureHfIds(html));
+    expect(first.elements.length).toBeGreaterThan(0);
+    expect(first.elements.map((element) => element.id)).toEqual(
+      persisted.elements.map((element) => element.id),
+    );
+  });
+
   it("extracts elements with data-start and data-end", () => {
     const html = `
       <html>
@@ -565,6 +595,59 @@ describe("addElementToHtml", () => {
 });
 
 describe("removeElementFromHtml", () => {
+  it.each([
+    "const nested = gsap.timeline();",
+    "nested = gsap.timeline();",
+    'window.__timelines["nested"] = gsap.timeline();',
+  ])("rediscovers a timeline when its declaration is deleted: %s", (declaration) => {
+    const html = `<html><body><div id="box"></div><div id="keep"></div>
+      <script>gsap.set("#box", { onComplete: () => { ${declaration} } });
+        const tl = gsap.timeline();
+        tl.to("#box", { x: 2 }); tl.to("#keep", { x: 3 });
+      </script></body></html>`;
+    const updated = removeElementFromHtml(html, "box");
+    expect(updated).not.toContain('"#box"');
+    expect(updated).not.toContain(declaration);
+    expect(updated).toContain('tl.to("#keep", { x: 3 });');
+  });
+
+  it("parses a script once when deleting a subtree with many tweens", () => {
+    const html = `<!doctype html><html><body>
+      <div id="parent"><div id="box"></div></div>
+      <div id="keep"></div>
+      <script>const tl = gsap.timeline();
+        tl.to("#box", { x: 10 }, 0); tl.to("#box", { x: 20 }, 0);
+        tl.to("#parent", { opacity: 0 }, 1);
+        tl.to("#keep", { x: 30 }, 2);
+      </script></body></html>`;
+    const parse = vi.spyOn(Parser, "parse");
+    try {
+      const updated = removeElementFromHtml(html, "parent");
+      expect(updated).not.toContain('"#box"');
+      expect(updated).not.toContain('"#parent"');
+      expect(updated).toContain('tl.to("#keep", { x: 30 }, 2);');
+      expect(parse).toHaveBeenCalledTimes(1);
+    } finally {
+      parse.mockRestore();
+    }
+  });
+
+  it.each([
+    ['tl.to("#box", { x: 10 }).to("#box", { x: 20 });', ""],
+    [
+      'tl.to("#box", { x: 10 }).addLabel("hold", 1).to("#keep", { x: 20 });',
+      'tl.addLabel("hold", 1).to("#keep", { x: 20 });',
+    ],
+  ])("preserves surviving chain operations when deleting tweens: %s", (chain, expected) => {
+    const preamble = "const tl = gsap.timeline();";
+    const html = `<html><body><div id="box"></div><div id="keep"></div><script>${preamble}${chain}</script></body></html>`;
+    const updated = removeElementFromHtml(html, "box");
+    const script = new DOMParser()
+      .parseFromString(updated, "text/html")
+      .querySelector("script")?.textContent;
+    expect(script).toBe(preamble + expected);
+  });
+
   it("removes an element by id", () => {
     const html = `<!DOCTYPE html>
 <html><body>
@@ -578,6 +661,19 @@ describe("removeElementFromHtml", () => {
 
     expect(updated).not.toContain('id="el1"');
     expect(updated).toContain('id="el2"');
+  });
+
+  it("cascades DOM and stable ids for every descendant", () => {
+    const html = `<!doctype html><html><body>
+      <div id="parent"><div id="box" data-hf-id="hf-box"></div></div>
+      <script>const tl = gsap.timeline();
+        tl.to("#parent", { x: 10 }); tl.to("#box", { x: 20 });
+        tl.to('[data-hf-id="hf-box"]', { x: 30 });
+      </script></body></html>`;
+    const updated = removeElementFromHtml(html, "parent");
+    expect(updated).not.toContain("#parent");
+    expect(updated).not.toContain("#box");
+    expect(updated).not.toContain("hf-box");
   });
 
   it("strips ALL gsap tweens for the removed element, not just the first", () => {
@@ -748,6 +844,25 @@ describe("extractCompositionMetadata", () => {
     expect(meta.variables[1].type).toBe("number");
   });
 
+  it("reads variables declared on the composition root, templated or not", () => {
+    const decl = (id: string, def = "x") =>
+      JSON.stringify([{ id, type: "string", label: id, default: def }]);
+    const onRoot = `<!DOCTYPE html><html><body><div data-composition-id="c" data-composition-variables='${decl("title")}'></div></body></html>`;
+    expect(extractCompositionMetadata(onRoot).variables.map((v) => v.id)).toEqual(["title"]);
+    const inTemplate = `<!DOCTYPE html><html><body><template id="c-template"><div data-composition-id="c" data-composition-variables='${decl("sub")}'></div></template></body></html>`;
+    expect(extractCompositionMetadata(inTemplate).variables.map((v) => v.id)).toEqual(["sub"]);
+  });
+
+  it("merges <html> and root declarations, the root winning a shared id", () => {
+    const html = `<!DOCTYPE html>
+<html data-composition-variables='[{"id":"title","type":"string","label":"T","default":"A"},{"id":"count","type":"number","label":"C","default":1}]'>
+<body><div data-composition-id="c" data-composition-variables='[{"id":"title","type":"string","label":"T","default":"B"}]'></div></body>
+</html>`;
+    const vars = extractCompositionMetadata(html).variables;
+    expect(vars.map((v) => v.id)).toEqual(["title", "count"]);
+    expect(vars[0]?.default).toBe("B");
+  });
+
   // T9 — CompositionVariable font/image parse (WS-B R1 implemented).
 
   it("parses a font variable (type: font) with name and source", () => {
@@ -845,5 +960,67 @@ describe("extractCompositionMetadata", () => {
     const meta = extractCompositionMetadata(html);
     expect(meta.variables.find((v) => v.id === "x")).toBeUndefined();
     expect(meta.variables.find((v) => v.id === "ok")).toBeDefined();
+  });
+});
+
+describe("video audio attributes", () => {
+  const DOC = `<!DOCTYPE html>
+<html><body>
+  <div id="stage">
+    <div id="stage-zoom-container"><video id="v" src="a.mp4" muted data-start="0" data-duration="2"></video></div>
+  </div>
+</body></html>`;
+
+  const videoTag = (html: string, id: string): string =>
+    html.match(new RegExp(`<video[^>]*id="${id}"[^>]*>`))?.[0] ?? "";
+
+  it("addElementToHtml: an audible video gets data-has-audio and no muted", () => {
+    const { html, id } = addElementToHtml(DOC, {
+      type: "video",
+      name: "Audible",
+      src: "b.mp4",
+      startTime: 0,
+      duration: 2,
+      zIndex: 0,
+      hasAudio: true,
+    });
+    const tag = videoTag(html, id);
+    expect(tag).toContain('data-has-audio="true"');
+    expect(tag).not.toMatch(/\bmuted\b/);
+  });
+
+  it("addElementToHtml: a silent video is muted with no data-has-audio", () => {
+    const { html, id } = addElementToHtml(DOC, {
+      type: "video",
+      name: "Silent",
+      src: "b.mp4",
+      startTime: 0,
+      duration: 2,
+      zIndex: 0,
+    });
+    const tag = videoTag(html, id);
+    expect(tag).toMatch(/\bmuted\b/);
+    expect(tag).not.toContain("data-has-audio");
+  });
+
+  it("updateElementInHtml hasAudio:true clears muted; false restores it", () => {
+    const on = updateElementInHtml(DOC, "v", { hasAudio: true });
+    expect(videoTag(on, "v")).not.toMatch(/\bmuted\b/);
+    expect(videoTag(on, "v")).toContain('data-has-audio="true"');
+    const off = updateElementInHtml(on, "v", { hasAudio: false });
+    const tag = videoTag(off, "v");
+    expect(tag).toMatch(/\bmuted\b/);
+    expect(tag).not.toContain("data-has-audio");
+  });
+
+  it("updateElementInHtml hasAudio only touches videos, and only true/false", () => {
+    const html =
+      '<html><body><video id="v" src="a.mp4" data-has-audio="true"></video><audio id="a" src="m.wav"></audio></body></html>';
+    const audio = updateElementInHtml(html, "a", { hasAudio: false });
+    expect(audio).not.toMatch(/<audio\b[^>]*\bmuted\b/);
+    expect(audio).not.toMatch(/<audio\b[^>]*data-has-audio/);
+    const untouched = updateElementInHtml(html, "v", { hasAudio: undefined });
+    expect(videoTag(untouched, "v")).toContain('data-has-audio="true"');
+    expect(videoTag(untouched, "v")).not.toMatch(/\bmuted\b/);
   });
 });

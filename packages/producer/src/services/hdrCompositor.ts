@@ -11,7 +11,8 @@
  * `captureHdrResources.ts`.
  */
 
-import { readSync, closeSync } from "fs";
+import { readSync } from "fs";
+import type { HdrFrameLease, HdrFrameWindows } from "./hdrFrameWindows.js";
 import { join } from "path";
 import {
   type CaptureSession,
@@ -29,6 +30,7 @@ import {
   blitRgb48leAffine,
   parseTransformMatrix,
   convertTransfer,
+  isVideoHiddenBeforeStreamStart,
 } from "@hyperframes/engine";
 import type { ProducerLogger } from "../logger.js";
 import { type HdrImageTransferCache } from "./hdrImageTransferCache.js";
@@ -132,28 +134,42 @@ function cropRgb48le(
  */
 export interface HdrVideoFrameSource {
   dir: string;
-  rawPath: string;
-  fd: number;
+  windows: HdrFrameWindows;
   width: number;
   height: number;
   frameSize: number;
-  frameCount: number;
+  readonly frameCount: number;
   scratch: Buffer;
+  /** The playable range is one source cycle and must wrap at its end. */
+  loop?: boolean;
+  mediaStart?: number;
+  videoStartSeconds?: number;
 }
 
 export function closeHdrVideoFrameSource(source: HdrVideoFrameSource, log?: ProducerLogger): void {
   try {
-    closeSync(source.fd);
+    source.windows.close();
   } catch (err) {
-    log?.warn("Failed to close HDR raw frame file", {
-      rawPath: source.rawPath,
+    log?.warn("Failed to close HDR raw frame windows", {
+      dir: source.dir,
       error: err instanceof Error ? err.message : String(err),
     });
   }
 }
 
-// fallow-ignore-next-line complexity
-export function blitHdrVideoLayer(
+export function resolveHdrVideoFrameIndex(
+  time: number,
+  startTime: number,
+  fps: number,
+  frameCount: number,
+  loop = false,
+): number | null {
+  const frameIndex = Math.round((time - startTime) * fps);
+  if (frameIndex < 0 || frameCount < 1) return null;
+  return loop ? frameIndex % frameCount : Math.min(frameIndex, frameCount - 1);
+}
+
+export async function blitHdrVideoLayer(
   canvas: Buffer,
   el: ElementStackingInfo,
   time: number,
@@ -166,26 +182,64 @@ export function blitHdrVideoLayer(
   sourceTransfer?: HdrTransfer,
   targetTransfer?: HdrTransfer,
   hdrPerf?: HdrPerfCollector,
-): void {
+): Promise<void> {
   const frameSource = hdrVideoFrameSources.get(el.id);
   const startTime = hdrStartTimes.get(el.id);
   if (!frameSource || startTime === undefined || el.opacity <= 0) {
     return;
   }
 
-  // Frame index within the video. Clamp to the extracted raw frame count so
-  // a composition that outlives the source clip freezes on the last frame,
-  // matching Chrome's <video> behavior.
-  const videoFrameIndex = Math.round((time - startTime) * fps) + 1;
-  if (videoFrameIndex < 1) return;
-  const effectiveIndex = Math.min(videoFrameIndex, frameSource.frameCount);
-  if (effectiveIndex < 1) return;
-  const frameOffset = (effectiveIndex - 1) * frameSource.frameSize;
+  // Frame index within the extracted playable source range. Loops wrap one
+  // extracted cycle; non-loops clamp to its final frame, matching Chrome's
+  // held-tail behavior for authored slots that outlive the source.
+  const effectiveIndex = resolveHdrVideoFrameIndex(
+    time,
+    startTime,
+    fps,
+    frameSource.frameCount,
+    frameSource.loop,
+  );
+  if (effectiveIndex === null) return;
+  const mediaTime = (frameSource.mediaStart ?? 0) + effectiveIndex / fps;
+  if (isVideoHiddenBeforeStreamStart(frameSource.videoStartSeconds, mediaTime)) return;
 
+  if (hdrPerf) hdrPerf.hdrVideoLayerBlits += 1;
+  const lease = await frameSource.windows.lease(effectiveIndex);
+  if (!lease) return;
   try {
-    if (hdrPerf) hdrPerf.hdrVideoLayerBlits += 1;
+    blitScratchFrameWithoutYielding(
+      canvas,
+      el,
+      frameSource,
+      lease,
+      width,
+      height,
+      log,
+      sourceTransfer,
+      targetTransfer,
+      hdrPerf,
+    );
+  } finally {
+    lease.release();
+  }
+}
+
+// fallow-ignore-next-line complexity
+function blitScratchFrameWithoutYielding(
+  canvas: Buffer,
+  el: ElementStackingInfo,
+  frameSource: HdrVideoFrameSource,
+  lease: HdrFrameLease,
+  width: number,
+  height: number,
+  log: ProducerLogger | undefined,
+  sourceTransfer: HdrTransfer | undefined,
+  targetTransfer: HdrTransfer | undefined,
+  hdrPerf: HdrPerfCollector | undefined,
+): void {
+  try {
     const bytesRead = timeHdrPhase(hdrPerf, "hdrVideoReadDecodeMs", () =>
-      readSync(frameSource.fd, frameSource.scratch, 0, frameSource.frameSize, frameOffset),
+      readSync(lease.fd, frameSource.scratch, 0, frameSource.frameSize, lease.offset),
     );
     if (bytesRead !== frameSource.frameSize) return;
     const hdrRgb = frameSource.scratch;
@@ -242,7 +296,7 @@ export function blitHdrVideoLayer(
       if (matrix && !isTranslationOnly) {
         if (clipped && log) {
           log.debug(
-            `HDR clip rect on affine-transformed element ${el.id} — clip not applied (affine scissor not yet supported)`,
+            `HDR clip rect on affine-transformed element ${el.id}: clip not applied (affine scissor not yet supported)`,
           );
         }
         blitRgb48leAffine(
@@ -331,7 +385,7 @@ export function blitHdrImageLayer(
     return;
   }
   if (el.clipRect && log) {
-    log.debug(`HDR clip rect on image element ${el.id} — clip not yet supported for images`);
+    log.debug(`HDR clip rect on image element ${el.id}: clip not yet supported for images`);
   }
 
   try {
@@ -560,7 +614,7 @@ export async function compositeHdrFrame(
           hdrPerf,
         );
       } else {
-        blitHdrVideoLayer(
+        await blitHdrVideoLayer(
           canvas,
           layer.element,
           time,
@@ -604,7 +658,7 @@ export async function compositeHdrFrame(
             startTime,
             localTime: localTime.toFixed(3),
             hdrFrameNum: frameNum,
-            rawPath: frameSource?.rawPath ?? null,
+            dir: frameSource?.dir ?? null,
             frameCount: frameSource?.frameCount ?? null,
           });
         }

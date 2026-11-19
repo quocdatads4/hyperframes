@@ -1,8 +1,10 @@
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync } from "node:fs";
+import { readProjectFile } from "@hyperframes/parsers/asset-resolution";
 import { randomUUID } from "node:crypto";
-import { dirname, relative, resolve, sep } from "node:path";
+import { relative, sep } from "node:path";
 import { parseHTML } from "linkedom";
-import { isSafePath, resolveWithinProject } from "./safePath.js";
+import { ProjectRootMissingError } from "@hyperframes/core";
+import { folderGone, isSafePath, realpath, resolveWithinProject } from "./safePath.js";
 
 export class CompositionInsertionError extends Error {
   constructor(
@@ -13,7 +15,7 @@ export class CompositionInsertionError extends Error {
   }
 }
 
-function descendants(root: Document | Element, selector: string): Element[] {
+export function descendants(root: Document | Element, selector: string): Element[] {
   const found = Array.from(root.querySelectorAll(selector));
   for (const template of root.querySelectorAll("template")) {
     found.push(...descendants(template, selector));
@@ -38,16 +40,28 @@ function positiveAttribute(root: Element, ...names: string[]): number {
 
 function canonicalProjectPath(projectDir: string, candidate: string | null): string {
   if (!candidate) {
+    if (folderGone(projectDir)) throw new ProjectRootMissingError(projectDir);
     throw new CompositionInsertionError("Composition source escapes the project", 400);
   }
   if (!existsSync(candidate)) {
     throw new CompositionInsertionError("Composition source was not found", 404);
   }
-  const canonical = realpathSync(candidate);
-  if (!isSafePath(realpathSync(projectDir), canonical)) {
+  const canonical = realpath(candidate);
+  if (!isSafePath(realpath(projectDir), canonical)) {
     throw new CompositionInsertionError("Composition source escapes the project", 400);
   }
   return canonical;
+}
+
+function readCompositionSource(file: string): string {
+  const read = readProjectFile(file);
+  if (read.kind === "folder") {
+    throw new CompositionInsertionError("Composition source is a folder, not an HTML file", 400);
+  }
+  if (read.kind === "missing") {
+    throw new CompositionInsertionError("Composition source was not found", 404);
+  }
+  return read.text;
 }
 
 function validateSourcePath(sourcePath: string): void {
@@ -59,14 +73,6 @@ function validateSourcePath(sourcePath: string): void {
 function canonicalProjectFile(projectDir: string, sourcePath: string): string {
   validateSourcePath(sourcePath);
   return canonicalProjectPath(projectDir, resolveWithinProject(projectDir, sourcePath));
-}
-
-function canonicalDependency(projectDir: string, ownerAbs: string, sourcePath: string): string {
-  validateSourcePath(sourcePath);
-  return canonicalProjectPath(
-    projectDir,
-    resolveWithinProject(projectDir, relative(projectDir, resolve(dirname(ownerAbs), sourcePath))),
-  );
 }
 
 function validateDependencyGraph(projectDir: string, targetAbs: string, sourceAbs: string): void {
@@ -81,12 +87,12 @@ function validateDependencyGraph(projectDir: string, targetAbs: string, sourceAb
     }
     if (visited.has(file)) return;
     visiting.add(file);
-    const source = readFileSync(file, "utf-8");
+    const source = readCompositionSource(file);
     const { document } = compositionRoot(source);
     for (const host of descendants(document, "[data-composition-src]")) {
       const dependency = host.getAttribute("data-composition-src");
       if (dependency) {
-        visit(canonicalDependency(projectDir, file, dependency));
+        visit(canonicalProjectFile(projectDir, dependency));
       }
     }
     visiting.delete(file);
@@ -139,8 +145,8 @@ function resolveTrack(
 
 function uniqueHostId(root: Element, base: string): string {
   const ids = new Set([
-    ...descendants(root, "[id]").map((element) => element.id),
-    ...descendants(root, "[data-composition-id]").flatMap((element) => {
+    ...[root, ...descendants(root, "[id]")].map((element) => element.id),
+    ...[root, ...descendants(root, "[data-composition-id]")].flatMap((element) => {
       const id = element.getAttribute("data-composition-id");
       return id ? [id] : [];
     }),
@@ -151,8 +157,8 @@ function uniqueHostId(root: Element, base: string): string {
   return `${base}_${suffix}`;
 }
 
-function relativeSourcePath(targetAbs: string, sourceAbs: string): string {
-  return relative(dirname(targetAbs), sourceAbs).split(sep).join("/");
+function rootSourcePath(projectDir: string, sourceAbs: string): string {
+  return relative(realpath(projectDir), sourceAbs).split(sep).join("/");
 }
 
 export function insertCompositionIntoSource(input: {
@@ -167,7 +173,7 @@ export function insertCompositionIntoSource(input: {
   const sourceAbs = canonicalProjectFile(input.projectDir, input.sourcePath);
   validateDependencyGraph(input.projectDir, targetAbs, sourceAbs);
 
-  const source = readFileSync(sourceAbs, "utf-8");
+  const source = readCompositionSource(sourceAbs);
   const sourceComposition = compositionRoot(source).root;
   const duration = positiveAttribute(
     sourceComposition,
@@ -178,8 +184,9 @@ export function insertCompositionIntoSource(input: {
   const height = positiveAttribute(sourceComposition, "data-height");
   const { document, root } = compositionRoot(input.parentSource);
   const parentDuration = positiveAttribute(root, "data-duration", "data-composition-duration");
+  const sourceCompositionId = sourceComposition.getAttribute("data-composition-id") ?? "";
   const base =
-    (sourceComposition.getAttribute("data-composition-id") ?? "composition")
+    (sourceCompositionId || "composition")
       .replace(/[^a-zA-Z0-9_-]+/g, "-")
       .replace(/^-+|-+$/g, "") || "composition";
   const hostId = uniqueHostId(root, base);
@@ -202,8 +209,9 @@ export function insertCompositionIntoSource(input: {
   host.id = hostId;
   host.className = "clip";
   host.setAttribute("data-hf-id", `hf-${randomUUID()}`);
-  host.setAttribute("data-composition-id", hostId);
-  host.setAttribute("data-composition-src", relativeSourcePath(targetAbs, sourceAbs));
+  const mountedRootId = sourceCompositionId || hostId;
+  host.setAttribute("data-composition-id", mountedRootId);
+  host.setAttribute("data-composition-src", rootSourcePath(input.projectDir, sourceAbs));
   host.setAttribute("data-start", String(Math.round(input.start * 100) / 100));
   host.setAttribute("data-duration", String(duration));
   host.setAttribute("data-playback-start", "0");

@@ -1,6 +1,6 @@
 // fallow-ignore-file complexity
 /**
- * audioPadTrim — pad-or-trim an `audio.aac` file so its exact duration
+ * audioPadTrim — pad-or-trim the mixed-audio file so its exact duration
  * matches the assembled video's frame count divided by fps.
  *
  * Distributed render assemble step needs this because:
@@ -14,21 +14,32 @@
  *     "audio cuts off early" or "video shows a frozen final frame" bugs.
  *
  * The fix: post-pad/trim audio to *exactly* `frameCount / fps` seconds at
- * assemble time. Pad by concat-copying a generated silence tail, trim with
- * `-t`, and avoid re-encoding the already mixed source AAC in either case.
+ * assemble time. Both branches decode/filter and re-encode AAC. Concatenating
+ * ADTS packets with `-c:a copy` is unsafe because concat timestamp estimation
+ * can stretch the terminal packet in the final MP4.
  */
 
+import { localContainerInputArgs } from "@hyperframes/parsers/ff-binaries";
 import { spawn } from "node:child_process";
-import { rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import {
+  DEFAULT_CONFIG,
+  describeFfmpegFailure,
+  encodeAac,
   extractAudioMetadata,
-  formatFfmpegError,
   getFfprobeBinary,
   ManagedChildProcess,
+  removeScratch,
+  renameWithRetry,
   runFfmpeg,
   trackChildProcess,
   type AudioMetadata,
+  type RunFfmpegResult,
+  withPublicOnlyProxy,
 } from "@hyperframes/engine";
+import { redactKnownPaths, redactTelemetryString } from "@hyperframes/core";
+import { measureTruePeakDbfs } from "./audioTruePeak.js";
+import { createStagingDir } from "@hyperframes/core/atomic-file";
 
 /**
  * Tolerance used to decide whether an audio file is already short enough to
@@ -36,6 +47,11 @@ import {
  * threshold and well below any frame interval at 24/30/60fps.
  */
 const AUDIO_DURATION_TOLERANCE_SECONDS = 0.001;
+
+/** Delivery headroom applied after every AAC encode in this stage. */
+export const AAC_DELIVERY_TRUE_PEAK_DBFS = -1;
+const AAC_TRUE_PEAK_CORRECTION_HEADROOM_DB = 0.5;
+const MAX_TRUE_PEAK_CORRECTION_PASSES = 3;
 
 export interface ProbeVideoFrameInfo {
   /** Number of video frames in the stream. */
@@ -58,21 +74,42 @@ export interface AudioProbeInfo {
 }
 
 export interface PadTrimAudioInput {
+  audioContainer?: "mov";
   /** Path to the assembled video. Used to derive `frameCount / fps`. */
   videoPath: string;
-  /** Path to the pre-mixed audio (typically `<planDir>/audio.aac`). */
+  /** Path to the pre-mixed audio (typically `<planDir>/audio.m4a`). */
   audioPath: string;
   /** Path the helper writes the duration-corrected audio to. */
   outputPath: string;
+  /** The PCM `audioPath` was encoded from: a pad, trim or peak correction encodes it instead of decoding the AAC. */
+  sourcePath?: string;
   signal?: AbortSignal;
+  /** Deadline for each ffmpeg process; defaults to the engine's `ffmpegProcessTimeout`. */
+  timeoutMs?: number;
   /**
-   * Optional injectables for unit tests. Production callers omit them and
-   * get the real `ffprobe`/`ffmpeg`-backed implementations.
+   * Optional injectables. Tests stub them; the distributed assembler supplies
+   * the frame probe because its video is still separate chunks.
    */
   probeVideoFrameInfo?: (videoPath: string) => Promise<ProbeVideoFrameInfo>;
   probeAudioInfo?: (audioPath: string, signal?: AbortSignal) => Promise<AudioProbeInfo>;
-  runFfmpeg?: (args: string[]) => Promise<{ success: boolean; error?: string }>;
+  probeAudioTruePeakDbfs?: (audioPath: string, signal?: AbortSignal) => Promise<number>;
+  runFfmpeg?: (args: string[]) => Promise<StepResult>;
+  encodeAac?: AacEncoder;
 }
+
+interface StepResult {
+  success: boolean;
+  error?: string;
+  failureReason?: "external_interruption";
+}
+
+/** Encodes `filter` applied to `inputPath` as AAC of exactly `durationSeconds`. */
+type AacEncoder = (
+  inputPath: string,
+  outputPath: string,
+  durationSeconds: number,
+  filter: string,
+) => Promise<StepResult>;
 
 export type PadTrimOperation = "pad" | "trim" | "copy";
 
@@ -87,24 +124,15 @@ export interface PadTrimAudioResult {
   operation: PadTrimOperation;
   /** Populated only when `success === false`. */
   error?: string;
+  /** Stable machine-readable cause for failures safe to retry on a fresh host. */
+  failureReason?: "external_interruption";
+  /** dB the true-peak limiter lowered the whole mix by; absent when it did not engage. */
+  audioLoweredDb?: number;
 }
 
-export type PadTrimAudioStepKind = "copy" | "trim" | "pad-silence" | "pad-concat";
-
-export interface PadTrimAudioStep {
-  kind: PadTrimAudioStepKind;
-  args: string[];
-  /**
-   * Concat-demuxer script materialization. When both fields are set, the
-   * runner writes `concatListContent` to `concatListPath` synchronously
-   * before spawning ffmpeg, and the step's `args` reference that path via
-   * `-i concatListPath`. Feeding the concat script through a real file
-   * (instead of `pipe:0`) is what makes bare-path directives work on both
-   * Linux and Windows — see `concatFileLine` for the platform history.
-   */
-  concatListPath?: string;
-  concatListContent?: string;
-}
+export type PadTrimAudioStep =
+  | { kind: "copy"; args: string[] }
+  | { kind: "trim" | "normalize"; filter: string };
 
 export interface PadTrimAudioPlan {
   operation: PadTrimOperation;
@@ -112,17 +140,23 @@ export interface PadTrimAudioPlan {
   cleanupPaths: string[];
 }
 
+const gainFilter = (gainDb: number) => `volume=${gainDb.toFixed(3)}dB`;
+
+function aacTruePeakCorrectionFilter(targetDurationSeconds: number, attenuationDb: number) {
+  return `${gainFilter(attenuationDb)},apad,atrim=0:${formatSeconds(targetDurationSeconds)}`;
+}
+
 /**
- * Pure helper: decide the pad/trim operation and build the ffmpeg argv
- * sequence that materializes it. Exported separately so unit tests can pin
+ * Pure helper: decide the pad/trim operation and the steps that
+ * materialize it. Exported separately so unit tests can pin
  * every branch without spawning ffmpeg.
  *
- *   - `sourceDuration < targetDuration` → generate only the missing silence
- *     tail, then concat-copy the source AAC plus that tail. This avoids
- *     re-encoding the already mixed `audio.aac`; the pad branch remains the
- *     inverse of trim instead of becoming a second full-source AAC encode.
- *   - `sourceDuration > targetDuration` → trim with `-t target`. `-c:a copy`
- *     is preserved when the input is already AAC.
+ *   - `sourceDuration < targetDuration` → pad with `apad` to the exact target
+ *     and re-encode AAC. This decodes and re-encodes the already mixed audio;
+ *     an earlier concat-copy shape avoided that but could not produce a
+ *     portable result on the bundled Windows FFmpeg builds.
+ *   - `sourceDuration > targetDuration` → filter to the exact target and
+ *     re-encode AAC so packet padding cannot outlast the video.
  *   - `|Δ| < AUDIO_DURATION_TOLERANCE_SECONDS` → no-op `copy`, but we still
  *     run ffmpeg with `-c:a copy` to materialize the output path.
  */
@@ -131,7 +165,6 @@ export function buildPadTrimAudioPlan(
   outputPath: string,
   sourceDurationSeconds: number,
   targetDurationSeconds: number,
-  audioInfo: Pick<AudioProbeInfo, "sampleRate" | "channels"> = {},
 ): PadTrimAudioPlan {
   const delta = targetDurationSeconds - sourceDurationSeconds;
   const targetSec = formatSeconds(targetDurationSeconds);
@@ -143,75 +176,20 @@ export function buildPadTrimAudioPlan(
     };
   }
   if (delta > 0) {
-    const padDur = formatSeconds(delta);
-    const silencePath = `${outputPath}.pad-silence.aac`;
-    const concatListPath = `${outputPath}.concat-list.txt`;
     return {
       operation: "pad",
-      steps: [
-        {
-          kind: "pad-silence",
-          args: [
-            "-f",
-            "lavfi",
-            "-i",
-            `anullsrc=channel_layout=${channelLayoutForChannels(audioInfo.channels)}:sample_rate=${sampleRateForFilter(audioInfo.sampleRate)}`,
-            "-t",
-            padDur,
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-y",
-            silencePath,
-          ],
-        },
-        {
-          kind: "pad-concat",
-          args: [
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            concatListPath,
-            "-c:a",
-            "copy",
-            "-y",
-            outputPath,
-          ],
-          concatListPath,
-          concatListContent: `${concatFileLine(audioPath)}\n${concatFileLine(silencePath)}\n`,
-        },
-      ],
-      cleanupPaths: [silencePath, concatListPath],
+      steps: [{ kind: "normalize", filter: `apad,atrim=0:${targetSec}` }],
+      cleanupPaths: [],
     };
   }
-  // Trim. `-t` truncates AAC without re-encoding because AAC frames are
-  // independently decodable; ffmpeg snaps the cut point to the nearest
-  // packet boundary, fine for the ±1ms tolerance we care about here.
+  // Packet-copy trimming snaps to AAC frame boundaries (typically 1024
+  // samples), which can leave ~20ms beyond the target. Decode/filter/re-encode
+  // into M4A so ffmpeg records the exact presentation duration.
   return {
     operation: "trim",
-    steps: [
-      { kind: "trim", args: ["-i", audioPath, "-t", targetSec, "-c:a", "copy", "-y", outputPath] },
-    ],
+    steps: [{ kind: "trim", filter: `atrim=duration=${targetSec},asetpts=PTS-STARTPTS` }],
     cleanupPaths: [],
   };
-}
-
-export function buildPadTrimAudioArgs(
-  audioPath: string,
-  outputPath: string,
-  sourceDurationSeconds: number,
-  targetDurationSeconds: number,
-): { args: string[]; operation: PadTrimOperation } {
-  const plan = buildPadTrimAudioPlan(
-    audioPath,
-    outputPath,
-    sourceDurationSeconds,
-    targetDurationSeconds,
-  );
-  return { operation: plan.operation, args: plan.steps[0]?.args ?? [] };
 }
 
 /**
@@ -224,45 +202,34 @@ function formatSeconds(sec: number): string {
   return sec.toFixed(6);
 }
 
-function sampleRateForFilter(sampleRate: number | undefined): number {
-  return sampleRate !== undefined && Number.isFinite(sampleRate) && sampleRate > 0
-    ? Math.round(sampleRate)
-    : 48000;
-}
-
-function channelLayoutForChannels(channels: number | undefined): string {
-  if (channels === 1) return "mono";
-  if (channels === 6) return "5.1";
-  if (channels === 8) return "7.1";
-  return "stereo";
-}
-
-function concatFileLine(path: string): string {
-  // Bare paths in concat directives — NOT `file://` URLs. Two failure
-  // modes on the round trip to a working shape:
-  //   1. `file:///C:/…` — FFmpeg 8.x on Windows fails to open URL-form
-  //      paths from the concat demuxer with "Impossible to open
-  //      file:///C:/…" (its `file:` protocol strips the scheme leaving
-  //      `///C:/…`, which Windows path parsing then rejects). Field-
-  //      signal reports ts=1784169914 / 1784177061 / 1784177375 (all
-  //      win32/x64 CLI 0.7.59; the last isolated the module's arg shape
-  //      vs a working manual `apad=whole_dur` command).
-  //   2. Bare `/tmp/…` when the concat script was fed via `pipe:0` —
-  //      FFmpeg's URL joiner resolves absolute POSIX paths against the
-  //      base `pipe:` URL, producing `pipe:/tmp/…` which the demuxer
-  //      then tries to open as a pipe. Broke Linux CI (regression shard
-  //      + producer integration) once the `file://` prefix was dropped.
-  // Fix: emit bare paths AND materialize the concat script into a real
-  // file (see `concatListPath`/`concatListContent` on the pad-concat
-  // step), matching sibling `assemble.ts`'s concat convention. A real
-  // file's directory becomes the base URL, and absolute paths in the
-  // script resolve as-is on both platforms. The single-quote escaping
-  // (`'\''`) is the concat demuxer's own escape rule.
-  return `file '${path.replace(/'/g, "'\\''")}'`;
+/**
+ * Every probe failure message, sanitized once, at the one place they all pass
+ * through on their way into the public `PadTrimAudioResult.error`.
+ *
+ * `runFfprobeJson` already scrubs the stderr it raises, but it is not the only
+ * thrower: `defaultProbeVideoFrameInfo` raises
+ * `ffprobe found no video stream in ${videoPath}` with the raw path, and a
+ * caller-supplied `probeVideoFrameInfo` / `probeAudioInfo` can raise anything
+ * at all. Sanitizing per-thrower is a list that will drift; sanitizing at the
+ * boundary cannot be bypassed by adding a new throw upstream.
+ *
+ * Known paths first (this function has them in hand, so no pattern has to
+ * recognise them), then the generic shape-based scrub for anything the message
+ * picked up elsewhere.
+ */
+function sanitizeProbeFailure(reason: unknown, paths: readonly string[]): string {
+  // Normalized here, not at the call sites. A caller-supplied probe can reject
+  // with anything — `Promise.reject("probe failed")` has no `.message`, so
+  // casting to Error yielded `undefined` and threw inside the redactor. That
+  // turned a returned failure result into a rejected promise, which is a
+  // behaviour regression the cast introduced.
+  const message = reason instanceof Error ? reason.message : String(reason);
+  const keepFfmpegsLastLineUncapped = Number.POSITIVE_INFINITY;
+  return redactTelemetryString(redactKnownPaths(message, paths), keepFfmpegsLastLineUncapped);
 }
 
 /**
- * Pad or trim `audio.aac` so its exact duration matches `frameCount / fps`
+ * Pad or trim the mixed audio so its exact duration matches `frameCount / fps`
  * for the assembled video.
  */
 export async function padOrTrimAudioToVideoFrameCount(
@@ -271,8 +238,25 @@ export async function padOrTrimAudioToVideoFrameCount(
   const probeVideo =
     input.probeVideoFrameInfo ??
     ((videoPath: string) => defaultProbeVideoFrameInfo(videoPath, input.signal));
-  const probeAudio = input.probeAudioInfo ?? defaultProbeAudioInfo;
-  const runner = input.runFfmpeg ?? ((args: string[]) => defaultRunFfmpeg(args, input.signal));
+  const probeAudio =
+    input.probeAudioInfo ??
+    ((path: string, signal?: AbortSignal) =>
+      defaultProbeAudioInfo(path, signal, input.audioContainer));
+  const timeoutMs = input.timeoutMs ?? DEFAULT_CONFIG.ffmpegProcessTimeout;
+  const runner =
+    input.runFfmpeg ?? ((args: string[]) => defaultRunFfmpeg(args, timeoutMs, input.signal));
+  const encode =
+    input.encodeAac ??
+    defaultAacEncoder(timeoutMs, input.signal, input.sourcePath, input.audioContainer);
+  // Injected runners usually do not materialize media. Tests that exercise
+  // peak correction opt in with a matching probe; production always uses the
+  // real post-codec measurement.
+  const probeTruePeak =
+    input.probeAudioTruePeakDbfs ??
+    (input.runFfmpeg || input.encodeAac
+      ? undefined
+      : (audioPath: string, signal?: AbortSignal) =>
+          measureTruePeakDbfs(audioPath, { timeoutMs, signal }));
 
   // Probe video and audio in parallel — the two ffprobe invocations are
   // independent and account for most of this function's wall-clock time.
@@ -281,12 +265,16 @@ export async function padOrTrimAudioToVideoFrameCount(
     probeAudio(input.audioPath, input.signal),
   ]);
 
+  const probePaths = [input.videoPath, input.audioPath, input.outputPath];
   if (videoResult.status === "rejected") {
     return failResult(
       input.outputPath,
       0,
       audioResult.status === "fulfilled" ? audioResult.value.durationSeconds : 0,
-      `audioPadTrim: failed to probe video: ${(videoResult.reason as Error).message}`,
+      `audioPadTrim: failed to probe video: ${sanitizeProbeFailure(
+        videoResult.reason,
+        probePaths,
+      )}`,
     );
   }
   if (audioResult.status === "rejected") {
@@ -294,7 +282,10 @@ export async function padOrTrimAudioToVideoFrameCount(
       input.outputPath,
       0,
       0,
-      `audioPadTrim: failed to probe audio: ${(audioResult.reason as Error).message}`,
+      `audioPadTrim: failed to probe audio: ${sanitizeProbeFailure(
+        audioResult.reason,
+        probePaths,
+      )}`,
     );
   }
 
@@ -323,19 +314,19 @@ export async function padOrTrimAudioToVideoFrameCount(
     input.outputPath,
     audioInfo.durationSeconds,
     targetDurationSeconds,
-    audioInfo,
   );
 
   try {
     for (const step of plan.steps) {
-      // Materialize the concat-demuxer script to a real file when the step
-      // needs one. Doing this here (instead of piping via `pipe:0` in the
-      // runner) is what makes the demuxer's URL resolution treat
-      // absolute paths as absolute — see `concatFileLine` for context.
-      if (step.concatListPath !== undefined && step.concatListContent !== undefined) {
-        writeFileSync(step.concatListPath, step.concatListContent, "utf-8");
-      }
-      const ffmpegResult = await runner(step.args);
+      const ffmpegResult =
+        step.kind === "copy"
+          ? await runner([...localContainerInputArgs(input.audioContainer), ...step.args])
+          : await encode(
+              input.sourcePath ?? input.audioPath,
+              input.outputPath,
+              targetDurationSeconds,
+              step.filter,
+            );
       if (!ffmpegResult.success) {
         return {
           success: false,
@@ -344,6 +335,7 @@ export async function padOrTrimAudioToVideoFrameCount(
           sourceDurationSeconds: audioInfo.durationSeconds,
           operation: plan.operation,
           error: ffmpegResult.error,
+          failureReason: ffmpegResult.failureReason,
         };
       }
     }
@@ -359,7 +351,31 @@ export async function padOrTrimAudioToVideoFrameCount(
       }`,
     };
   } finally {
-    for (const path of plan.cleanupPaths) rmSync(path, { force: true });
+    for (const path of plan.cleanupPaths) removeScratch(path);
+  }
+
+  let loweredDb = 0;
+  if (probeTruePeak) {
+    const correction = await enforceAacTruePeak({
+      audioPath: input.outputPath,
+      sourcePath: input.sourcePath,
+      targetDurationSeconds,
+      signal: input.signal,
+      probeTruePeak,
+      encode,
+    });
+    if (!correction.success) {
+      return {
+        success: false,
+        outputPath: input.outputPath,
+        targetDurationSeconds,
+        sourceDurationSeconds: audioInfo.durationSeconds,
+        operation: plan.operation,
+        error: correction.error,
+        failureReason: correction.failureReason,
+      };
+    }
+    loweredDb = correction.loweredDb ?? 0;
   }
   return {
     success: true,
@@ -367,7 +383,166 @@ export async function padOrTrimAudioToVideoFrameCount(
     targetDurationSeconds,
     sourceDurationSeconds: audioInfo.durationSeconds,
     operation: plan.operation,
+    ...(loweredDb > 0 ? { audioLoweredDb: loweredDb } : {}),
   };
+}
+
+/**
+ * The true-peak half of {@link padOrTrimAudioToVideoFrameCount}, for AAC already encoded at its
+ * exact length: measures once and re-encodes only when the peak is over the ceiling.
+ */
+export async function constrainAacTruePeak(input: {
+  audioPath: string;
+  /** The PCM `audioPath` was encoded from: a correction re-encodes it instead of decoding the AAC. */
+  sourcePath?: string;
+  targetDurationSeconds: number;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  probeTruePeakDbfs?: (audioPath: string, signal?: AbortSignal) => Promise<number>;
+  encodeAac?: AacEncoder;
+  rewriteSource?: SourceRewriter;
+}): Promise<{
+  success: boolean;
+  error?: string;
+  failureReason?: "external_interruption";
+  loweredDb?: number;
+  sourceStale?: true;
+}> {
+  const timeoutMs = input.timeoutMs ?? DEFAULT_CONFIG.ffmpegProcessTimeout;
+  return enforceAacTruePeak({
+    audioPath: input.audioPath,
+    sourcePath: input.sourcePath,
+    targetDurationSeconds: input.targetDurationSeconds,
+    signal: input.signal,
+    probeTruePeak:
+      input.probeTruePeakDbfs ??
+      ((audioPath, signal) => measureTruePeakDbfs(audioPath, { timeoutMs, signal })),
+    encode: input.encodeAac ?? defaultAacEncoder(timeoutMs, input.signal, input.sourcePath),
+    rewriteSource:
+      input.rewriteSource ??
+      ((sourcePath, outputPath, filter) =>
+        defaultRunFfmpeg(
+          ["-i", sourcePath, "-af", filter, "-c:a", "pcm_f32le", "-y", outputPath],
+          timeoutMs,
+          input.signal,
+        )),
+  });
+}
+
+/** Writes `sourcePath` through `filter` to `outputPath` as float PCM. */
+type SourceRewriter = (
+  sourcePath: string,
+  outputPath: string,
+  filter: string,
+) => Promise<StepResult>;
+
+interface EnforceAacTruePeakInput {
+  audioPath: string;
+  sourcePath?: string;
+  targetDurationSeconds: number;
+  signal?: AbortSignal;
+  probeTruePeak: (audioPath: string, signal?: AbortSignal) => Promise<number>;
+  encode: AacEncoder;
+  /** Given with `sourcePath`, a cut is also applied to the PCM so it still encodes to `audioPath`. */
+  rewriteSource?: SourceRewriter;
+}
+
+/** Applies the delivered cut to the PCM. False means the PCM no longer matches the delivered AAC, even if deleting it was refused. */
+async function cutSource(
+  input: EnforceAacTruePeakInput,
+  scratchDir: string,
+  attenuationDb: number,
+): Promise<boolean> {
+  if (!input.sourcePath || !input.rewriteSource) return true;
+  const cutPath = join(scratchDir, "source.wav");
+  try {
+    const result = await input.rewriteSource(input.sourcePath, cutPath, gainFilter(attenuationDb));
+    if (!result.success) throw new Error(result.error);
+    renameWithRetry(cutPath, input.sourcePath, { copyFallback: true });
+    return true;
+  } catch {
+    removeScratch(input.sourcePath);
+    return false;
+  }
+}
+
+async function enforceAacTruePeak(input: EnforceAacTruePeakInput): Promise<{
+  success: boolean;
+  error?: string;
+  failureReason?: "external_interruption";
+  loweredDb?: number;
+  sourceStale?: true;
+}> {
+  let scratchDir: string | undefined;
+  try {
+    scratchDir = createStagingDir(dirname(input.audioPath), ".true-peak-");
+    const correctedPath = join(scratchDir, "audio.m4a");
+    const measurements: string[] = [];
+    let attenuationDb = 0;
+    let sourcePeakDbfs: number | undefined;
+    let measuredPath = input.audioPath;
+    for (let pass = 0; pass <= MAX_TRUE_PEAK_CORRECTION_PASSES; pass += 1) {
+      const truePeakDbfs = await input.probeTruePeak(measuredPath, input.signal);
+      measurements.push(
+        `pass ${pass}: ${truePeakDbfs.toFixed(3)} dBFS at ${attenuationDb.toFixed(3)} dB attenuation`,
+      );
+      if (Number.isNaN(truePeakDbfs) || truePeakDbfs === Number.POSITIVE_INFINITY) {
+        return { success: false, error: "audioPadTrim: FFmpeg reported an invalid true peak" };
+      }
+      if (truePeakDbfs <= AAC_DELIVERY_TRUE_PEAK_DBFS) {
+        if (measuredPath !== correctedPath) return { success: true };
+        const sourceCut = await cutSource(input, scratchDir, attenuationDb);
+        renameWithRetry(correctedPath, input.audioPath, { copyFallback: true });
+        const loweredDb = Number((-attenuationDb).toFixed(2));
+        return sourceCut
+          ? { success: true, loweredDb }
+          : { success: true, loweredDb, sourceStale: true };
+      }
+      if (pass === MAX_TRUE_PEAK_CORRECTION_PASSES) break;
+
+      // Aim below the ceiling, twice as far each pass: the correction is another lossy AAC encode,
+      // whose peak can stall or rise over a few dB of attenuation instead of falling dB for dB.
+      const headroomDb = AAC_TRUE_PEAK_CORRECTION_HEADROOM_DB * 2 ** pass;
+      // The encoder clips what is left above full scale, so the AAC under-reads a hotter PCM and a
+      // cut sized from it never gets the PCM under: size it from the louder of the two.
+      if (input.sourcePath && sourcePeakDbfs === undefined) {
+        sourcePeakDbfs = await input.probeTruePeak(input.sourcePath, input.signal);
+      }
+      const referenceDbfs = Math.max(truePeakDbfs, (sourcePeakDbfs ?? -Infinity) + attenuationDb);
+      attenuationDb += AAC_DELIVERY_TRUE_PEAK_DBFS - headroomDb - referenceDbfs;
+      const result = await input.encode(
+        input.sourcePath ?? input.audioPath,
+        correctedPath,
+        input.targetDurationSeconds,
+        aacTruePeakCorrectionFilter(input.targetDurationSeconds, attenuationDb),
+      );
+      if (!result.success) {
+        return {
+          success: false,
+          error: sanitizeProbeFailure(
+            result.error ?? "audioPadTrim: failed to constrain AAC true peak",
+            [input.audioPath, correctedPath],
+          ),
+          failureReason: result.failureReason,
+        };
+      }
+      measuredPath = correctedPath;
+    }
+    return {
+      success: false,
+      error: `audioPadTrim: AAC true peak remained above ${AAC_DELIVERY_TRUE_PEAK_DBFS} dBFS after ${MAX_TRUE_PEAK_CORRECTION_PASSES} correction passes; ${measurements.join("; ")}`,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      error: `audioPadTrim: failed to validate AAC true peak: ${sanitizeProbeFailure(
+        err,
+        scratchDir ? [input.audioPath, scratchDir] : [input.audioPath],
+      )}`,
+    };
+  } finally {
+    if (scratchDir) removeScratch(scratchDir);
+  }
 }
 
 function failResult(
@@ -398,14 +573,16 @@ interface FfprobeOutput {
   streams?: FfprobeStreamInfo[];
 }
 
-async function defaultProbeVideoFrameInfo(
+export async function defaultProbeVideoFrameInfo(
   videoPath: string,
   signal?: AbortSignal,
+  container?: "mov" | "matroska",
 ): Promise<ProbeVideoFrameInfo> {
   // Try the container header (`nb_frames`) first — single moov atom read,
   // no decode. Closed-GOP, B-frame-free streams (the only ones we'll ever
   // ask to pad/trim) reliably set it. Fall back to `-count_packets` which
   // walks the packet stream when the header doesn't carry the count.
+  const inputArgs = localContainerInputArgs(container);
   const fastInfo = await runFfprobeJson<FfprobeOutput>(
     [
       "-v",
@@ -416,6 +593,8 @@ async function defaultProbeVideoFrameInfo(
       "stream=nb_frames,r_frame_rate",
       "-of",
       "json",
+      ...inputArgs,
+      "--",
       videoPath,
     ],
     signal,
@@ -436,6 +615,8 @@ async function defaultProbeVideoFrameInfo(
       "stream=nb_read_packets,r_frame_rate",
       "-of",
       "json",
+      ...inputArgs,
+      "--",
       videoPath,
     ],
     signal,
@@ -462,10 +643,11 @@ function parseFrameRate(rate: string): { fpsNum: number; fpsDen: number } {
 async function defaultProbeAudioInfo(
   audioPath: string,
   signal?: AbortSignal,
+  inputContainer?: "mov",
 ): Promise<AudioProbeInfo> {
-  // The shared ffprobe wrapper derives AAC-LC duration from packet count so
+  // The shared ffprobe wrapper corrects for a lying container duration so
   // every consumer sees the same VBR-safe metadata while preserving cancellation.
-  const metadata: AudioMetadata = await extractAudioMetadata(audioPath, { signal });
+  const metadata: AudioMetadata = await extractAudioMetadata(audioPath, { signal, inputContainer });
   return {
     durationSeconds: metadata.durationSeconds,
     sampleRate: metadata.sampleRate,
@@ -476,20 +658,68 @@ async function defaultProbeAudioInfo(
 
 async function defaultRunFfmpeg(
   args: string[],
+  timeoutMs: number,
   signal?: AbortSignal,
-): Promise<{ success: boolean; error?: string }> {
-  const result = await runFfmpeg(args, { signal });
+): Promise<StepResult> {
+  return toStepResult(await runFfmpeg(args, { signal, timeout: timeoutMs }), timeoutMs);
+}
+
+function defaultAacEncoder(
+  timeoutMs: number,
+  signal?: AbortSignal,
+  pcmSourcePath?: string,
+  inputContainer?: "mov",
+): AacEncoder {
+  return async (inputPath, outputPath, durationSeconds, filter) => {
+    // Each segment decodes its input from the start: cheap from PCM, a second lossy pass from AAC.
+    const options = pcmSourcePath
+      ? { signal, timeout: timeoutMs, filter }
+      : { signal, timeout: timeoutMs, filter, segments: 1, inputContainer };
+    return toStepResult(
+      await encodeAac(pcmSourcePath ?? inputPath, outputPath, durationSeconds, options),
+      timeoutMs,
+    );
+  };
+}
+
+function toStepResult(result: RunFfmpegResult, timeoutMs: number): StepResult {
   if (result.success) return { success: true };
   return {
     success: false,
-    error: `[audioPadTrim] ${formatFfmpegError(result.exitCode, result.stderr)}`,
+    error: `[audioPadTrim] ${describeFfmpegFailure(result, timeoutMs)}`,
+    failureReason: result.failureReason,
   };
 }
 
 // ── ffprobe JSON runner (shared between fast/slow video probe paths) ─────
 
-async function runFfprobeJson<T>(args: string[], signal?: AbortSignal): Promise<T> {
-  const proc = spawn(getFfprobeBinary(), args);
+export async function runFfprobeJson<T>(args: string[], signal?: AbortSignal): Promise<T> {
+  // Callers bake the input path into `args` (terminated with "--"), so this
+  // helper cannot add the terminator itself — assert they did rather than
+  // let a dash-prefixed path silently reach ffprobe as an option.
+  if (!args.includes("--")) {
+    throw new Error('[audioPadTrim] ffprobe args must terminate options with "--".');
+  }
+  // With a restricted page network, a URL input not declared by the render reaches only public hosts.
+  const proxying = withPublicOnlyProxy(args, [args.indexOf("--") + 1]);
+  const routed = proxying && (await proxying);
+  try {
+    return await spawnFfprobeJson<T>(routed?.args ?? args, routed?.env, signal);
+  } finally {
+    await routed?.close();
+  }
+}
+
+async function spawnFfprobeJson<T>(
+  args: string[],
+  env: NodeJS.ProcessEnv | undefined,
+  signal?: AbortSignal,
+): Promise<T> {
+  const proc = spawn(getFfprobeBinary(), args, {
+    ...(env && { env }),
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
   trackChildProcess(proc);
   let stdout = "";
   proc.stdout.on("data", (data: Buffer) => {
@@ -507,7 +737,14 @@ async function runFfprobeJson<T>(args: string[], signal?: AbortSignal): Promise<
     throw outcome.error ?? new Error(outcome.stderr);
   }
   if (outcome.reason !== "exit" || outcome.exitCode !== 0) {
-    throw new Error(`ffprobe ${outcome.reason}: ${outcome.stderr}`);
+    // Redacted twice, deliberately. The shape-based scrub is a net with
+    // holes — it cannot know that `customer/acme-secret/video.mp4` is a path
+    // and `48000/1001` is not — but THIS caller knows the exact path it put
+    // in the argv, so it names it literally first. The message reaches logs,
+    // telemetry, and `PadTrimAudioResult.error`.
+    const probed = args[args.length - 1];
+    const scrubbed = redactKnownPaths(outcome.stderr, probed === undefined ? [] : [probed]);
+    throw new Error(`ffprobe ${outcome.reason}: ${redactTelemetryString(scrubbed, 2000)}`);
   }
   try {
     return JSON.parse(stdout) as T;

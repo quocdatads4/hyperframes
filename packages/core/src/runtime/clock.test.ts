@@ -10,6 +10,14 @@ function createClock(opts?: ConstructorParameters<typeof TransportClock>[0]) {
   return { clock, advance, getMs: () => ms };
 }
 
+/** Advances `totalMs` in sub-threshold steps, reading `now()` each time (see clock.ts's stall policy). */
+function advancePolled(clock: TransportClock, advance: (deltaMs: number) => void, totalMs: number) {
+  for (let remaining = totalMs; remaining > 0; remaining -= 250) {
+    advance(Math.min(250, remaining));
+    clock.now();
+  }
+}
+
 describe("TransportClock", () => {
   describe("initial state", () => {
     it("starts paused at time 0", () => {
@@ -108,8 +116,8 @@ describe("TransportClock", () => {
       clock.seek(10);
       expect(clock.isPlaying()).toBe(true);
       expect(clock.now()).toBe(10);
-      advance(1000);
-      expect(clock.now()).toBe(11);
+      advancePolled(clock, advance, 1000);
+      expect(clock.now()).toBeCloseTo(11, 5);
     });
 
     it("clamps to 0", () => {
@@ -191,6 +199,28 @@ describe("TransportClock", () => {
       expect(clock.getDuration()).toBe(Infinity);
     });
 
+    it("plays to a range's end, stops on its last frame, and runs to the film end once cleared", () => {
+      const { clock, advance } = createClock({ duration: 6 });
+      clock.setPlayRange(2, 3, 30);
+      clock.seek(2);
+      clock.play();
+      advance(1500);
+      expect(clock.now()).toBe(3);
+      expect(clock.reachedEnd()).toBe(true);
+      expect(clock.getStopTime()).toBeCloseTo(89 / 30, 9);
+      clock.pause();
+      clock.seek(clock.getStopTime());
+      expect(clock.reachedEnd()).toBe(true);
+      expect(clock.getDuration()).toBe(6);
+      expect(clock.getPlayStart()).toBe(2);
+      clock.setPlayRange(0, null, 30);
+      expect(clock.reachedEnd()).toBe(false);
+      expect(clock.getStopTime()).toBe(6);
+      clock.play();
+      advance(5000);
+      expect(clock.now()).toBe(6);
+    });
+
     it("reachedEnd returns false when no duration set", () => {
       const { clock, advance } = createClock();
       clock.play();
@@ -235,8 +265,8 @@ describe("TransportClock", () => {
       advance(5000);
       clock.seek(0);
       expect(clock.now()).toBe(0);
-      advance(1000);
-      expect(clock.now()).toBe(1);
+      advancePolled(clock, advance, 1000);
+      expect(clock.now()).toBeCloseTo(1, 5);
     });
   });
 
@@ -254,6 +284,82 @@ describe("TransportClock", () => {
       expect(clock.getSource()).toBe("audio");
     });
 
+    /**
+     * Plays 1/60 s ticks against an element whose time moves in `stepMs` steps at `speed`; frames are 30 fps. Frames
+     * count from the 7th tick: until the element's second update the clock does not know its step.
+     */
+    function playStepping(ticks: number, stepMs: number, speed = 1, stallAfterMs = Infinity) {
+      const { clock, advance, getMs } = createClock({ duration: 60 });
+      const el = createMockAudioEl(0, false);
+      clock.play();
+      clock.attachAudioSource({ el, compositionStart: 0, mediaStart: 0 });
+      let last = 0;
+      let skipped = 0;
+      let heldTicks = 0;
+      let longestHold = 0;
+      let mostAhead = 0;
+      let back = 0;
+      let previous = 0;
+      for (let tick = 1; tick <= ticks; tick++) {
+        advance(1000 / 60);
+        const played = Math.min(getMs(), stallAfterMs) * speed;
+        el.currentTime = (Math.floor(played / stepMs) * stepMs) / 1000;
+        const now = clock.now();
+        if (now < previous) back += 1;
+        previous = now;
+        mostAhead = Math.max(mostAhead, now - el.currentTime);
+        const frame = Math.floor(now * 30 + 1e-6);
+        if (tick > 6 && frame > last + 1) skipped += 1;
+        heldTicks = frame === last ? heldTicks + 1 : 0;
+        if (tick > 6) longestHold = Math.max(longestHold, heldTicks);
+        last = frame;
+      }
+      return { skipped, longestHold, mostAhead, back, end: clock.now() };
+    }
+
+    it("moves on every display frame between the element's time updates, never skipping a film frame", () => {
+      for (const stepMs of [30, 40, 50]) {
+        const run = playStepping(240, stepMs);
+        expect(run.skipped, `${stepMs} ms steps: film frames skipped`).toBe(0);
+        // A 30 fps frame spans two 60 Hz ticks: held for one extra tick, never two.
+        expect(run.longestHold, `${stepMs} ms steps: ticks a frame is held`).toBeLessThanOrEqual(1);
+        expect(run.back, `${stepMs} ms steps: reads that went back`).toBe(0);
+        expect(run.mostAhead, `${stepMs} ms steps: lead over the element`).toBeLessThanOrEqual(
+          stepMs / 1000 + 1e-9,
+        );
+      }
+    });
+
+    it("stops within one of the element's own updates when the element stops moving", () => {
+      const run = playStepping(120, 40, 1, 1000);
+      expect(run.end).toBeLessThanOrEqual(1 + 0.04 + 1e-9);
+    });
+
+    it("stays within one update of an element that plays slightly slower than the wall clock", () => {
+      const run = playStepping(600, 40, 0.98);
+      expect(run.mostAhead).toBeLessThanOrEqual(0.04 + 1e-9);
+      expect(run.back).toBe(0);
+    });
+
+    it("names the clock it follows: an audio element, WebAudio, or neither", () => {
+      const { clock } = createClock({ duration: 10 });
+      expect(clock.followedClock()).toBe("monotonic");
+      clock.play();
+      expect(clock.followedClock()).toBe("monotonic");
+      clock.attachAudioSource({
+        el: createMockAudioEl(3.5, false),
+        compositionStart: 0,
+        mediaStart: 0,
+      });
+      expect(clock.followedClock()).toBe("audio");
+      clock.attachAudioSource({ currentTimeSeconds: 2, webAudio: true });
+      expect(clock.followedClock()).toBe("webaudio");
+      clock.attachAudioSource({ currentTimeSeconds: 2 });
+      expect(clock.followedClock()).toBe("audio");
+      clock.detachAudioSource();
+      expect(clock.followedClock()).toBe("monotonic");
+    });
+
     it("falls back to monotonic when audio is paused", () => {
       const { clock, advance } = createClock({ duration: 10 });
       const audioEl = createMockAudioEl(3.5, true);
@@ -262,6 +368,21 @@ describe("TransportClock", () => {
       advance(1000);
       expect(clock.now()).toBe(1);
       expect(clock.getSource()).toBe("monotonic");
+    });
+
+    it("maps audio position back to composition time through a rate lane", () => {
+      const { clock } = createClock({ duration: 20 });
+      const rate = {
+        target: "rate",
+        points: [
+          { t: 0, v: 1 },
+          { t: 2, v: 3 },
+        ],
+      };
+      const audioEl = createMockAudioEl(4, false);
+      clock.play();
+      clock.attachAudioSource({ el: audioEl, compositionStart: 1, mediaStart: 0, rate });
+      expect(clock.now()).toBeCloseTo(1 + 2 + (4 - 3.641) / 3, 2);
     });
 
     it("accounts for compositionStart offset", () => {
@@ -288,9 +409,147 @@ describe("TransportClock", () => {
       expect(clock.now()).toBe(5);
       clock.detachAudioSource();
       expect(clock.now()).toBeCloseTo(5, 1);
-      advance(1000);
+      advancePolled(clock, advance, 1000);
       expect(clock.now()).toBeCloseTo(6, 1);
       expect(clock.getSource()).toBe("monotonic");
+    });
+
+    it("never rewinds the playhead for a clip that started late, and runs on while it catches up", () => {
+      const { clock, advance } = createClock({ duration: 30 });
+      clock.play();
+      advancePolled(clock, advance, 6300);
+      const sfx = createMockAudioEl(0, false); // at its start, 50 ms behind the playhead
+      clock.attachAudioSource({ el: sfx, compositionStart: 6.25, mediaStart: 0 });
+      expect(clock.now()).toBeCloseTo(6.3, 5);
+      advance(100);
+      sfx.currentTime = 0.02;
+      expect(clock.now()).toBeCloseTo(6.4, 5); // steering catches the clip up; the playhead does not wait
+      advance(100);
+      sfx.currentTime = 0.4; // now it is ahead of the playhead: the playhead follows it
+      expect(clock.now()).toBeCloseTo(6.65, 5);
+    });
+
+    it("keeps the playhead moving while a just-played element is frozen behind it, as WebKit leaves it", () => {
+      const { clock, advance } = createClock({ duration: 30 });
+      clock.play();
+      advancePolled(clock, advance, 6300);
+      const take = createMockAudioEl(0, false); // playing, its time frozen at its start
+      clock.attachAudioSource({ el: take, compositionStart: 6, mediaStart: 0 });
+      let previous = clock.now();
+      for (let i = 0; i < 20; i++) {
+        advance(16);
+        const now = clock.now();
+        expect(now).toBeGreaterThan(previous);
+        previous = now;
+      }
+    });
+
+    it("keeps the playhead moving while the element it follows is seeked", () => {
+      const { clock, advance } = createClock({ duration: 30 });
+      clock.play();
+      advancePolled(clock, advance, 2000);
+      const voice = Object.assign(createMockAudioEl(0.1, false), { seeking: false });
+      clock.attachAudioSource({ el: voice, compositionStart: 2, mediaStart: 0 });
+      expect(clock.now()).toBeCloseTo(2.1, 5);
+      voice.seeking = true;
+      voice.currentTime = 3; // WebKit reports the target at once
+      let previous = clock.now();
+      for (let i = 0; i < 20; i++) {
+        advance(16);
+        const now = clock.now();
+        expect(now).toBeGreaterThan(previous);
+        previous = now;
+      }
+    });
+
+    it("holds the playhead on an element that is buffering behind it", () => {
+      const { clock, advance } = createClock({ duration: 30 });
+      clock.play();
+      advancePolled(clock, advance, 6300);
+      const voice = Object.assign(createMockAudioEl(0, false), { readyState: 1 });
+      clock.attachAudioSource({ el: voice, compositionStart: 5, mediaStart: 0 });
+      advance(500);
+      expect(clock.now()).toBeCloseTo(6.3, 5);
+    });
+
+    it("does not follow a jump back past a hard sync, such as a native loop wrap", () => {
+      const { clock, advance } = createClock({ duration: 30 });
+      clock.play();
+      const bed = createMockAudioEl(5, false);
+      clock.attachAudioSource({ el: bed, compositionStart: 0, mediaStart: 0 });
+      expect(clock.now()).toBe(5);
+      advance(16);
+      bed.currentTime = 1; // wrapped to its loop start
+      expect(clock.now()).toBeCloseTo(5.016, 5);
+    });
+
+    it("a Play waits for audio that has not started where it began, but never pulls back to audio far behind", () => {
+      const { clock, advance } = createClock({ duration: 30 });
+      clock.seek(5);
+      clock.play();
+      advance(16);
+      expect(clock.now()).toBeCloseTo(5.016, 5);
+      const voice = createMockAudioEl(5, false);
+      clock.attachAudioSource({ el: voice, compositionStart: 0, mediaStart: 0 });
+      advance(100);
+      expect(clock.now()).toBe(5);
+
+      clock.pause();
+      clock.play();
+      advance(16);
+      voice.currentTime = 1;
+      expect(clock.now()).toBeCloseTo(5.016, 5);
+    });
+
+    it("does not freeze on a short native loop that wraps", () => {
+      const { clock, advance } = createClock({ duration: 30 });
+      clock.play();
+      const bed = Object.assign(createMockAudioEl(0.3, false), { loop: true, duration: 0.32 });
+      clock.attachAudioSource({ el: bed, compositionStart: 0, mediaStart: 0 });
+      expect(clock.now()).toBeCloseTo(0.3, 5);
+      advance(16);
+      bed.currentTime = 0.02; // wrapped to its loop start
+      expect(clock.now()).toBeCloseTo(0.316, 5);
+    });
+
+    it("keeps the playhead moving for a looping bed that starts late", () => {
+      const { clock, advance } = createClock({ duration: 30 });
+      clock.play();
+      advancePolled(clock, advance, 2000);
+      const bed = Object.assign(createMockAudioEl(0, false), {
+        loop: true,
+        duration: 8,
+        readyState: 4,
+      });
+      clock.attachAudioSource({ el: bed, compositionStart: 1.9, mediaStart: 0 });
+      advance(16);
+      expect(clock.now()).toBeCloseTo(2.016, 5);
+    });
+
+    it("continues from the last audio time when the element drops out", () => {
+      const { clock, advance } = createClock({ duration: 30 });
+      clock.play();
+      advancePolled(clock, advance, 4000);
+      const voice = createMockAudioEl(5, false);
+      clock.attachAudioSource({ el: voice, compositionStart: 0, mediaStart: 0 });
+      expect(clock.now()).toBe(5);
+      Object.assign(voice, { paused: true });
+      advance(16);
+      expect(clock.now()).toBeCloseTo(5.016, 5);
+    });
+
+    it("lets a seek move the playhead back past a held time", () => {
+      const { clock, advance } = createClock({ duration: 30 });
+      clock.play();
+      const voice = createMockAudioEl(5, false);
+      clock.attachAudioSource({ el: voice, compositionStart: 0, mediaStart: 0 });
+      expect(clock.now()).toBe(5);
+      clock.detachAudioSource();
+      clock.seek(2);
+      voice.currentTime = 2;
+      clock.attachAudioSource({ el: voice, compositionStart: 0, mediaStart: 0 });
+      advance(16);
+      expect(clock.now()).toBe(2);
     });
 
     it("clamps audio-derived time to duration", () => {
@@ -341,15 +600,24 @@ describe("TransportClock", () => {
       expect(clock.now()).toBe(4);
     });
 
-    it("composition time is correct when el.playbackRate differs from clock rate", () => {
-      // General formula: wall_elapsed = (el.currentTime - mediaStart) / el.playbackRate
-      // composition_time = compositionStart + wall_elapsed * clockRate
+    it("reads the element's place in its file, whatever playbackRate it has been given", () => {
       const { clock } = createClock({ rate: 2, duration: 20 });
-      // Audio at 1x, clock at 2x: after 1s wall, el.currentTime=1, comp should be 2.
       const audioEl = { currentTime: 1, paused: false, playbackRate: 1 } as HTMLMediaElement;
       clock.play();
       clock.attachAudioSource({ el: audioEl, compositionStart: 0, mediaStart: 0 });
-      expect(clock.now()).toBe(2);
+      expect(clock.now()).toBe(1);
+    });
+
+    it("keeps its place when the speed changes under a clip with its own rate", () => {
+      const { clock, advance } = createClock({ duration: 30 });
+      clock.play();
+      const voice = { currentTime: 12.5, paused: false, playbackRate: 1.25 } as HTMLMediaElement;
+      clock.attachAudioSource({ el: voice, compositionStart: 0, mediaStart: 0, rate: 1.25 });
+      expect(clock.now()).toBe(10);
+      clock.setRate(1.5);
+      voice.playbackRate = 1.5; // the transport rate lands on the element before media sync restores 1.875
+      advance(16);
+      expect(clock.now()).toBe(10);
     });
   });
 });

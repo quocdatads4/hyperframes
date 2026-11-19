@@ -8,11 +8,14 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
+import { globalMediaDir } from "./media-home.mjs";
 import { appendRecord, mediaDir, nextId } from "./manifest.mjs";
 import { regenerateIndex } from "./index-gen.mjs";
 import { mergedPreferences } from "./prefs-store.mjs";
+
+// A filter keeps Node 22 off its native copy, which writes nothing under a non-ASCII path on Windows.
+const NON_ASCII_SAFE_DIR_COPY = { recursive: true, force: true, filter: () => true };
 
 /**
  * Recipes — the heavyweight tier of HyperFrames user memory.
@@ -35,7 +38,7 @@ import { mergedPreferences } from "./prefs-store.mjs";
 const FRONTMATTER_CONTENT_KEYS = new Set(["message", "audience", "mode"]);
 
 /** BRIEF.md frontmatter keys that describe this run, not the reusable type —
- * a recipe never locks the run's shape, so the intent layer always re-asks. */
+ * a recipe never locks the run's shape, so these are always asked again. */
 const BRIEF_CONTENT_KEYS = new Set(["flow", "storyboard", "message", "audience"]);
 
 /** Per-frame metadata that is content, not structure. */
@@ -58,7 +61,7 @@ export function projectRecipesDir(projectDir) {
 }
 
 export function userRecipesDir() {
-  return join(homedir(), ".media", "recipes");
+  return join(globalMediaDir(), "recipes");
 }
 
 export function slugifyRecipeName(name) {
@@ -193,6 +196,18 @@ function readRecipeJson(dir) {
   }
 }
 
+/** The highest `<slug>@v<N>` archive number in `recipesDir`, 0 when there is none. */
+function highestArchive(recipesDir, slug) {
+  const prefix = `${slug}@v`;
+  let highest = 0;
+  for (const entry of readdirSync(recipesDir)) {
+    if (!entry.startsWith(prefix)) continue;
+    const number = Number(entry.slice(prefix.length));
+    if (Number.isSafeInteger(number) && number > highest) highest = number;
+  }
+  return highest;
+}
+
 function prefValue(prefs, key) {
   return prefs[key]?.value;
 }
@@ -221,10 +236,21 @@ export function freezeRecipe({ projectDir, name, workflow, blocks }) {
   let version = 1;
   const previous = existsSync(dir) ? readRecipeJson(dir) : null;
   if (previous) {
-    version = (Number.isInteger(previous.version) ? previous.version : 1) + 1;
-    const archive = `${dir}@v${previous.version ?? 1}`;
-    rmSync(archive, { recursive: true, force: true });
-    renameSync(dir, archive);
+    // recipe.json travels with the project, so its version is untrusted text: only a positive
+    // integer may name the archive, and an archive already on disk is never replaced. A
+    // malformed version, or one whose archive exists, moves to the first slot above them all.
+    const claimed =
+      Number.isSafeInteger(previous.version) && previous.version > 0 ? previous.version : 0;
+    const slot =
+      claimed && !existsSync(`${dir}@v${claimed}`)
+        ? claimed
+        : Math.max(claimed, highestArchive(projectRecipesDir(root), slug)) + 1;
+    version = slot + 1;
+    // Checked before either folder moves, and keeps the next freeze's version valid too.
+    if (!Number.isSafeInteger(version)) {
+      throw new Error(`recipe "${slug}" has no version number left to freeze into`);
+    }
+    renameSync(dir, `${dir}@v${slot}`);
   }
   mkdirSync(dir, { recursive: true });
 
@@ -279,7 +305,8 @@ export function freezeRecipe({ projectDir, name, workflow, blocks }) {
   try {
     const userDir = join(userRecipesDir(), slug);
     mkdirSync(userDir, { recursive: true });
-    cpSync(dir, userDir, { recursive: true, force: true });
+    cpSync(dir, userDir, NON_ASCII_SAFE_DIR_COPY);
+    if (!briefSkeleton) rmSync(join(userDir, "brief-skeleton.md"), { force: true });
   } catch {
     // The project-tier freeze already landed.
   }
@@ -339,7 +366,7 @@ export function useRecipe({ projectDir, name }) {
       );
     }
     mkdirSync(dir, { recursive: true });
-    cpSync(userDir, dir, { recursive: true, force: true });
+    cpSync(userDir, dir, NON_ASCII_SAFE_DIR_COPY);
     const imported = readRecipeJson(dir);
     appendRecord(root, {
       id: nextId(root, "recipe"),

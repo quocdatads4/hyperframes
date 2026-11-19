@@ -1,6 +1,6 @@
 {
   "name": "@hyperframes/studio-server",
-  "version": "0.7.69",
+  "version": "0.9.70",
   "repository": {
     "type": "git",
     "url": "https://github.com/heygen-com/hyperframes",
@@ -26,6 +26,30 @@
       "node": "./dist/helpers/screenshotClip.js",
       "import": "./src/helpers/screenshotClip.ts",
       "types": "./src/helpers/screenshotClip.ts"
+    },
+    "./safe-path": {
+      "bun": "./src/helpers/safePath.ts",
+      "node": "./dist/helpers/safePath.js",
+      "import": "./src/helpers/safePath.ts",
+      "types": "./src/helpers/safePath.ts"
+    },
+    "./request-identity": {
+      "bun": "./src/helpers/requestIdentity.ts",
+      "node": "./dist/helpers/requestIdentity.js",
+      "import": "./src/helpers/requestIdentity.ts",
+      "types": "./src/helpers/requestIdentity.ts"
+    },
+    "./hf-ids": {
+      "bun": "./src/helpers/hfIdPersist.ts",
+      "node": "./dist/helpers/hfIdPersist.js",
+      "import": "./src/helpers/hfIdPersist.ts",
+      "types": "./src/helpers/hfIdPersist.ts"
+    },
+    "./history": {
+      "bun": "./src/history/index.ts",
+      "node": "./dist/history/index.js",
+      "import": "./src/history/index.ts",
+      "types": "./src/history/index.ts"
     },
     "./manual-edits-render-script": {
       "bun": "./src/helpers/manualEditsRenderScript.ts",
@@ -69,11 +93,41 @@
       "import": "./src/helpers/proxyTranscoder.ts",
       "types": "./src/helpers/proxyTranscoder.ts"
     },
+    "./loudness": {
+      "bun": "./src/helpers/loudness.ts",
+      "node": "./dist/helpers/loudness.js",
+      "import": "./src/helpers/loudness.ts",
+      "types": "./src/helpers/loudness.ts"
+    },
     "./media-proxy-preview": {
       "bun": "./src/helpers/mediaProxyPreview.ts",
       "node": "./dist/helpers/mediaProxyPreview.js",
       "import": "./src/helpers/mediaProxyPreview.ts",
       "types": "./src/helpers/mediaProxyPreview.ts"
+    },
+    "./encoder-options": {
+      "bun": "./src/helpers/encoderOptions.ts",
+      "node": "./dist/helpers/encoderOptions.js",
+      "import": "./src/helpers/encoderOptions.ts",
+      "types": "./src/helpers/encoderOptions.ts"
+    },
+    "./mime": {
+      "bun": "./src/helpers/mime.ts",
+      "node": "./dist/helpers/mime.js",
+      "import": "./src/helpers/mime.ts",
+      "types": "./src/helpers/mime.ts"
+    },
+    "./outside-file": {
+      "bun": "./src/helpers/outsideFile.ts",
+      "node": "./dist/helpers/outsideFile.js",
+      "import": "./src/helpers/outsideFile.ts",
+      "types": "./src/helpers/outsideFile.ts"
+    },
+    "./media-range": {
+      "bun": "./src/helpers/mediaRange.ts",
+      "node": "./dist/helpers/mediaRange.js",
+      "import": "./src/helpers/mediaRange.ts",
+      "types": "./src/helpers/mediaRange.ts"
     }
   },
   "publishConfig": {
@@ -87,6 +141,22 @@
       "./screenshot-clip": {
         "import": "./dist/helpers/screenshotClip.js",
         "types": "./dist/helpers/screenshotClip.d.ts"
+      },
+      "./safe-path": {
+        "import": "./dist/helpers/safePath.js",
+        "types": "./dist/helpers/safePath.d.ts"
+      },
+      "./request-identity": {
+        "import": "./dist/helpers/requestIdentity.js",
+        "types": "./dist/helpers/requestIdentity.d.ts"
+      },
+      "./hf-ids": {
+        "import": "./dist/helpers/hfIdPersist.js",
+        "types": "./dist/helpers/hfIdPersist.d.ts"
+      },
+      "./history": {
+        "import": "./dist/history/index.js",
+        "types": "./dist/history/index.d.ts"
       },
       "./manual-edits-render-script": {
         "import": "./dist/helpers/manualEditsRenderScript.js",
@@ -116,9 +186,29 @@
         "import": "./dist/helpers/proxyTranscoder.js",
         "types": "./dist/helpers/proxyTranscoder.d.ts"
       },
+      "./loudness": {
+        "import": "./dist/helpers/loudness.js",
+        "types": "./dist/helpers/loudness.d.ts"
+      },
       "./media-proxy-preview": {
         "import": "./dist/helpers/mediaProxyPreview.js",
         "types": "./dist/helpers/mediaProxyPreview.d.ts"
+      },
+      "./encoder-options": {
+        "import": "./dist/helpers/encoderOptions.js",
+        "types": "./dist/helpers/encoderOptions.d.ts"
+      },
+      "./mime": {
+        "import": "./dist/helpers/mime.js",
+        "types": "./dist/helpers/mime.d.ts"
+      },
+      "./outside-file": {
+        "import": "./dist/helpers/outsideFile.js",
+        "types": "./dist/helpers/outsideFile.d.ts"
+      },
+      "./media-range": {
+        "import": "./dist/helpers/mediaRange.js",
+        "types": "./dist/helpers/mediaRange.d.ts"
       }
     },
     "main": "./dist/index.js",
@@ -136,16 +226,19 @@
   "dependencies": {
     "@hyperframes/core": "workspace:*",
     "@hyperframes/parsers": "workspace:*",
-    "hono": "^4.0.0",
+    "hono": "^4.13.16",
     "linkedom": "^0.18.12",
     "postcss": "^8.5.8",
-    "postcss-selector-parser": "^7.1.2"
+    "postcss-selector-parser": "^7.1.7"
   },
   "devDependencies": {
     "@types/node": "^25.0.10",
     "tsup": "^8.0.0",
     "tsx": "^4.21.0",
     "typescript": "^5.0.0",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.12"
+  },
+  "optionalDependencies": {
+    "sharp": "^0.35.5"
   }
 }

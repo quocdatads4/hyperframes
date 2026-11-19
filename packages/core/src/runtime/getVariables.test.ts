@@ -1,8 +1,13 @@
 /**
  * @vitest-environment jsdom
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { getVariables, readDeclaredDefaults } from "./getVariables";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import {
+  getDeclaredVariableSources,
+  getVariables,
+  readDeclaredDefaults,
+  resetUnknownEnumWarnings,
+} from "./getVariables";
 
 const VARIABLES_ATTR = "data-composition-variables";
 
@@ -59,6 +64,27 @@ describe("getVariables", () => {
     setDeclared(JSON.stringify([{ id: "title", type: "string", label: "Title", default: "x" }]));
     setOverrides({ extra: 42 });
     expect(getVariables()).toEqual({ title: "x", extra: 42 });
+  });
+
+  it("keeps a scene's declaration in its own scope, and a pasted component's on the page", () => {
+    const declare = (id: string, value: string) =>
+      JSON.stringify([{ id, type: "string", label: id, default: value }]);
+    setDeclared(declare("title", "Top"));
+    document.body.innerHTML = `
+      <div data-composition-id="main">
+        <div data-composition-id="card" data-composition-variables='${declare("title", "Default")}'></div>
+        <div data-composition-variables='${declare("accent", "red")}'></div>
+      </div>`;
+    const win = window as Window & {
+      __hfVariablesByComp?: Record<string, Record<string, unknown>>;
+    };
+    win.__hfVariablesByComp = { card: { title: "Card" } };
+    try {
+      expect(getVariables()).toEqual({ title: "Top", accent: "red" });
+    } finally {
+      delete win.__hfVariablesByComp;
+      document.body.innerHTML = "";
+    }
   });
 
   it("returns {} when the declared JSON is invalid", () => {
@@ -204,6 +230,140 @@ describe("readDeclaredDefaults", () => {
   });
 });
 
+describe("out-of-set enum values (observability only — never changes the returned map)", () => {
+  // One enum plus a number and a string, so "only enums are inspected" is
+  // pinned by the same declaration the warning reads.
+  const DECLARED = JSON.stringify([
+    {
+      id: "accent",
+      type: "enum",
+      label: "Accent",
+      default: "green",
+      options: [
+        { value: "green", label: "Green" },
+        { value: "blue", label: "Blue" },
+        { value: "violet", label: "Violet" },
+      ],
+    },
+    { id: "swap_at", type: "number", label: "Swap at", default: 0.5 },
+    { id: "title", type: "string", label: "Title", default: "Hello" },
+  ]);
+  const DEFAULTS = { accent: "green", swap_at: 0.5, title: "Hello" };
+
+  let warnings: string[];
+
+  beforeEach(() => {
+    resetUnknownEnumWarnings();
+    document.body.innerHTML = "";
+    setDeclared(DECLARED);
+    document.documentElement.setAttribute("data-composition-id", "morph-swap");
+    setOverrides(undefined);
+    warnings = [];
+    vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    document.documentElement.removeAttribute("data-composition-id");
+    setDeclared(null);
+    setOverrides(undefined);
+    resetUnknownEnumWarnings();
+  });
+
+  it("a declared option warns nothing", () => {
+    setOverrides({ accent: "violet" });
+    expect(getVariables()).toEqual({ ...DEFAULTS, accent: "violet" });
+    expect(warnings).toEqual([]);
+  });
+
+  it("an absent value warns nothing — absent is the normal case", () => {
+    expect(getVariables()).toEqual(DEFAULTS);
+    expect(warnings).toEqual([]);
+  });
+
+  it("an enum declared without a default and never set warns nothing", () => {
+    setDeclared(
+      JSON.stringify([
+        { id: "accent", type: "enum", label: "Accent", options: [{ value: "green" }] },
+      ]),
+    );
+    expect(getVariables()).toEqual({});
+    expect(warnings).toEqual([]);
+  });
+
+  it("an out-of-set value warns once, naming composition, variable, value and fallback", () => {
+    setOverrides({ accent: "orange" });
+    expect(getVariables()).toEqual({ ...DEFAULTS, accent: "orange" });
+    expect(warnings).toHaveLength(1);
+    const message = warnings[0] ?? "";
+    expect(message).toContain("runtime_unknown_enum_value");
+    expect(message).toContain("morph-swap");
+    expect(message).toContain('"accent"');
+    expect(message).toContain('got "orange"');
+    expect(message).toContain("green, blue, violet");
+    expect(message).toContain('Rendering "green" instead');
+  });
+
+  it("falls back to the root composition id when the declarer carries none", () => {
+    // The real top-level shape: <html> declares, the root <div> has the id.
+    document.documentElement.removeAttribute("data-composition-id");
+    document.body.innerHTML = '<div data-composition-id="hero-scene"></div>';
+    setOverrides({ accent: "orange" });
+    getVariables();
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("hero-scene");
+  });
+
+  it("the same bad value twice warns once; a different bad value warns again", () => {
+    setOverrides({ accent: "orange" });
+    getVariables();
+    getVariables();
+    expect(warnings).toHaveLength(1);
+
+    setOverrides({ accent: "puce" });
+    getVariables();
+    expect(warnings).toHaveLength(2);
+    expect(warnings[1]).toContain('got "puce"');
+  });
+
+  it("non-enum variables are never inspected (any number or string is legal)", () => {
+    setOverrides({ swap_at: 9.9, title: "anything at all" });
+    expect(getVariables()).toEqual({ ...DEFAULTS, swap_at: 9.9, title: "anything at all" });
+    expect(warnings).toEqual([]);
+  });
+
+  it("does not warn when the declared default is itself out of set — nothing fell back", () => {
+    setDeclared(
+      JSON.stringify([
+        {
+          id: "accent",
+          type: "enum",
+          label: "Accent",
+          default: "orange",
+          options: [{ value: "green" }, { value: "blue" }],
+        },
+      ]),
+    );
+    expect(getVariables()).toEqual({ accent: "orange" });
+    expect(warnings).toEqual([]);
+  });
+
+  it("returns byte-identical values whether the value is in set or not", () => {
+    setOverrides({ accent: "violet" });
+    const good = getVariables();
+    setOverrides({ accent: "orange" });
+    const bad = getVariables();
+    expect(warnings).toHaveLength(1);
+    // Same keys, same non-enum values, and the bad value passed through
+    // untouched — the composition's own guard still owns the coercion.
+    expect(Object.keys(bad)).toEqual(Object.keys(good));
+    expect(bad).toEqual({ ...good, accent: "orange" });
+    expect(bad.accent).toBe("orange");
+  });
+});
+
 describe("css variable injection (figma brand-token chain)", () => {
   afterEach(() => {
     document.documentElement.removeAttribute(VARIABLES_ATTR);
@@ -294,5 +454,37 @@ describe("css variable injection (figma brand-token chain)", () => {
     const { getVariables } = await import("./getVariables");
     document.body.innerHTML = `<div ${VARIABLES_ATTR}='[{"id":"figma:brand","type":"color","label":"b","default":"#445566"}]'></div>`;
     expect(getVariables()["figma:brand"]).toBe("#445566");
+  });
+});
+
+describe("getDeclaredVariableSources", () => {
+  afterEach(() => {
+    setDeclared(null);
+    document.body.innerHTML = "";
+    (window as Window & { __hfVariablesByComp?: unknown }).__hfVariablesByComp = undefined;
+  });
+
+  it("lists <html> first, then every other declarer in document order", () => {
+    setDeclared("[1]");
+    document.body.innerHTML = `<div ${VARIABLES_ATTR}="[2]"></div><p ${VARIABLES_ATTR}="[3]"></p>`;
+    expect(getDeclaredVariableSources()).toEqual(["[1]", "[2]", "[3]"]);
+  });
+
+  it("is empty when nothing declares variables", () => {
+    expect(getDeclaredVariableSources()).toEqual([]);
+  });
+
+  it("leaves out a sub-composition's declaration, which has its own scope", () => {
+    setDeclared("[1]");
+    document.body.innerHTML = `<div data-composition-id="sub"><span ${VARIABLES_ATTR}="[9]"></span></div>`;
+    (window as Window & { __hfVariablesByComp?: unknown }).__hfVariablesByComp = { sub: {} };
+    expect(getDeclaredVariableSources()).toEqual(["[1]"]);
+  });
+
+  it("is the scope getVariables merges, so a later declarer's default wins", () => {
+    setDeclared(JSON.stringify([{ id: "a", type: "string", label: "A", default: "html" }]));
+    document.body.innerHTML = `<div ${VARIABLES_ATTR}='${JSON.stringify([{ id: "a", type: "string", label: "A", default: "div" }])}'></div>`;
+    expect(getVariables()).toEqual({ a: "div" });
+    expect(getDeclaredVariableSources()).toHaveLength(2);
   });
 });

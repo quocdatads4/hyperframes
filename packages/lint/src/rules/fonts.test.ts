@@ -6,55 +6,48 @@ async function findByCode(html: string, code: string, isSubComposition = true) {
   return result.findings.filter((f) => f.code === code);
 }
 
+/** system_font_will_alias only applies to distributed / Lambda renders. */
+async function findAliasFindings(html: string) {
+  const result = await lintHyperframeHtml(html, { isSubComposition: true, distributed: true });
+  return result.findings.filter((f) => f.code === "system_font_will_alias");
+}
+
 describe("font rules", () => {
-  describe("google_fonts_import", () => {
-    it("warns on @import url with fonts.googleapis.com without failing lint", async () => {
-      const html = `<div data-composition-id="test" data-width="1920" data-height="1080">
-        <style>@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500&display=swap');</style>
-      </div>`;
-      const result = await lintHyperframeHtml(html, { isSubComposition: true });
-      const findings = result.findings.filter((f) => f.code === "google_fonts_import");
-      expect(findings).toHaveLength(1);
-      expect(findings[0]!.severity).toBe("warning");
-      expect(result.errorCount).toBe(0);
-    });
-
-    it("warns on <link> to fonts.googleapis.com", async () => {
-      const html = `<div data-composition-id="test" data-width="1920" data-height="1080">
-        <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter">
-      </div>`;
-      const findings = await findByCode(html, "google_fonts_import");
-      expect(findings).toHaveLength(1);
-      expect(findings[0]!.severity).toBe("warning");
-    });
-
-    it("does not flag local @font-face usage", async () => {
-      const html = `<div data-composition-id="test" data-width="1920" data-height="1080">
-        <style>@font-face { font-family: 'Inter'; src: url('../capture/assets/fonts/Inter.woff2'); }</style>
-      </div>`;
-      const findings = await findByCode(html, "google_fonts_import");
-      expect(findings).toHaveLength(0);
-    });
-
-    it("does not flag installed registry blocks that bundle Google Fonts", async () => {
-      const html =
-        `<!-- hyperframes-registry-item: my-block -->\n` +
-        `<div data-composition-id="test" data-width="1920" data-height="1080">
-        <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter">
-      </div>`;
-      const findings = await findByCode(html, "google_fonts_import");
-      expect(findings).toHaveLength(0);
-    });
-  });
-
   describe("system_font_will_alias", () => {
+    it("reports an aliased family reached through a referenced custom property", async () => {
+      const findings = await findAliasFindings(`<div data-composition-id="test"><style>
+        :root { --heading: "Verdana"; } h1 { font-family: var(--heading); }
+      </style></div>`);
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.message).toContain("'verdana' → Inter");
+    });
+
+    it.each([
+      ':root { --font-family: "Verdana"; }',
+      'p::before { content: "font-family: Verdana;"; }',
+    ])("ignores aliased names outside font declarations: %s", async (css) => {
+      const findings = await findAliasFindings(`<div data-composition-id="test"><style>
+        ${css} p { font-family: Inter; }
+      </style></div>`);
+      expect(findings).toHaveLength(0);
+    });
+
+    it("does not treat quoted @font-face text as an alias declaration", async () => {
+      const findings = await findAliasFindings(`<div data-composition-id="test"><style>
+        p::before { content: "@font-face { font-family: Verdana; }"; }
+        p { font-family: Verdana; }
+      </style></div>`);
+      expect(findings).toHaveLength(1);
+      expect(findings[0]!.message).toContain("'verdana' → Inter");
+    });
+
     it("flags SF Mono as aliased to JetBrains Mono", async () => {
       const html = `<div data-composition-id="test" data-width="1920" data-height="1080">
         <style>code { font-family: 'SF Mono', monospace; }</style>
       </div>`;
-      const findings = await findByCode(html, "system_font_will_alias");
+      const findings = await findAliasFindings(html);
       expect(findings).toHaveLength(1);
-      expect(findings[0]!.severity).toBe("info");
+      expect(findings[0]!.severity).toBe("warning");
       expect(findings[0]!.message).toContain("JetBrains Mono");
     });
 
@@ -62,7 +55,7 @@ describe("font rules", () => {
       const html = `<div data-composition-id="test" data-width="1920" data-height="1080">
         <style>body { font-family: 'Helvetica Neue', sans-serif; }</style>
       </div>`;
-      const findings = await findByCode(html, "system_font_will_alias");
+      const findings = await findAliasFindings(html);
       expect(findings).toHaveLength(1);
       expect(findings[0]!.message).toContain("Inter");
     });
@@ -71,7 +64,7 @@ describe("font rules", () => {
       const html = `<div data-composition-id="test" data-width="1920" data-height="1080">
         <style>body { font-family: 'Inter', sans-serif; }</style>
       </div>`;
-      const findings = await findByCode(html, "system_font_will_alias");
+      const findings = await findAliasFindings(html);
       expect(findings).toHaveLength(0);
     });
 
@@ -79,7 +72,7 @@ describe("font rules", () => {
       const html = `<div data-composition-id="test" data-width="1920" data-height="1080">
         <style>body { font-family: 'Roboto', sans-serif; }</style>
       </div>`;
-      const findings = await findByCode(html, "system_font_will_alias");
+      const findings = await findAliasFindings(html);
       expect(findings).toHaveLength(0);
     });
 
@@ -87,7 +80,7 @@ describe("font rules", () => {
       const html = `<div data-composition-id="test" data-width="1920" data-height="1080">
         <style>body { font-family: 'Comic Sans MS', sans-serif; }</style>
       </div>`;
-      const findings = await findByCode(html, "system_font_will_alias");
+      const findings = await findAliasFindings(html);
       expect(findings).toHaveLength(0);
     });
 
@@ -98,7 +91,7 @@ describe("font rules", () => {
           code { font-family: 'Menlo', monospace; }
         </style>
       </div>`;
-      const findings = await findByCode(html, "system_font_will_alias");
+      const findings = await findAliasFindings(html);
       expect(findings).toHaveLength(0);
     });
 
@@ -106,7 +99,7 @@ describe("font rules", () => {
       const html = `<div data-composition-id="test" data-width="1920" data-height="1080">
         <style>body { font-family: 'VERDANA', sans-serif; }</style>
       </div>`;
-      const findings = await findByCode(html, "system_font_will_alias");
+      const findings = await findAliasFindings(html);
       expect(findings).toHaveLength(1);
       expect(findings[0]!.message).toContain("Inter");
     });
@@ -118,14 +111,143 @@ describe("font rules", () => {
           code { font-family: 'Consolas', monospace; }
         </style>
       </div>`;
-      const findings = await findByCode(html, "system_font_will_alias");
+      const findings = await findAliasFindings(html);
       expect(findings).toHaveLength(1);
       expect(findings[0]!.message).toContain("Inter");
       expect(findings[0]!.message).toContain("JetBrains Mono");
     });
+    it("stays silent on a local render, where the renderer really does supply the alias", async () => {
+      const html = `<div data-composition-id="test" data-width="1920" data-height="1080">
+        <style>code { font-family: 'SF Mono', monospace; }</style>
+      </div>`;
+      const findings = await findByCode(html, "system_font_will_alias");
+      expect(findings).toHaveLength(0);
+    });
   });
 
   describe("font_family_without_font_face", () => {
+    it.each([
+      ':root { --font-family: "Brand Heading"; } h1 { font-family: var(--font-family); }',
+      ':root { --family: "Brand Heading"; --heading: var(--family); } h1 { font-family: var(--heading); }',
+      ':root { --heading: "Brand Heading"; } h1 { font-family: serif, var(--heading), sans-serif; }',
+      ':root { --heading: "Brand Heading", sans-serif; } h1 { font-family: var(--heading); }',
+      ':root { --Heading: "Brand Heading"; --heading: Inter; } h1 { font-family: var(--Heading); }',
+      ':root { --heading: "Brand Heading"; } h1 { font-family: var(--heading, "Unused Fallback"); }',
+    ])("reports the missing family in a referenced custom property: %s", async (css) => {
+      const findings = await findByCode(
+        `<div data-composition-id="test"><style>${css}</style></div>`,
+        "font_family_without_font_face",
+      );
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.message).toContain("brand heading");
+      expect(findings[0]?.message).not.toContain("unused fallback");
+    });
+
+    it("resolves referenced font tokens across style blocks and locates their use", async () => {
+      const findings = await findByCode(
+        `<div data-composition-id="test"><style>:root { --font-family: "Brand Heading"; }</style>
+<style>
+h1 { font-family: var(--font-family); }
+</style></div>`,
+        "font_family_without_font_face",
+      );
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({ line: 3, column: 6 });
+    });
+
+    it.each([
+      '@font-face { font-family: "Brand Heading"; src: local("Arial"); } :root { --heading: "Brand Heading"; } h1 { font-family: var(--heading); }',
+      ":root { --heading: var(--other); --other: var(--heading); } h1 { font-family: var(--heading); }",
+      ':root { --heading: "Brand Heading"; } h1 { font-family: var(--unresolved); }',
+      ':root { --heading: "Brand Heading"; } h1 { font-family: "var(--heading)"; }',
+    ])("keeps declared or unresolved token references quiet: %s", async (css) => {
+      const findings = await findByCode(
+        `<div data-composition-id="test"><style>${css}</style></div>`,
+        "font_family_without_font_face",
+      );
+      expect(findings).toHaveLength(0);
+    });
+
+    it.each([
+      ':root { --font-family: "Brand Heading"; }',
+      ':root { --brand-font-family: "Brand Heading"; }',
+      'p::before { content: "font-family: Brand Heading;"; }',
+    ])("ignores family names outside font declarations: %s", async (css) => {
+      const findings = await findByCode(
+        `<div data-composition-id="test"><style>${css} p { font-family: Inter; }</style></div>`,
+        "font_family_without_font_face",
+      );
+      expect(findings).toHaveLength(0);
+    });
+
+    it.each([
+      'p::before { content: "@font-face { font-family: Brand Heading; }"; }',
+      '@font-face { --font-family: "Brand Heading"; src: local("Arial"); }',
+    ])("requires a real font-face descriptor: %s", async (css) => {
+      const findings = await findByCode(
+        `<div data-composition-id="test"><style>${css} p { font-family: "Brand Heading"; }</style></div>`,
+        "font_family_without_font_face",
+      );
+      expect(findings).toHaveLength(1);
+      expect(findings[0]!.message).toContain("brand heading");
+    });
+
+    it("reports only the real missing family and locates its declaration", async () => {
+      const findings = await findByCode(
+        `<div data-composition-id="test"><style>
+:root { --font-family: "Unused Brand"; }
+p::before { content: "font-family: Another Brand;"; }
+p { FONT-FAMILY: "Real Brand", sans-serif !important; }
+</style></div>`,
+        "font_family_without_font_face",
+      );
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({ line: 4, column: 5 });
+      expect(findings[0]!.message).toContain("real brand");
+      expect(findings[0]!.message).not.toContain("unused brand");
+      expect(findings[0]!.message).not.toContain("another brand");
+    });
+
+    it("still finds a real font face inside a conditional rule", async () => {
+      const findings = await findByCode(
+        `<div data-composition-id="test"><style>
+        @media screen { @font-face { font-family: "Brand Heading"; src: local("Arial"); } }
+        p { font-family: "Brand Heading"; }
+      </style></div>`,
+        "font_family_without_font_face",
+      );
+      expect(findings).toHaveLength(0);
+    });
+
+    it("reads the family list of a font shorthand, as the renderer does", async () => {
+      const findings = await findByCode(
+        `<div data-composition-id="test"><style>
+.a { font: 500 16px/1 "PingFang SC", Inter, sans-serif; }
+</style></div>`,
+        "font_family_without_font_face",
+      );
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({ line: 2, column: 6 });
+      expect(findings[0]!.message).toContain("pingfang sc");
+      expect(findings[0]!.message).not.toContain("inter");
+    });
+
+    it.each([
+      "16px / 1.5 Inter",
+      "var(--weight) 16px Inter",
+      "var(--size) 'Brand Sans'",
+      "'Brand Sans' 16px",
+    ])("does not invent a family from a valid or unreadable shorthand: font: %s", async (font) => {
+      const findings = await findByCode(
+        `<div data-composition-id="test"><style>
+:root { --weight: 700; --size: 16px; }
+p { font: ${font}; }
+</style></div>`,
+        "font_family_without_font_face",
+      );
+      expect(findings).toHaveLength(0);
+    });
+
     it("flags font-family used without @font-face", async () => {
       const html = `<div data-composition-id="test" data-width="1920" data-height="1080">
         <style>body { font-family: 'GT Walsheim', sans-serif; }</style>
@@ -146,6 +268,20 @@ describe("font rules", () => {
       expect(findings).toHaveLength(0);
     });
 
+    it.each(["ProjectFont", "Project Font"])(
+      "recognizes an unquoted final font-family descriptor without a semicolon: %s",
+      async (family) => {
+        const html = `<div data-composition-id="test" data-width="1920" data-height="1080">
+          <style>
+            @font-face { src: local('DejaVu Sans'); font-family: ${family} }
+            body { font-family: ${family}, sans-serif }
+          </style>
+        </div>`;
+        const findings = await findByCode(html, "font_family_without_font_face");
+        expect(findings).toHaveLength(0);
+      },
+    );
+
     it("does not flag a system font declared via @font-face src: local()", async () => {
       // Regression: two independent reports of this rule hard-erroring on OS
       // system fonts (Hiragino Sans, Microsoft YaHei) that have no downloadable
@@ -162,12 +298,12 @@ describe("font rules", () => {
       expect(findings).toHaveLength(0);
     });
 
-    it("fixHint mentions the local() pattern for system fonts", async () => {
+    it("fixHint says an installed OS font does not reach a cloud render", async () => {
       const html = `<div data-composition-id="test" data-width="1920" data-height="1080">
         <style>body { font-family: 'GT Walsheim', sans-serif; }</style>
       </div>`;
       const findings = await findByCode(html, "font_family_without_font_face");
-      expect(findings[0]!.fixHint).toContain("local(");
+      expect(findings[0]!.fixHint).toContain("cloud render has no copy");
     });
 
     it("does not flag generic font families", async () => {
@@ -226,7 +362,6 @@ describe("font rules", () => {
         <style>body { font-family: 'Geist', sans-serif; }</style>
       </div>`;
       const result = await lintHyperframeHtml(html, { isSubComposition: true });
-      expect(result.findings.filter((f) => f.code === "google_fonts_import")).toHaveLength(1);
       expect(
         result.findings.filter((f) => f.code === "font_family_without_font_face"),
       ).toHaveLength(0);
@@ -239,7 +374,6 @@ describe("font rules", () => {
         <style>body { font-family: 'Geist', sans-serif; }</style>
       </div>`;
       const result = await lintHyperframeHtml(html, { isSubComposition: true });
-      expect(result.findings.filter((f) => f.code === "google_fonts_import")).toHaveLength(1);
       expect(
         result.findings.filter((f) => f.code === "font_family_without_font_face"),
       ).toHaveLength(0);
@@ -255,7 +389,6 @@ describe("font rules", () => {
         </style>
       </div>`;
       const result = await lintHyperframeHtml(html, { isSubComposition: true });
-      expect(result.findings.filter((f) => f.code === "google_fonts_import")).toHaveLength(1);
       expect(
         result.findings.filter((f) => f.code === "font_family_without_font_face"),
       ).toHaveLength(0);
@@ -384,6 +517,32 @@ describe("font rules", () => {
       expect(findings).toHaveLength(1);
       expect(findings[0]!.message).toContain("aeonik");
       expect(findings[0]!.message).not.toContain("apple-system");
+    });
+  });
+
+  describe("font_face_local_only", () => {
+    it("warns when an @font-face only names a font installed on this machine", async () => {
+      const findings = await findByCode(
+        `<div data-composition-id="test"><style>
+@font-face { font-family: "PingFang SC"; src: local("PingFang SC"), local("PingFangSC-Regular"); }
+p { font-family: "PingFang SC"; }
+</style></div>`,
+        "font_face_local_only",
+      );
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({ severity: "warning", line: 2 });
+      expect(findings[0]!.message).toContain("pingfang sc");
+    });
+
+    it("stays quiet when the face also ships a font file", async () => {
+      const findings = await findByCode(
+        `<div data-composition-id="test"><style>
+@font-face { font-family: "Brand"; src: local("Brand"), url("fonts/brand.woff2") format("woff2"); }
+p { font-family: "Brand"; }
+</style></div>`,
+        "font_face_local_only",
+      );
+      expect(findings).toHaveLength(0);
     });
   });
 });

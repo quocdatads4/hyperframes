@@ -22,10 +22,9 @@ const COMPOSITION_HTML = '<html><body><div data-composition-id="main"></div></bo
 //   - .cache/examples/        a vendored dot-dir. walkDir does NOT special-case
 //                             it, so it stays listed in the file tree, but it is
 //                             gated out of composition discovery (isInHiddenOrVendorDir).
-//   - .hyperframes/examples/  vendored under Studio's dir — also listed in the
-//                             file tree, also gated out of discovery.
-//   - .hyperframes/backup/    Studio's internal snapshots — the only thing hidden
-//                             from the file tree (walkDir's shouldIgnoreDir).
+//   - .hyperframes/examples/  under the app's folder — gated out of discovery,
+//                             and hidden from the tree like every non-Studio record.
+//   - .hyperframes/backup/    Studio's internal snapshots — hidden from the tree.
 function createProjectDir(): string {
   const projectDir = mkdtempSync(join(tmpdir(), "hf-projects-test-"));
   tempDirs.push(projectDir);
@@ -72,6 +71,29 @@ describe("GET /projects/:id/signature", () => {
     expect(await response.json()).toEqual({ signature: "cached-sig" });
   });
 
+  // fails without the fix: the polled signature walked every file synchronously, holding a host's event loop (a
+  // desktop app's main process) for the whole walk.
+  it("lets the event loop run while it walks a project", async () => {
+    const projectDir = createProjectDir();
+    for (let i = 0; i < 300; i++)
+      writeFileSync(join(projectDir, `clip-${i}.html`), COMPOSITION_HTML);
+    const app = new Hono();
+    registerProjectRoutes(app, createAdapter(projectDir));
+    let turns = 0;
+    let answered = false;
+    const turn = () => {
+      if (answered) return;
+      turns++;
+      setImmediate(turn);
+    };
+    setImmediate(turn);
+
+    const response = await app.request("http://localhost/projects/demo/signature");
+    answered = true;
+    expect(response.status).toBe(200);
+    expect(turns).toBeGreaterThan(0);
+  });
+
   it("computes a signature that moves when project files change", async () => {
     const projectDir = createProjectDir();
     const app = new Hono();
@@ -89,6 +111,37 @@ describe("GET /projects/:id/signature", () => {
       await app.request("http://localhost/projects/demo/signature")
     ).json()) as { signature: string };
     expect(second.signature).not.toBe(first.signature);
+  });
+
+  it("ignores generated cache writes while detecting source edits", async () => {
+    const projectDir = createProjectDir();
+    const app = new Hono();
+    registerProjectRoutes(app, createAdapter(projectDir));
+    const getSignature = async () =>
+      (
+        (await (await app.request("http://localhost/projects/demo/signature")).json()) as {
+          signature: string;
+        }
+      ).signature;
+
+    const initial = await getSignature();
+    const generatedFiles = [
+      [".transcode-cache", "proxy.mp4"],
+      [".thumbnails", "frame.jpg"],
+      [".waveform-cache", "peaks.json"],
+    ] as const;
+    const generatedSignatures: string[] = [];
+    for (const [dir, file] of generatedFiles) {
+      mkdirSync(join(projectDir, dir));
+      writeFileSync(join(projectDir, dir, file), `generated ${dir}`);
+      generatedSignatures.push(await getSignature());
+    }
+
+    expect(generatedSignatures).toEqual([initial, initial, initial]);
+
+    mkdirSync(join(projectDir, "src"));
+    writeFileSync(join(projectDir, "src", "scene.ts"), "export const scene = true;");
+    expect(await getSignature()).not.toBe(initial);
   });
 
   it("404s for an unknown project", async () => {
@@ -118,18 +171,61 @@ describe("registerProjectRoutes — composition discovery (#1384)", () => {
     expect(payload.compositions).not.toContain(".hyperframes/examples/preset.html");
   });
 
-  it("lists vendored dot-directory files in the file tree but hides Studio backups", async () => {
+  it("lists no hidden file but Studio's own and the media folder's, nothing under .hyperframes/ that isn't Studio's", async () => {
     const projectDir = createProjectDir();
+    writeFileSync(join(projectDir, ".hyperframes", "app-history.jsonl"), "{}");
+    writeFileSync(join(projectDir, ".hyperframes", "studio-motion.json"), "{}");
+    writeFileSync(join(projectDir, ".dev.vars"), "TOKEN=x");
+    mkdirSync(join(projectDir, ".pulumi"));
+    writeFileSync(join(projectDir, ".pulumi", "credentials.json"), "{}");
+    mkdirSync(join(projectDir, ".media", "audio"), { recursive: true });
+    writeFileSync(join(projectDir, ".media", "audio", "bgm.wav"), "RIFF");
     const app = new Hono();
     registerProjectRoutes(app, createAdapter(projectDir));
 
     const response = await app.request("http://localhost/projects/demo");
     const payload = (await response.json()) as { files?: string[] };
 
-    // Vendored dot-dirs stay browsable — discovery is gated, the file tree is not.
-    expect(payload.files).toContain(".cache/examples/preset.html");
-    expect(payload.files).toContain(".hyperframes/examples/preset.html");
-    // Only Studio's own backup snapshots are hidden from the tree (#1366).
-    expect(payload.files).not.toContain(".hyperframes/backup/snapshot.html");
+    expect(payload.files).toContain(".hyperframes/studio-motion.json");
+    expect(payload.files).toContain(".media/audio/bgm.wav");
+    for (const hidden of [".cache/examples/preset.html", ".dev.vars", ".pulumi/credentials.json"])
+      expect(payload.files).not.toContain(hidden);
+    for (const hidden of ["examples/preset.html", "backup/snapshot.html", "app-history.jsonl"])
+      expect(payload.files).not.toContain(`.hyperframes/${hidden}`);
+  });
+
+  it("lists nothing under a nested project's .hyperframes/", async () => {
+    const projectDir = createProjectDir();
+    const nested = join(projectDir, "compositions", "x");
+    mkdirSync(join(nested, ".hyperframes", "backup"), { recursive: true });
+    writeFileSync(join(nested, "index.html"), COMPOSITION_HTML);
+    writeFileSync(join(nested, ".hyperframes", "app-history.jsonl"), "{}");
+    writeFileSync(join(nested, ".hyperframes", "studio-motion.json"), "{}");
+    writeFileSync(join(nested, ".hyperframes", "backup", "snapshot.html"), COMPOSITION_HTML);
+    const app = new Hono();
+    registerProjectRoutes(app, createAdapter(projectDir));
+
+    const response = await app.request("http://localhost/projects/demo");
+    const payload = (await response.json()) as { files: string[]; compositions: string[] };
+
+    expect(payload.files).toContain("compositions/x/index.html");
+    expect(payload.compositions).toContain("compositions/x/index.html");
+    expect(payload.files.filter((file) => file.includes("/.hyperframes"))).toEqual([]);
+  });
+
+  it("omits generated cache files from the project file tree", async () => {
+    const projectDir = createProjectDir();
+    mkdirSync(join(projectDir, ".transcode-cache"));
+    writeFileSync(join(projectDir, ".transcode-cache", "proxy.mp4"), "proxy");
+    mkdirSync(join(projectDir, ".waveform-cache"));
+    writeFileSync(join(projectDir, ".waveform-cache", "peaks.json"), "[]");
+    const app = new Hono();
+    registerProjectRoutes(app, createAdapter(projectDir));
+
+    const response = await app.request("http://localhost/projects/demo");
+    const payload = (await response.json()) as { files?: string[] };
+
+    expect(payload.files).not.toContain(".transcode-cache/proxy.mp4");
+    expect(payload.files).not.toContain(".waveform-cache/peaks.json");
   });
 });

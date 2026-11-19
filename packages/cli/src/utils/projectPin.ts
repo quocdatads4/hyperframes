@@ -1,15 +1,40 @@
 import { isSafeVersion } from "./safeVersion.js";
 
-// Matches `hyperframes@<semver>` as a whole token inside a script string. The
-// version class mirrors isSafeVersion's semver shape; capturing group 1 is the
-// old version. `(?=\s|$)` keeps it from matching a longer package name.
+// Package-name characters before the name belong to another package, including
+// scoped names: a word boundary also matches after their slash, hyphen or dot.
+// The version shape follows isSafeVersion; group 1 captures the current pin.
 export const HYPERFRAMES_PIN_RE =
-  /\bhyperframes@([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)(?=\s|$)/g;
+  /(?<![0-9A-Za-z._/@-])hyperframes@([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)(?=\s|$)/g;
 
 export interface PinRewriteResult {
   changed: boolean;
   scripts: Record<string, string>;
   fromVersions: string[];
+}
+
+export interface TextPinRewriteResult {
+  changed: boolean;
+  text: string;
+  fromVersions: string[];
+}
+
+export function rewritePinnedHyperframesText(
+  text: string,
+  targetVersion: string,
+): TextPinRewriteResult {
+  if (!isSafeVersion(targetVersion)) {
+    return { changed: false, text, fromVersions: [] };
+  }
+  const fromVersions = new Set<string>();
+  const next = text.replace(HYPERFRAMES_PIN_RE, (_full, version: string) => {
+    if (version !== targetVersion) fromVersions.add(version);
+    return `hyperframes@${targetVersion}`;
+  });
+  return {
+    changed: fromVersions.size > 0,
+    text: next,
+    fromVersions: [...fromVersions].sort(),
+  };
 }
 
 export function readPinnedHyperframesVersions(scripts: Record<string, string>): string[] {
@@ -31,10 +56,9 @@ export function rewriteProjectPinnedScripts(
   const fromVersions = new Set<string>();
   const next: Record<string, string> = {};
   for (const [name, cmd] of Object.entries(scripts ?? {})) {
-    next[name] = cmd.replace(HYPERFRAMES_PIN_RE, (_full, version: string) => {
-      if (version !== targetVersion) fromVersions.add(version);
-      return `hyperframes@${targetVersion}`;
-    });
+    const rewrite = rewritePinnedHyperframesText(cmd, targetVersion);
+    next[name] = rewrite.text;
+    for (const version of rewrite.fromVersions) fromVersions.add(version);
   }
   return {
     changed: [...fromVersions].length > 0,

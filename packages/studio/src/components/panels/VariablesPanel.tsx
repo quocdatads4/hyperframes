@@ -1,11 +1,10 @@
-import { memo, useCallback, useEffect, useMemo, useState, type MutableRefObject } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import type {
   Composition,
   CompositionVariable,
   VariableUsageReport,
   VariableValidationIssue,
 } from "@hyperframes/sdk";
-import type { EditHistoryKind } from "../../utils/editHistory";
 import type { PublishSdkSession } from "../../utils/sdkCutover";
 import { useStudioPlaybackContext, useStudioShellContext } from "../../contexts/StudioContext";
 import { useDomEditContext } from "../../contexts/DomEditContext";
@@ -25,20 +24,15 @@ import { PreviewValueControl } from "./VariablesValueControls";
 import { copyTextToClipboard } from "../../utils/clipboard";
 import { resolveMasterCompositionPath } from "../../utils/studioUrlState";
 import { isScalarVariableValue as isScalar } from "@hyperframes/core/variables";
-
-/** POSIX single-quote escaping so the copied command survives quotes in values. */
-function shellSingleQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
+import { RENDER_VARIABLES_FILE } from "@hyperframes/core/project-folders";
+import { renderHandoffCommand, saveRenderVariables } from "./renderHandoff";
 
 export interface StudioEditPersistenceProps {
   sdkSession: Composition | null;
   publishSdkSession: PublishSdkSession;
   reloadPreview: () => void;
-  domEditSaveTimestampRef: MutableRefObject<number>;
   recordEdit: (entry: {
     label: string;
-    kind: EditHistoryKind;
     files: Record<string, { before: string; after: string }>;
   }) => Promise<void>;
 }
@@ -59,9 +53,9 @@ function formatIssue(issue: VariableValidationIssue): string {
 function ValidationStrip({ issues }: { issues: VariableValidationIssue[] }) {
   if (issues.length === 0) return null;
   return (
-    <div className="space-y-1 rounded-lg border border-red-900/60 bg-red-950/30 p-2">
+    <div className="space-y-1 rounded-lg border border-danger/40 bg-danger/15 p-2">
       {issues.map((issue) => (
-        <p key={`${issue.kind}:${issue.variableId}`} className="text-[10px] text-red-300">
+        <p key={`${issue.kind}:${issue.variableId}`} className="text-[10px] text-danger-ink">
           {formatIssue(issue)}
         </p>
       ))}
@@ -97,12 +91,12 @@ function VariableRow({
     <div className="space-y-1.5 rounded-lg border border-neutral-800/70 p-2">
       <div className="flex items-center gap-1.5">
         <span className="truncate text-[10px] font-medium text-neutral-300">{decl.label}</span>
-        <span className="rounded bg-neutral-800 px-1 py-px font-mono text-[8px] text-neutral-500">
+        <span className="rounded-sm bg-neutral-800 px-1 py-px font-mono text-[8px] text-neutral-500">
           {decl.type}
         </span>
         {unused && (
           <span
-            className="rounded bg-amber-900/40 px-1 py-px text-[8px] text-amber-400"
+            className="rounded-sm bg-amber-500/15 px-1 py-px text-[8px] text-warning-ink"
             title="No script reads this variable"
           >
             unused
@@ -178,9 +172,7 @@ function PreviewModeHeader({
         <span className="text-[11px] font-semibold text-neutral-200">Variables</span>
         <span
           className={`rounded-full px-2 py-0.5 text-[9px] font-medium ${
-            hasOverrides
-              ? "bg-studio-accent/20 text-studio-accent"
-              : "bg-neutral-800 text-neutral-500"
+            hasOverrides ? "bg-studio-accent/20 text-accent-ink" : "bg-neutral-800 text-neutral-500"
           }`}
         >
           {hasOverrides ? `Previewing ${overrideCount} custom` : "Previewing defaults"}
@@ -190,7 +182,7 @@ function PreviewModeHeader({
         <button
           type="button"
           onClick={onReset}
-          className="h-6 rounded px-2 text-[10px] text-neutral-400 hover:text-neutral-200"
+          className="h-6 rounded-sm px-2 text-[10px] text-neutral-400 hover:text-neutral-200"
         >
           Reset
         </button>
@@ -200,34 +192,45 @@ function PreviewModeHeader({
 }
 
 /**
- * Developer/agent handoff: copy the effective values as JSON or as a
- * ready-to-run render command mirroring exactly what the preview shows.
+ * Developer/agent handoff: copy the effective values as JSON, or a render
+ * command that reads them from the file Studio writes when it is copied.
  */
 function HandoffFooter({
   effectiveValues,
   compPath,
   onCopy,
+  onCopyCommand,
 }: {
   effectiveValues: Record<string, unknown>;
   compPath: string;
   onCopy: (text: string, what: string) => void;
+  onCopyCommand: (command: string) => void;
 }) {
   const json = JSON.stringify(effectiveValues);
-  const command = `npx hyperframes render ${shellSingleQuote(compPath)} --variables ${shellSingleQuote(json)}`;
+  const command = renderHandoffCommand(compPath);
   return (
     <div className="space-y-1.5 rounded-lg border border-neutral-800/70 bg-neutral-900/40 p-2">
       <p className="text-[9px] font-medium uppercase tracking-wider text-neutral-500">
         Use this template
       </p>
-      <code className="block truncate font-mono text-[9px] text-neutral-500" title={command}>
-        {command}
-      </code>
+      {command ? (
+        <code className="block truncate font-mono text-[9px] text-neutral-500" title={command}>
+          {command}
+        </code>
+      ) : (
+        <p className="text-[9px] leading-relaxed text-neutral-500">
+          Rename this composition to letters, digits, <code className="font-mono">_ . / -</code> to
+          copy a render command. A shell would read other characters in its name as syntax.
+        </p>
+      )}
       <div className="flex items-center gap-2">
-        <RowAction
-          label="Copy render command"
-          title="CLI command rendering exactly what the preview shows"
-          onClick={() => onCopy(command, "Render command")}
-        />
+        {command && (
+          <RowAction
+            label="Copy render command"
+            title={`Saves what the preview shows to ${RENDER_VARIABLES_FILE}. Run the command from the project folder.`}
+            onClick={() => onCopyCommand(command)}
+          />
+        )}
         <RowAction
           label="Copy values JSON"
           title="Effective values (defaults merged with preview overrides)"
@@ -240,33 +243,29 @@ function HandoffFooter({
 
 const EMPTY_STATE = (
   <p className="text-[10px] leading-relaxed text-neutral-500">
-    No variables declared. Variables make parts of this composition dynamic — declare them here (or
+    No variables declared. Variables make parts of this composition dynamic. Declare them here (or
     in <code className="font-mono">data-composition-variables</code>), read them with{" "}
     <code className="font-mono">getVariables()</code>, and pass values at render time with{" "}
     <code className="font-mono">--variables</code>.
   </p>
 );
 
-// Panel orchestrator — JSX conditionals per section, same shape as StudioRightPanel.
+// Panel orchestrator — JSX conditionals per section, same shape as StudioRightPanels.
 // fallow-ignore-next-line complexity
 export const VariablesPanel = memo(function VariablesPanel({
   sdkSession,
   publishSdkSession,
   reloadPreview,
-  domEditSaveTimestampRef,
   recordEdit,
 }: VariablesPanelProps) {
-  const { activeCompPath, showToast } = useStudioShellContext();
+  const { projectId, activeCompPath, showToast } = useStudioShellContext();
   const { refreshKey } = useStudioPlaybackContext();
-  const { readProjectFile, writeProjectFile, fileTree } = useFileManagerContext();
+  const { readProjectFile, writeProjectFile, compositions } = useFileManagerContext();
   const { domEditSelection } = useDomEditContext();
-  // On the master view (no activeCompPath) the panel targets the project's real
-  // main composition — the first .html in the tree — not a hardcoded index.html
-  // that may not exist. This same path is used for the persist write target (so
-  // an edit never lands in a phantom index.html) AND the handoff render command.
-  // Null only when the project has no composition yet, in which case sdkSession
-  // is also null and the panel is inert.
-  const effectiveCompPath = activeCompPath ?? resolveMasterCompositionPath(fileTree);
+  // Master view (no activeCompPath) targets the real main composition, not a
+  // hardcoded index.html — used for both the persist write target and the
+  // handoff render command. Null only when the project has no composition.
+  const effectiveCompPath = activeCompPath ?? resolveMasterCompositionPath(compositions);
   const previewValues = usePreviewVariablesStore((s) => s.values);
   const setPreviewValues = usePreviewVariablesStore((s) => s.setValues);
 
@@ -289,7 +288,6 @@ export const VariablesPanel = memo(function VariablesPanel({
     writeProjectFile,
     recordEdit,
     reloadPreview,
-    domEditSaveTimestampRef,
     publishSdkSession,
   });
 
@@ -325,6 +323,21 @@ export const VariablesPanel = memo(function VariablesPanel({
       );
     },
     [showToast],
+  );
+
+  const copyRenderCommand = useCallback(
+    (command: string) => {
+      // Both start inside the click: a clipboard write after an await loses the user activation Safari requires.
+      const copied = copyTextToClipboard(command);
+      const saved = saveRenderVariables(projectId, effectiveValues);
+      void Promise.all([saved, copied]).then(([wasSaved, wasCopied]) => {
+        if (!wasCopied) showToast("Couldn't copy render command", "error");
+        else if (!wasSaved)
+          showToast(`Couldn't save the values to ${RENDER_VARIABLES_FILE}`, "error");
+        else showToast("Render command copied", "info");
+      });
+    },
+    [projectId, effectiveValues, showToast],
   );
 
   const dropPreviewOverride = useCallback(
@@ -447,7 +460,7 @@ export const VariablesPanel = memo(function VariablesPanel({
       const wanted = action.declaration(id).type;
       if (existing && existing.type !== wanted) {
         showToast(
-          `"${id}" is already a ${existing.type} variable — pick another id for this ${wanted} binding`,
+          `"${id}" is already a ${existing.type} variable. Pick another id for this ${wanted} binding`,
           "error",
         );
         return;
@@ -518,7 +531,7 @@ export const VariablesPanel = memo(function VariablesPanel({
         />
         {usage?.scanIncomplete && (
           <p className="text-[9px] text-neutral-600">
-            Scripts access variables dynamically — usage info may be incomplete.
+            Scripts access variables dynamically, so usage info may be incomplete.
           </p>
         )}
         {declarations.length > 0 && (
@@ -526,6 +539,7 @@ export const VariablesPanel = memo(function VariablesPanel({
             effectiveValues={effectiveValues}
             compPath={effectiveCompPath ?? "index.html"}
             onCopy={copyToClipboard}
+            onCopyCommand={copyRenderCommand}
           />
         )}
         {addOpen ? (
@@ -545,14 +559,13 @@ export const VariablesPanel = memo(function VariablesPanel({
           </button>
         )}
         <VariablesOtherCompositions
-          fileTree={fileTree}
-          excludePath={activeCompPath ?? "index.html"}
+          compositionPaths={compositions}
+          excludePath={effectiveCompPath}
           refreshKey={`${refreshKey}:${revision}`}
           readProjectFile={readProjectFile}
           writeProjectFile={writeProjectFile}
           recordEdit={recordEdit}
           reloadPreview={reloadPreview}
-          domEditSaveTimestampRef={domEditSaveTimestampRef}
         />
       </div>
     </div>

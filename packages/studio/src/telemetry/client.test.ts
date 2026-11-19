@@ -30,6 +30,7 @@ describe("studio client shouldTrack", () => {
     setDev(false);
     setNoTelemetry(undefined);
     localStorage.clear();
+    delete window.__HF_CLI_TELEMETRY_DISABLED;
     vi.unstubAllGlobals();
   });
 
@@ -56,10 +57,19 @@ describe("studio client shouldTrack", () => {
     expect(shouldTrack()).toBe(false);
   });
 
-  it("returns false when VITE_HYPERFRAMES_NO_TELEMETRY='true'", async () => {
-    setNoTelemetry("true");
+  it.each(["true", "TRUE", " yes ", "on"])(
+    "returns false when VITE_HYPERFRAMES_NO_TELEMETRY=%j",
+    async (value) => {
+      setNoTelemetry(value);
+      const shouldTrack = await loadShouldTrack();
+      expect(shouldTrack()).toBe(false);
+    },
+  );
+
+  it("does not opt out for an explicit false value", async () => {
+    setNoTelemetry("false");
     const shouldTrack = await loadShouldTrack();
-    expect(shouldTrack()).toBe(false);
+    expect(shouldTrack()).toBe(true);
   });
 
   it("returns false in vite dev mode", async () => {
@@ -68,10 +78,40 @@ describe("studio client shouldTrack", () => {
     expect(shouldTrack()).toBe(false);
   });
 
-  it("memoizes its decision after the first call", async () => {
+  // Previously asserted the opposite. That memoization WAS the bug: policy.ts
+  // is explicit that transports re-ask, and policy.test.ts asserts a
+  // mid-session opt-out takes effect at once — but this transport cached on
+  // first call, so a user who opted out in DevTools after one event kept
+  // sending `studio_*` and render events while `studio:*` correctly stopped.
+  it("re-reads the policy, so a mid-session opt-out takes effect immediately", async () => {
     const shouldTrack = await loadShouldTrack();
-    const first = shouldTrack();
+    expect(shouldTrack()).toBe(true);
     localStorage.setItem(OPT_OUT_KEY, "1");
-    expect(shouldTrack()).toBe(first);
+    expect(shouldTrack()).toBe(false);
   });
+});
+
+it("suppresses actual render events in a CLI-opted-out Studio while the enabled control sends", async () => {
+  vi.useFakeTimers();
+  vi.resetModules();
+  setDev(false);
+  setNoTelemetry(undefined);
+  localStorage.clear();
+  const send = vi.fn().mockResolvedValue(new Response());
+  vi.stubGlobal("fetch", send);
+  try {
+    const { trackEvent } = await import("./client");
+    window.__HF_CLI_TELEMETRY_DISABLED = true;
+    trackEvent("render_complete", { duration: 1 });
+    await vi.advanceTimersByTimeAsync(1100);
+    expect(send).not.toHaveBeenCalled();
+    window.__HF_CLI_TELEMETRY_DISABLED = false;
+    trackEvent("render_complete", { duration: 1 });
+    await vi.advanceTimersByTimeAsync(1100);
+    expect(send).toHaveBeenCalledOnce();
+  } finally {
+    delete window.__HF_CLI_TELEMETRY_DISABLED;
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  }
 });

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { access, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ResolvedProject } from "@hyperframes/studio-server";
 
@@ -195,6 +195,15 @@ async function fileExists(path: string): Promise<boolean> {
   }
 }
 
+async function isRealDirectory(path: string): Promise<boolean> {
+  try {
+    const stats = await lstat(path);
+    return stats.isDirectory() && !stats.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 export class DatframesStudioProjectProvider {
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly now: () => number;
@@ -290,6 +299,23 @@ export class DatframesStudioProjectProvider {
       });
     this.inFlight.set(projectId, operation);
     return operation;
+  }
+
+  invalidateProject(projectId?: string): void {
+    this.projectList = undefined;
+    if (!projectId || projectId === "*") {
+      this.resolvedProjects.clear();
+      this.inFlight.clear();
+      this.titles.clear();
+      return;
+    }
+    this.resolvedProjects.delete(projectId);
+    this.inFlight.delete(projectId);
+    this.titles.delete(projectId);
+  }
+
+  projectDirectoryFor(projectId: string): string {
+    return this.projectDirectory(projectId);
   }
 
   private projectDirectory(projectId: string): string {
@@ -409,8 +435,25 @@ export class DatframesStudioProjectProvider {
         throw new Error(`DATframes archive is missing entry file: ${archive.entryFile}`);
       }
       await mkdir(dirname(projectDir), { recursive: true });
-      await rm(projectDir, { recursive: true, force: true });
-      await rename(stagingRoot, projectDir);
+      const existingRendersDir = join(projectDir, "renders");
+      const stagedRendersDir = join(stagingRoot, "renders");
+      const canPreserveRenders =
+        (await isRealDirectory(existingRendersDir)) && !(await fileExists(stagedRendersDir));
+      let movedRenders = false;
+      if (canPreserveRenders) {
+        await rename(existingRendersDir, stagedRendersDir);
+        movedRenders = true;
+      }
+      try {
+        await rm(projectDir, { recursive: true, force: true });
+        await rename(stagingRoot, projectDir);
+      } catch (swapError) {
+        if (movedRenders) {
+          await mkdir(projectDir, { recursive: true }).catch(() => undefined);
+          await rename(stagedRendersDir, existingRendersDir).catch(() => undefined);
+        }
+        throw swapError;
+      }
     } catch (error) {
       await rm(stagingRoot, { recursive: true, force: true });
       throw error;

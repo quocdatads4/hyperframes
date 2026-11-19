@@ -2,9 +2,14 @@
 
 import React, { act } from "react";
 import { createRoot } from "react-dom/client";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { previewClipManifest } from "../player/lib/previewChannel";
 import { useSlideshowTabState } from "./useSlideshowTabState";
-import type { RightPanelTab } from "../utils/studioHelpers";
+
+vi.mock("../player/lib/previewChannel", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../player/lib/previewChannel")>();
+  return { ...actual, previewClipManifest: vi.fn(async () => null) };
+});
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -17,21 +22,21 @@ afterEach(() => {
 
 function renderHook(params: {
   editingFileContent: string | null | undefined;
-  rightPanelTab: RightPanelTab;
+  iframe?: HTMLIFrameElement | null;
 }) {
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
-  const setRightPanelTabCalls: RightPanelTab[] = [];
   let current: ReturnType<typeof useSlideshowTabState> | null = null;
+  // One ref for every render, as Studio's useRef gives.
+  const previewIframeRef = { current: params.iframe ?? null };
 
   function Harness() {
     current = useSlideshowTabState({
       editingFileContent: params.editingFileContent,
-      previewIframeRef: { current: null },
+      previewIframeRef,
       refreshKey: 0,
-      rightPanelTab: params.rightPanelTab,
-      setRightPanelTab: (tab) => setRightPanelTabCalls.push(tab),
+      slideshowVisible: false,
     });
     return null;
   }
@@ -45,52 +50,69 @@ function renderHook(params: {
       if (!current) throw new Error("useSlideshowTabState did not render");
       return current;
     },
-    setRightPanelTabCalls,
     unmount: () => act(() => root.unmount()),
   };
 }
 
+// Whether "slideshow" stays the active dock tab across a file switch is
+// StudioRightPanels' own effect now (it opens/closes the dock panel), not
+// this hook's job — this only derives the two values that effect reads.
 describe("useSlideshowTabState", () => {
   it("detects a slideshow composition via the JSON island", () => {
-    const harness = renderHook({ editingFileContent: SLIDESHOW_HTML, rightPanelTab: "design" });
+    const harness = renderHook({ editingFileContent: SLIDESHOW_HTML });
     expect(harness.getState().isSlideshowComposition).toBe(true);
     harness.unmount();
   });
 
   it("reports false for a plain (non-slideshow) composition", () => {
-    const harness = renderHook({ editingFileContent: PLAIN_HTML, rightPanelTab: "design" });
+    const harness = renderHook({ editingFileContent: PLAIN_HTML });
     expect(harness.getState().isSlideshowComposition).toBe(false);
     harness.unmount();
   });
 
   it("reports false when there is no editing file yet", () => {
-    const harness = renderHook({ editingFileContent: undefined, rightPanelTab: "design" });
+    const harness = renderHook({ editingFileContent: undefined });
     expect(harness.getState().isSlideshowComposition).toBe(false);
     harness.unmount();
   });
 
   it("still detects a malformed island — presence-only, not full manifest validation", () => {
     const malformed = `<html><body><script type="application/hyperframes-slideshow+json">{not valid json</script></body></html>`;
-    const harness = renderHook({ editingFileContent: malformed, rightPanelTab: "design" });
+    const harness = renderHook({ editingFileContent: malformed });
     expect(harness.getState().isSlideshowComposition).toBe(true);
     harness.unmount();
   });
 
-  it("bounces rightPanelTab off 'slideshow' to 'renders' on a non-slideshow composition", () => {
-    const harness = renderHook({ editingFileContent: PLAIN_HTML, rightPanelTab: "slideshow" });
-    expect(harness.setRightPanelTabCalls).toEqual(["renders"]);
-    harness.unmount();
-  });
-
-  it("does not bounce when the composition is a slideshow", () => {
-    const harness = renderHook({ editingFileContent: SLIDESHOW_HTML, rightPanelTab: "slideshow" });
-    expect(harness.setRightPanelTabCalls).toEqual([]);
-    harness.unmount();
-  });
-
-  it("does not bounce a tab other than 'slideshow'", () => {
-    const harness = renderHook({ editingFileContent: PLAIN_HTML, rightPanelTab: "renders" });
-    expect(harness.setRightPanelTabCalls).toEqual([]);
+  it("lists the scenes of a sealed preview, read over its editing port", async () => {
+    // A cross-origin frame's window refuses every property read.
+    const sealedWindow = new Proxy(
+      {},
+      {
+        get() {
+          throw new DOMException(
+            "Blocked a frame from accessing a cross-origin frame.",
+            "SecurityError",
+          );
+        },
+      },
+    );
+    const iframe = document.createElement("iframe");
+    Object.defineProperty(iframe, "contentWindow", { value: sealedWindow });
+    vi.mocked(previewClipManifest).mockResolvedValueOnce({
+      clips: [],
+      durationInFrames: 300,
+      scenes: [
+        null,
+        { id: "s1", label: "Intro", start: 0, duration: 4 },
+        { id: 2, label: "Bad id", start: 4, duration: 4 },
+        { id: "s3", label: "No time", start: null, duration: 4 },
+      ],
+    } as unknown as Awaited<ReturnType<typeof previewClipManifest>>);
+    const harness = renderHook({ editingFileContent: SLIDESHOW_HTML, iframe });
+    await act(async () => {});
+    expect(harness.getState().slideshowScenes).toEqual([
+      { id: "s1", label: "Intro", start: 0, duration: 4 },
+    ]);
     harness.unmount();
   });
 });

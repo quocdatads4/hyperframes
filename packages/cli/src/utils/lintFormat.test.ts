@@ -1,7 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it, onTestFinished } from "vitest";
 import type { HyperframeLintFinding } from "@hyperframes/core/lint";
-import { formatLintFindings } from "./lintFormat.js";
-import type { ProjectLintResult } from "./lintProject.js";
+import { formatLintFindings, formatLintStartupMessage } from "./lintFormat.js";
+import { lintProject, type ProjectLintResult } from "./lintProject.js";
 
 function finding(
   severity: HyperframeLintFinding["severity"],
@@ -19,6 +22,7 @@ function project(
   return {
     results: files.map(({ file, findings }) => ({
       file,
+      contentHash: "test",
       result: {
         ok: findings.every((f) => f.severity !== "error"),
         errorCount: findings.filter((f) => f.severity === "error").length,
@@ -34,6 +38,30 @@ function project(
 }
 
 describe("formatLintFindings", () => {
+  it("shows control characters in project-derived text as visible escapes", () => {
+    const lines = formatLintFindings(
+      project([
+        {
+          file: "a\u001b]0;title\u0007.html",
+          findings: [
+            finding("error", {
+              elementId: "x\u001b[2K",
+              message: "bad \u009b2J\rclean",
+              fixHint: "fix \u001b]52;c;Y2xpcA==\u0007",
+              line: 3,
+            }),
+          ],
+        },
+      ]),
+    );
+    const out = lines.join("\n");
+    for (const control of ["\u0007", "\r", "\u001b", "\u009b"]) expect(out).not.toContain(control);
+    expect(out).toContain("[x\\x1b[2K]");
+    expect(out).toContain("bad \\x9b2J\\x0dclean");
+    expect(out).toContain("Fix: fix \\x1b]52;c;Y2xpcA==\\x07");
+    expect(out).toContain("[a\\x1b]0;title\\x07.html:3]");
+  });
+
   it("returns no lines when no file has findings", () => {
     expect(formatLintFindings(project([{ file: "index.html", findings: [] }]))).toEqual([]);
   });
@@ -202,5 +230,74 @@ describe("formatLintFindings", () => {
 
     const verbose = formatLintFindings(result, { showSummary: true, verbose: true });
     expect(verbose.at(-1)).toContain("1 error(s), 0 warning(s), 1 info(s)");
+  });
+});
+
+describe("formatLintStartupMessage", () => {
+  const result = project([
+    {
+      file: "index.html",
+      findings: [finding("error"), finding("error"), finding("warning")],
+    },
+  ]);
+
+  it("collapses to a one-line summary by default, pointing at the lint command (no Studio open)", () => {
+    const lines = formatLintStartupMessage(result, { kind: "summary" });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("2 error(s), 1 warning(s)");
+    expect(lines[0]).not.toContain("Studio");
+    expect(lines[0]).toContain("hyperframes lint");
+  });
+
+  it("does not name --lint-verbose, a flag lint and check do not take", () => {
+    for (const pointer of [undefined, "studio"] as const) {
+      const lines = formatLintStartupMessage(result, { kind: "summary", pointer });
+      expect(lines[0]).not.toContain("--lint-verbose");
+    }
+  });
+
+  it("names the Studio badge and the lint command when pointer is 'studio'", () => {
+    const lines = formatLintStartupMessage(result, { kind: "summary", pointer: "studio" });
+    expect(lines[0]).toContain("Lint badge in Studio");
+    expect(lines[0]).toContain("hyperframes lint");
+  });
+
+  it("does not print individual findings in the default summary", () => {
+    const lines = formatLintStartupMessage(result, { kind: "summary" });
+    expect(lines.join("\n")).not.toContain("error-code");
+  });
+
+  it("prints full per-finding output when verbose", () => {
+    const lines = formatLintStartupMessage(result, { kind: "verbose" });
+    expect(lines).toEqual(formatLintFindings(result));
+    expect(lines.length).toBeGreaterThan(1);
+  });
+});
+
+it("prints source coordinates for a single-file finding", () => {
+  const result = project([
+    { file: "index.html", findings: [finding("error", { line: 5, column: 3 })] },
+  ]);
+  expect(formatLintFindings(result)[0]).toContain("index.html:5:3");
+});
+
+describe("formatLintFindings on a real project", () => {
+  it("labels a draft section's missing image with the draft, not index.html", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hf-lint-format-draft-"));
+    onTestFinished(() => rmSync(dir, { recursive: true, force: true }));
+    mkdirSync(join(dir, "compositions"));
+    writeFileSync(
+      join(dir, "index.html"),
+      `<html><body><div data-composition-id="main" data-width="1920" data-height="1080"><div data-composition-src="compositions/draft.html" data-composition-id="draft" data-start="0" data-duration="5"></div></div></body></html>`,
+    );
+    writeFileSync(
+      join(dir, "compositions", "draft.html"),
+      `<html><body><div data-composition-id="draft" data-width="1920" data-height="1080"><img src="../assets/missing.png" /></div></body></html>`,
+    );
+
+    const lines = formatLintFindings(await lintProject(dir));
+
+    const line = lines.find((l) => l.includes("missing.png"));
+    expect(line).toContain("[compositions/draft.html]");
   });
 });

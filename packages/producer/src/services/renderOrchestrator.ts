@@ -1,3 +1,5 @@
+import type { ExpectedOutputDimensions } from "./render/outputDimensions.js";
+import { audioFailureDiagnostics, usableCpuCount } from "@hyperframes/engine";
 // fallow-ignore-file unused-type circular-dependency code-duplication complexity
 /**
  * Render Orchestrator Service
@@ -34,8 +36,6 @@
 import {
   existsSync,
   mkdirSync,
-  mkdtempSync,
-  readFileSync,
   readdirSync,
   rmSync,
   statSync,
@@ -44,28 +44,50 @@ import {
   appendFileSync,
 } from "fs";
 import { tmpdir } from "node:os";
-import { parseHTML } from "linkedom";
 import {
   type CanvasResolution,
   type Fps,
   type FpsInput,
+  type HfVfxCapture,
+  chainCapture,
   fpsToNumber,
+  HF_COLOR_GRADING_ATTR,
+  HF_VFX_ATTR,
+  parseVfxChain,
+  redactTelemetryString,
   toFps,
 } from "@hyperframes/core";
+import { HF_AUDIO_GROUP_TAG } from "@hyperframes/core/audio-groups";
+import type { CompileForRenderOptions } from "./htmlCompiler.js";
+import {
+  countCompositionSrcMounts,
+  countTagsWithAttr,
+  countedTagNames,
+  firstCompositionIdTag,
+  removeScriptAndStyleBlocks,
+} from "./htmlTagScans.js";
+import { matchHtmlBodyCssHeightFirst, matchHtmlBodyCssWidthFirst } from "@hyperframes/parsers";
 import {
   type EngineConfig,
+  extractMediaMetadata,
   resolveConfig,
   type ExtractionResult,
   type ExtractionPhaseBreakdown,
   type VideoFrameFormat,
   closeCaptureSession,
+  createCaptureSession,
+  initializeSession,
   type CaptureOptions,
   type CaptureVideoMetadataHint,
+  type SubTimelineWaitMemo,
+  type StaticDedupMemo,
   type CaptureSession,
   type BeforeCaptureHook,
   createVideoFrameInjector,
   getEncoderPreset,
+  type ProresProfile,
   distributeFrames,
+  distributeFramesInterleaved,
   executeParallelCapture,
   mergeWorkerFrames,
   type ParallelProgress,
@@ -77,16 +99,33 @@ import {
   type CaptureWarning,
   type SubTimelineWaitOutcome,
   type WorkerSizing,
+  type StaticVerificationOutcome,
   resolveBrowserGpuMode,
   resolveHeadlessShellPath,
+  compositionRequiresWebGpu,
   applyConcreteGpuScreenshotClamp,
+  explainDrawElementDisabled,
+  chromeMajorCeiling,
   scaleProtocolTimeoutForComposition,
   classifyCaptureFailure,
+  type CaptureFailureKind,
+  cloneCaptureWarning,
   isMemoryExhaustionError,
+  isTransientBrowserError,
   isDrawElementVerificationError,
+  isDrawElementCaptureError,
   getDrawElementVerificationDetails,
   augmentProtocolTimeoutError,
   augmentPageNavigationTimeoutError,
+  displaySize,
+  type ChromaSubsampling,
+  type MotionBlurOptions,
+  type PageMotionBlurSummary,
+} from "@hyperframes/engine";
+import {
+  referenceBackgroundResult,
+  createReferenceBackgroundRecorder,
+  type ReferenceBackgroundResult,
 } from "@hyperframes/engine";
 import { join, dirname, resolve } from "path";
 import { totalmem } from "node:os";
@@ -100,23 +139,86 @@ import {
   VIRTUAL_TIME_SHIM,
 } from "./fileServer.js";
 import { defaultLogger, type ProducerLogger } from "../logger.js";
-import { createMemorySampler, type MemorySampler, updateJobStatus } from "./render/shared.js";
-import { buildRenderErrorDetails } from "./render/cleanup.js";
-import { publishRenderFailure } from "./render/renderEventPublisher.js";
-import { RenderExecutionContext } from "./render/renderExecutionContext.js";
-import { ArtifactTransaction } from "./render/artifactTransaction.js";
 import {
+  outputNeedsAlpha,
+  outputSupportsPageSideShaderCompositing,
+  outputUsesH264Pipeline,
+  type RenderOutputFormat,
+} from "./render/renderFormat.js";
+import { resolveHlsSegmentSeconds, validateHlsRenderConfig } from "./render/hlsConfig.js";
+import {
+  resolveDeliveryEncoderOptions,
+  validateDeliveryEncoderConfig,
+} from "./render/deliveryEncoder.js";
+import {
+  assertChromaSubsamplingSdr,
+  validateChromaSubsamplingConfig,
+} from "./render/chromaSubsampling.js";
+import {
+  createMemorySampler,
+  describeWorkerPhases,
+  forgetWorkerPhases,
+  noteStaticDedupActivity,
+  staticDedupActivity,
+  type MemorySampler,
+  reportExtractProgress,
+  updateJobStatus,
+  audioWaitReporter,
+  AUDIO_STAGE,
+  audioWorkDir,
+} from "./render/shared.js";
+import { frameCacheOptions } from "./render/frameCacheBudget.js";
+import { buildRenderErrorDetails } from "./render/cleanup.js";
+import { describeMissingPath, type MissingPathFacts } from "./render/missingPath.js";
+import { publishRenderFailure } from "./render/renderEventPublisher.js";
+import { EncoderInterruptedError } from "./render/encoderInterruption.js";
+import { RenderExecutionContext } from "./render/renderExecutionContext.js";
+import {
+  ArtifactTransaction,
+  buildArtifactExpectation,
+  commitArtifactTransaction,
+} from "./render/artifactTransaction.js";
+import { createRenderWorkDir } from "./render/renderDirOwner.js";
+import {
+  capturePathForPlanKind,
   createCapturePlan,
   replanAfterFailure,
+  streamingCaptureFailure,
   type CapturePlan,
+  type SdrDiskCapturePlan,
   type CaptureRouting,
 } from "./render/capturePlan.js";
+import { runCaptureSegmentedStage } from "./render/stages/captureSegmentedStage.js";
+import {
+  RenderTooSlowError,
+  checkCalibratedRenderEta,
+  startRenderEtaGuard,
+} from "./render/renderEtaGuard.js";
+import { checkPageNeverReady } from "./render/pageNeverReady.js";
+import { resolveSegmentFrames } from "./render/segmentPlan.js";
+import { extractAllDeferredFrames } from "./render/deferredVideoFrames.js";
+import { measureLocalShownBoxes, oversizedVideos } from "./render/videoShownBoxes.js";
+import { createSegmentVideoFrames } from "./render/segmentVideoFrames.js";
+import { shouldWindowVideoFrames, trackSegmentFramePeak } from "./render/videoFrameWindow.js";
+import { resolveSegmentBrowserRecycle } from "./render/segmentRecycle.js";
+import {
+  computeSegmentPlanHash,
+  probeSegmentFrameCount,
+  readSegmentManifest,
+  segmentDirFor,
+  segmentManifestKey,
+  validateCompletedSegments,
+  writeSegmentManifest,
+  type SegmentManifest,
+} from "./render/segmentManifest.js";
 import { normalizeErrorMessage } from "../utils/errorMessage.js";
 import { formatCaptureFrameName } from "../utils/paths.js";
-import { resolveEffectiveHdrMode } from "./render/hdrMode.js";
+import { findRenderHdrAutoPromotionTrigger, resolveEffectiveHdrMode } from "./render/hdrMode.js";
 import {
   buildRenderPerfSummary,
   pushWorkerDedupPerfs,
+  pushWorkerPageErrors,
+  withCapturedBeyondViewport,
   roundDb,
   worstSubTimelineWaitOutcome,
 } from "./render/perfSummary.js";
@@ -128,15 +230,19 @@ import {
   buildHeapAdvisoryWarning,
   resolveRenderWorkerCount,
   runCaptureCalibration,
+  selectCaptureCalibrationFrames,
 } from "./render/captureCost.js";
 import {
   computeCompositionObservabilityHash,
   RenderObservabilityRecorder,
   observeRenderStage,
+  RenderStageStalledError,
   type RenderCaptureObservability,
   type RenderExtractionObservability,
   type RenderObservationData,
   type RenderObservabilitySummary,
+  type OpenStallAttempt,
+  type StageStallRule,
 } from "./render/observability.js";
 import { emitFallbackCaptureProfile } from "./render/fallbackCaptureProfile.js";
 import { type HdrPerfCollector, type HdrPerfSummary } from "./render/hdrPerf.js";
@@ -151,21 +257,35 @@ import { runCompileStage } from "./render/stages/compileStage.js";
 import { runProbeStage } from "./render/stages/probeStage.js";
 import { validateRenderDuration } from "./render/planValidation.js";
 import {
+  resolveVideoExtractionPolicy,
   runExtractVideosStage,
-  shouldCopyExtractedFrames,
 } from "./render/stages/extractVideosStage.js";
+import { rendersSdrOnly } from "./render/hdrMode.js";
+import {
+  planVideoLayerPassthrough,
+  type VideoLayerPlan,
+} from "./render/videoLayerPassthroughPlan.js";
 import { runAudioStage } from "./render/stages/audioStage.js";
-import { runCaptureStage } from "./render/stages/captureStage.js";
+import { inspectDiskCaptureHeadroom, runCaptureStage } from "./render/stages/captureStage.js";
 import {
   type CaptureStreamingStageResult,
+  resolveCaptureStallTimeoutMs,
   runCaptureStreamingStage,
 } from "./render/stages/captureStreamingStage.js";
 import { runCaptureHdrStage } from "./render/stages/captureHdrStage.js";
-import { runEncodeStage } from "./render/stages/encodeStage.js";
-import { runAssembleStage } from "./render/stages/assembleStage.js";
+import {
+  canEncodeWhileCapturing,
+  encodeWhileCapturing,
+  runEncodeStage,
+  type VideoEncodeInput,
+} from "./render/stages/encodeStage.js";
+import { recordLimiterAttenuation, runAssembleStage } from "./render/stages/assembleStage.js";
 import { shouldUseLayeredComposite } from "./hdrCompositor.js";
+import { resolveCaptureSurface } from "./render/captureImageFormat.js";
+import { assertMotionBlurSupported, pageMotionBlurForRoute } from "./render/motionBlurRoute.js";
+import { assertOutputScaleSupported } from "./render/outputScaleRoute.js";
 
-function sampleDirectoryBytes(dir: string): number {
+export function sampleDirectoryBytes(dir: string): number {
   let total = 0;
   const stack: string[] = [dir];
   while (stack.length > 0) {
@@ -229,6 +349,8 @@ function summarizeExtractionObservability(
     vfrPreflightCount: phaseBreakdown?.vfrPreflightCount,
     cacheHits: phaseBreakdown?.cacheHits,
     cacheMisses: phaseBreakdown?.cacheMisses,
+    cachePublishFailures: phaseBreakdown?.cachePublishFailures,
+    transientRetries: phaseBreakdown?.transientRetries,
     ...coverageGauges,
     authoredTimedClipCount,
   };
@@ -264,54 +386,77 @@ export interface RenderConfig {
    */
   fps: Fps;
   quality: "draft" | "standard" | "high";
+  /** Segmented capture: reuse segments recorded in a matching manifest (Phase 2b). */
+  resumeSegments?: boolean;
+  /** Segmented capture: keep the local segment cache after a successful render. */
+  keepSegments?: boolean;
   /**
-   * Output container format. Defaults to `"mp4"`; existing renders are
-   * unaffected unless this field is set explicitly.
+   * Output container format. Defaults to `"mp4"`; set explicitly for other formats.
    *
-   * - `"mp4"`: H.264 by default, or H.265 + HDR10 when HDR auto-detect
-   *   engages or `hdrMode: "force-hdr"` is set. Opaque. The
-   *   default streaming/social deliverable. Faststart is applied so the
-   *   `moov` atom sits at the file start and the file plays from a
-   *   partial download.
-   * - `"webm"`: VP9 + `yuva420p` pixel format → **true alpha channel**, no
-   *   chroma key. Plays in Chrome, Edge, and Firefox; Safari support for
-   *   alpha-WebM is incomplete. Use this when the output should drop
-   *   straight into a `<video>` over a colored background on the web.
-   *   Audio is muxed as Opus.
-   * - `"mov"`: ProRes 4444 + `yuva444p10le` → **true alpha channel +
-   *   10-bit color**. Sized for editor ingest (Premiere, Final Cut Pro,
-   *   DaVinci Resolve), not direct web playback. Audio is muxed as AAC.
-   * - `"gif"`: animated GIF encoded from captured frames with a two-pass
-   *   FFmpeg palette (`palettegen` + `paletteuse`). Use for PRs, READMEs,
-   *   and docs where inline autoplay matters more than file size. No audio
-   *   stream and no alpha channel.
-   * - `"png-sequence"`: a directory of zero-padded RGBA PNGs
-   *   (`frame_000001.png` …). Lossless alpha, largest on disk, no muxed
-   *   audio (an `audio.aac` sidecar is written alongside the PNGs when
-   *   the composition has audio elements). Use for After Effects / Nuke
-   *   / Fusion ingest, or when frames need post-processing before
-   *   encoding. `outputPath` is treated as a directory; it is created if
-   *   it doesn't exist.
+   * - `"mp4"`: opaque H.264, or H.265 + HDR10 with HDR auto-detection or
+   *   `hdrMode: "force-hdr"`. For streaming/social delivery; faststart puts the
+   *   `moov` atom first so playback can begin during a partial download.
+   * - `"webm"`: VP9 + `yuva420p` with true alpha (no chroma key) and Opus audio.
+   *   For `<video>` overlays in Chrome, Edge and Firefox; Safari's alpha-WebM
+   *   support is incomplete.
+   * - `"mov"`: ProRes 4444 + `yuva444p10le` with true alpha and AAC audio.
+   *   Chrome captures 8-bit RGBA; encoding it as 10-bit ProRes does not add
+   *   capture precision. For editor ingest (Premiere, Final Cut Pro, DaVinci
+   *   Resolve), rather than direct web playback.
+   * - `"gif"`: animated GIF from RGBA captures, using FFmpeg's two-pass
+   *   `palettegen` + `paletteuse`. For inline autoplay in PRs, READMEs and docs
+   *   when file size matters less. No audio; transparency is binary, not partial.
+   * - `"png-sequence"`: zero-padded RGBA PNGs (`frame_000001.png` ...), with
+   *   lossless alpha and the largest disk footprint. No muxed audio; an
+   *   `audio.m4a` sidecar is written when the composition contains audio.
+   *   For After Effects / Nuke / Fusion or post-processing before encoding.
+   *   `outputPath` is a directory, created if it does not exist.
+   * - `"hls"`: HLS VOD using the opaque H.264 + AAC encode from `"mp4"`,
+   *   stream-copied without re-encoding into MPEG-TS in the `outputPath` directory:
+   *   `master.m3u8`, `video.m3u8` + `video_%05d.ts`, and `audio.m3u8` +
+   *   `audio_%05d.ts` when the composition contains audio. Segment length is
+   *   {@link RenderConfig.hlsSegmentSeconds}; the encoder's GOP is locked to
+   *   that length in frames, so each segment starts on an IDR frame.
+   *   SDR and software encoders only; unavailable in distributed rendering,
+   *   including Lambda and Cloud Run.
    *
-   * Alpha output (`"webm"`, `"mov"`, `"png-sequence"`) automatically
-   * forces screenshot capture (Chrome's BeginFrame compositor does not
-   * preserve alpha on Linux headless-shell) and disables HDR — HDR +
-   * alpha is not a supported combination, a warning is logged and HDR
-   * falls back to SDR. The transparent-background CSS is injected by
-   * the engine's `initTransparentBackground` helper, so authors should
-   * not paint a fullscreen `body` / `#root` background in their
-   * compositions when targeting alpha output.
+   * Alpha formats (`"webm"`, `"mov"`, `"png-sequence"`, `"gif"`) force screenshot
+   * capture because BeginFrame does not preserve alpha on Linux headless-shell.
+   * HDR + alpha is unsupported: a warning is logged and output falls back to SDR.
+   * The engine's `initTransparentBackground` injects transparent-background CSS;
+   * avoid painting a fullscreen `body` / `#root` background for alpha output.
    */
-  format?: "mp4" | "webm" | "mov" | "png-sequence" | "gif";
+  format?: RenderOutputFormat;
   /** GIF Netscape loop count. 0 means infinite looping. Only used with `format: "gif"`. */
   gifLoop?: number;
+  /**
+   * HLS target segment length in whole seconds. Defaults to 4. Only used with
+   * `format: "hls"`; ignored for every other format.
+   *
+   * Must be a positive integer — it is both ffmpeg's `-hls_time` and the
+   * encoder's GOP size (`round(fps × hlsSegmentSeconds)` frames), and whole
+   * seconds keep the integer `#EXT-X-TARGETDURATION` in the playlist honest.
+   * A non-integer value throws at the start of `executeRenderJob`.
+   */
+  hlsSegmentSeconds?: number;
+  /**
+   * Opt into sub-frame multi-sample motion blur. Absent means off and the capture path is
+   * unchanged. Forces PNG frame capture, because the samples are averaged pixel by pixel
+   * and JPEG samples would be averaged after a lossy quantization.
+   */
+  motionBlur?: MotionBlurOptions;
+  pageMotionBlur?: "off";
   workers?: number;
+  /** Wall-time budget in ms for the whole render. Absent or 0 disables the ETA guard. */
+  maxRenderMs?: number;
   useGpu?: boolean;
   debug?: boolean;
   /** Strict rejects correctness warnings; best-effort returns a qualified outcome. */
   strictness?: RenderStrictness;
   /** Entry HTML file relative to projectDir. Defaults to "index.html". */
   entryFile?: string;
+  allowOutsideProjectAssets?: CompileForRenderOptions["allowOutsideProjectAssets"];
+  includeOutsideScripts?: CompileForRenderOptions["includeOutsideScripts"];
   /** Full producer config. When provided, env vars are not read. */
   producerConfig?: EngineConfig;
   /** Custom logger. Defaults to console-based defaultLogger. */
@@ -320,6 +465,16 @@ export interface RenderConfig {
   crf?: number;
   /** Target video bitrate (e.g. "10M"). Mutually exclusive with `crf`. */
   videoBitrate?: string;
+  /** Keyframe every N seconds (mp4). A maximum where chunks join, as on Lambda. */
+  keyframeIntervalSeconds?: number;
+  /** MOV only: ProRes profile. Default `4444` keeps alpha; the 422 profiles drop it. */
+  proresProfile?: ProresProfile;
+  /** Peak bitrate cap (e.g. "8M", mp4) alongside CRF. */
+  maxBitrate?: string;
+  /** Rate-cap buffer; defaults to twice `maxBitrate`. */
+  bufferSize?: string;
+  /** MP4 chroma, default `"420"`. `"444"` captures PNG and encodes yuv444p (SDR, software). */
+  chromaSubsampling?: ChromaSubsampling;
   /**
    * Source-video frame extraction format. Defaults to `"auto"`, which preserves
    * the historical behavior: alpha/alpha-capable sources extract as PNG, all
@@ -344,6 +499,8 @@ export interface RenderConfig {
    * `--variables-file <path>`. Must be a JSON-serializable plain object.
    */
   variables?: Record<string, unknown>;
+  strictVariables?: boolean;
+  expectedOutputDimensions?: ExpectedOutputDimensions;
   /**
    * Override the output resolution via Chrome `deviceScaleFactor` (DPR).
    * The composition's authored dimensions are unchanged. See
@@ -377,9 +534,8 @@ export interface RenderPerfSummary {
   /**
    * Provenance of the auto worker-sizing decision (undefined when the
    * htmlInCanvas / low-memory pins short-circuited sizing). `boundBy` names
-   * the binding constraint; the heap fields are the advisory budget being
-   * validated by fleet telemetry before enforcement — see
-   * `computeWorkerSizing` in @hyperframes/engine.
+   * the binding constraint; the heap fields are the budget that caps auto
+   * sizing — see `computeWorkerSizing` in @hyperframes/engine.
    */
   workerSizing?: WorkerSizing;
   chunkedEncode: boolean;
@@ -410,6 +566,11 @@ export interface RenderPerfSummary {
    * captured the most frames when parallel workers report separately.
    */
   captureP50Ms?: number;
+  /** Per-frame capture phases, frame-weighted across sessions; encoder wait is FFmpeg back-pressure. */
+  captureSeekAvgMs?: number;
+  captureBeforeCaptureAvgMs?: number;
+  captureScreenshotAvgMs?: number;
+  encoderWaitAvgMs?: number;
   /** Worst sub-composition timeline wait outcome across sessions. */
   subTimelineWait?: SubTimelineWaitOutcome;
   capturePeakMs?: number;
@@ -438,6 +599,14 @@ export interface RenderPerfSummary {
    * inside the orchestrator. Optional for the same back-compat reason.
    */
   peakHeapUsedMb?: number;
+  /** Chrome process memory aggregated across capture sessions (max of peaks, sum of samples). */
+  chromeMemory?: {
+    browserRssPeakMb?: number;
+    rendererRssPeakMb?: number;
+    rssLastMb?: number;
+    gpuProcessSeenLastSample?: boolean;
+    samples: number;
+  };
   hdrDiagnostics?: HdrDiagnostics;
   hdrPerf?: HdrPerfSummary;
   /**
@@ -452,8 +621,17 @@ export interface RenderPerfSummary {
     enabled: boolean;
     armed: boolean;
     predictedFrames: number;
+    verifiedFrames?: number;
     reusedFrames: number;
     skipReason?: string;
+    ineligibleCause?: string;
+    verificationOutcomes?: StaticVerificationOutcome[];
+    plannedRuns?: number;
+    completedRuns?: number;
+    screenshots?: number;
+    seeks?: number;
+    comparisons?: number;
+    verificationElapsedMs?: number;
   };
   /**
    * BeginFrame no-damage reuse outcome for this render (Linux/Docker),
@@ -474,6 +652,7 @@ export interface RenderPerfSummary {
     noDamageFrames: number;
     hasDamageFrames: number;
   };
+  motionBlur?: PageMotionBlurSummary;
   /**
    * drawElement fast-capture outcome for this render (default-on release
    * visibility). Undefined when no capture session ran.
@@ -481,7 +660,7 @@ export interface RenderPerfSummary {
   drawElement?: {
     /** Final capture mode: "drawelement" | "screenshot" | "beginframe" (|-joined if workers diverge). */
     mode: string;
-    /** Compile-time gate that disabled default DE: 3d | mix_blend_mode | shader_transitions. */
+    /** Compile-time gate that disabled default DE: 3d | ancestor_background_image | shader_transitions. */
     compileGate?: string;
     /** Producer clamp that disabled default DE: parallel | disk_path. */
     clampReason?: string;
@@ -489,12 +668,44 @@ export interface RenderPerfSummary {
     workerInversion?: string;
     /** Worker count the auto-resolution chose BEFORE the inversion pinned it to 1 — the parallel counterfactual for speedup math. Only set when the inversion fired. */
     preInversionWorkers?: number;
+    /** Rough compiled-composition element count — the variable the short-comp inversion band is gated on. Always set. */
+    compositionElementCount?: number;
+    /** Rough compiled-composition element-count provenance: "live" (probe DOM) | "static" (source scan, not trusted to open the band). */
+    compositionElementCountSource?: "live" | "static";
+    /** Per-tag breakdown of the same static scan behind compositionElementCount, capped at MAX_REPORTED_ELEMENT_TAGS + an "other" bucket. Only set when the source above is "static" — the live path never runs this scan. */
+    compositionElementTags?: Readonly<Record<string, number>>;
+    /** `<video data-aroll="true">` elements from the same static scan. Only set when compositionElementCountSource is "static". */
+    arollVideoCount?: number;
+    /** `<video data-media-source="heygen">` elements from the same static scan. Only set when compositionElementCountSource is "static". */
+    heygenVideoCount?: number;
+    /** Runtime adapters exercised (see `KNOWN_RUNTIME_ADAPTERS`), a live+static union, always set (possibly empty). */
+    adaptersUsed?: readonly string[];
+    /** Audio/image/sub-comp/color-grading counts, same static scan; only set when the source above is "static". */
+    audioCount?: number;
+    imageCount?: number;
+    subCompositionCount?: number;
+    audioGroupCount?: number;
+    colorGradingCount?: number;
+    hasLut?: boolean;
+    /** Authored root data-width/height vs. the scaffold's html/body CSS size; absent when either is undetectable. */
+    rootBodyMismatch?: boolean;
+    rootBodyDeltaPxBucket?: "0" | "1-10" | "11-50" | "51+";
+    /** `data-vfx-chain` host count from the same static scan. Only set when the source above is "static". */
+    vfxHostCount?: number;
+    /** Strongest enabled node's capture across every `data-vfx-chain` host (`chainCapture`, max: backdrop > self > none). Undefined when vfxHostCount is 0. */
+    vfxCapture?: HfVfxCapture;
+    /** Sorted unique def ids across every enabled node in every chain, comma-joined ("" when vfxHostCount is 0). */
+    vfxTypes?: string;
+    /** Short-comp band attribution: "applied" | "skipped_elements" | "unmeasured"; unset when the frame count made the band irrelevant. */
+    shortBand?: "applied" | "skipped_elements" | "unmeasured";
     /** DE parallel-router outcome: "routed" (fired, held), "reverted" (fired, self-verify retry rolled back), "none". Mutually exclusive with workerInversion. */
     parallelRouter?: string;
     /** Worker count the auto-resolution chose BEFORE the router pinned it to 3 — the single-worker-inversion counterfactual. Only set when the router fired. */
     preRouterWorkers?: number;
-    /** Engine init-time gate: swiftshader | css_effect:* | at_risk_timeline | 3d_init_failed | supersampling | render_mode_hint. */
+    /** Engine init-time gate: swiftshader | webgl_unavailable | beginframe_no_self_verify | css_effect:* | at_risk_timeline | 3d_init_failed | supersampling | render_mode_hint. */
     gateReason?: string;
+    /** Low-cardinality GPU bucket from DE session init (`<backend>/<vendor>`, e.g. `d3d11/nvidia`); |-joined across parallel sessions (bounded: one bucket per distinct backend on the host). */
+    gpuRenderer?: string;
     /** Worker-encode drain (the verified path) was active. */
     workerEncode: boolean;
     /** Self-verification ground-truth samples armed at init. */
@@ -512,9 +723,9 @@ export interface RenderPerfSummary {
      * `fallbackReason` being set is the "any fallback fired" signal.
      */
     selfVerifyFallback: boolean;
-    /** What tripped the fallback retry: psnr | blank | oom | capture_error. */
+    /** What tripped the fallback retry: psnr | blank | oom | de_renderer_stall | encoder_death | parallel_stall | capture_error. */
     fallbackReason?: string;
-    /** The failing PSNR (dB) when `fallbackReason === "psnr"`; undefined for blank/oom/capture_error (no score exists). */
+    /** The failing PSNR (dB) when `fallbackReason === "psnr"`; undefined for every other reason (no score exists). */
     fallbackFailedDb?: number;
     /** Frame index the verification failure was detected at; set for both "psnr" and "blank" fallback reasons. */
     fallbackFrameIndex?: number;
@@ -526,8 +737,37 @@ export interface RenderPerfSummary {
     blankRecaptures: number;
     /** Clip-cut boundary frames captured via per-frame screenshot. */
     boundaryFrames: number;
+    riskFrames: number;
     /** Per-frame "No cached paint record" screenshot fallbacks. */
     ncprFallbacks: number;
+    /**
+     * Frames that blew `HF_DE_FRAME_TIMEOUT_MS` — a wedged renderer
+     * (PRINFRA-488). Distinct from the other fallback counters: this one always
+     * costs a whole-render re-run via screenshot, so its rate is worth graphing
+     * on its own rather than inside `capture_error`.
+     */
+    frameTimeouts: number;
+  };
+  /**
+   * Render-host facts, captured from the orchestrator process. Lets fleet-wide
+   * telemetry correlate render performance with the machine it ran on — most
+   * importantly `cpuCount` vs the top-level `workers` (are we under-/over-
+   * subscribing cores?) and `totalMemMb` (does `lowMemoryMode` / single-worker
+   * collapse track real memory pressure?). `gpuDisabled` completes the GPU
+   * picture alongside `observability.browserGpuMode`.
+   *
+   * Reflects the ORCHESTRATOR host. For distributed renders the chunk workers
+   * may run on different machines; this is still the right signal for the
+   * common single-machine render. Optional for back-compat with serialized
+   * older summaries.
+   */
+  host?: {
+    platform: string;
+    arch: string;
+    cpuCount: number;
+    totalMemMb: number;
+    nodeVersion: string;
+    gpuDisabled: boolean;
   };
 }
 
@@ -554,12 +794,31 @@ export interface CaptureAttemptSummary {
   reason: "initial" | "retry" | "transient-retry";
 }
 
-export interface RenderJob {
+/** The stage a render is in, for machines; capture and encode count frames, assemble seconds. */
+export type RenderStageCode =
+  | "compile"
+  | "extract_video"
+  | "process_audio"
+  | "start_browsers"
+  | "capture"
+  | "encode"
+  | "assemble";
+
+export interface RenderStageProgress {
+  code: RenderStageCode;
+  done?: number;
+  total?: number;
+}
+
+export interface RenderJob extends Partial<ReferenceBackgroundResult> {
   id: string;
+  strictVariablesChecked?: boolean;
+  outputDimensionsChecked?: boolean;
   config: RenderConfig;
   status: RenderStatus;
   progress: number;
   currentStage: string;
+  stageProgress?: RenderStageProgress;
   createdAt: Date;
   startedAt?: Date;
   completedAt?: Date;
@@ -571,6 +830,7 @@ export interface RenderJob {
   totalFrames?: number;
   framesRendered?: number;
   perfSummary?: RenderPerfSummary;
+  audioLoweredDb?: number;
   failedStage?: string;
   errorDetails?: {
     message: string;
@@ -583,6 +843,7 @@ export interface RenderJob {
     observability?: RenderObservabilitySummary;
     /** Worst sub-composition timeline wait outcome across sessions captured before the failure. */
     subTimelineWait?: SubTimelineWaitOutcome;
+    missingPath?: MissingPathFacts;
   };
 }
 
@@ -591,12 +852,16 @@ export type ProgressCallback = (job: RenderJob, message: string) => void | Promi
 export class RenderQualityError extends Error {
   constructor(readonly warnings: readonly RenderWarning[]) {
     super(
-      `Render blocked by ${warnings.length} correctness warning${warnings.length === 1 ? "" : "s"}: ` +
-        warnings.map((warning) => warning.code).join(", "),
+      `Render blocked by ${warnings.length} correctness warning${warnings.length === 1 ? "" : "s"}:\n` +
+        warnings
+          .map((warning) => `- ${warning.code}: ${redactTelemetryString(warning.message)}`)
+          .join("\n"),
     );
     this.name = "RenderQualityError";
   }
 }
+
+const MIN_CPUS_TO_CAPTURE_DURING_MIX = 4;
 
 export function applyRenderWarningPolicy(
   job: RenderJob,
@@ -612,30 +877,65 @@ export function applyRenderWarningPolicy(
     if (existing.has(key)) continue;
     existing.add(key);
     job.warnings.push({
-      ...warning,
+      ...cloneCaptureWarning(warning),
       stage: "capture-readiness",
-      details: warning.details
-        ? {
-            ...warning.details,
-            sources: warning.details.sources ? [...warning.details.sources] : undefined,
-          }
-        : undefined,
     });
   }
   if (job.warnings.length === 0) return;
 
   const strictness = job.config.strictness ?? "best-effort";
+  const typedRetryability = job.warnings.flatMap((warning) =>
+    warning.details?.retryable === undefined ? [] : [warning.details.retryable],
+  );
   log.warn("Render completed capture with correctness warnings", {
     strictness,
     warningCodes: job.warnings.map((warning) => warning.code),
+    warningReasons: job.warnings.flatMap((warning) => warning.details?.failureReasons ?? []),
+    warningStages: job.warnings.flatMap((warning) => warning.details?.failureStages ?? []),
+    warningOwners: job.warnings.flatMap((warning) =>
+      warning.details?.failureOwner ? [warning.details.failureOwner] : [],
+    ),
+    warningRetryable:
+      typedRetryability.length === 0
+        ? undefined
+        : typedRetryability.every((retryable) => retryable),
   });
   const hasAudioProcessingFailure = job.warnings.some(
     (warning) => warning.code === "audio_processing_failed",
   );
-  if (strictness === "strict" || hasAudioProcessingFailure) {
+  // A script failure means the composition's GSAP timelines can never
+  // register — the render produces a degenerate 2-frame output that looks
+  // like a still image. Fail loudly rather than shipping garbage (#3352). A failed VFX chain drops its layer.
+  const hasScriptOrVfxFailure = job.warnings.some(
+    (warning) => warning.code === "sub_timeline_script_failure" || warning.code === "vfx_failure",
+  );
+  if (strictness === "strict" || hasAudioProcessingFailure || hasScriptOrVfxFailure) {
     throw new RenderQualityError(job.warnings);
   }
 }
+
+export const stopPrepSessionOnScriptFailure = (options: CaptureOptions): CaptureOptions => ({
+  ...options,
+  onSubTimelineScriptFailure: () => {
+    throw new Error("a composition script failed, so this preparation session stops");
+  },
+});
+
+export const surfaceScriptFailure = (error: unknown, job: RenderJob): unknown =>
+  error instanceof RenderQualityError ||
+  error instanceof RenderCancelledError ||
+  !job.warnings?.some((warning) => warning.code === "sub_timeline_script_failure")
+    ? error
+    : new RenderQualityError(job.warnings);
+
+export const withScriptFailureStop = (
+  options: CaptureOptions,
+  job: RenderJob,
+  log: ProducerLogger,
+): CaptureOptions => ({
+  ...options,
+  onSubTimelineScriptFailure: (warnings) => applyRenderWarningPolicy(job, warnings, log),
+});
 
 export class RenderCancelledError extends Error {
   reason: "user_cancelled" | "timeout" | "aborted";
@@ -696,10 +996,7 @@ export function collectVideoReadinessSkipIds(
 
 interface ExtractedVideoReadinessInput {
   videoId: string;
-  metadata: {
-    width: number;
-    height: number;
-  };
+  metadata: Parameters<typeof displaySize>[0];
 }
 
 function hasUsableVideoDimensions(metadata: ExtractedVideoReadinessInput["metadata"]) {
@@ -716,11 +1013,7 @@ export function collectVideoMetadataHints(
 ): CaptureVideoMetadataHint[] {
   return extractedVideos
     .filter((video) => hasUsableVideoDimensions(video.metadata))
-    .map((video) => ({
-      id: video.videoId,
-      width: video.metadata.width,
-      height: video.metadata.height,
-    }))
+    .map((video) => ({ id: video.videoId, ...displaySize(video.metadata) }))
     .sort((a, b) => a.id.localeCompare(b.id));
 }
 
@@ -761,9 +1054,40 @@ export function buildMissingFrameRetryBatches(
   workDir: string,
   attempt: number,
   rangeStart: number = 0,
+  stride: number = 1,
 ): WorkerTask[][] {
   const workersPerBatch = Math.max(1, Math.floor(maxWorkers));
   const batches: WorkerTask[][] = [];
+  const outputDirFor = (batchIndex: number, workerId: number) =>
+    join(workDir, `retry-${attempt}-batch-${batchIndex}-worker-${workerId}`);
+
+  // A dead interleaved worker leaves every `stride`th frame missing: one stride task per
+  // residue class re-captures them in a single batch, not a one-frame batch per frame.
+  if (stride > 1) {
+    const spans = new Map<number, { first: number; last: number }>();
+    for (const range of ranges) {
+      for (let frame = range.startFrame; frame < range.endFrame; frame++) {
+        const span = spans.get(frame % stride);
+        if (span) span.last = frame;
+        else spans.set(frame % stride, { first: frame, last: frame });
+      }
+    }
+    const strided = [...spans.values()];
+    for (let i = 0; i < strided.length; i += workersPerBatch) {
+      const batchIndex = batches.length;
+      batches.push(
+        strided.slice(i, i + workersPerBatch).map(({ first, last }, workerId) => ({
+          workerId,
+          startFrame: rangeStart + first,
+          endFrame: rangeStart + last + 1,
+          frameStride: stride,
+          outputDir: outputDirFor(batchIndex, workerId),
+          outputFrameOffset: rangeStart,
+        })),
+      );
+    }
+    return batches;
+  }
 
   // `ranges` are 0-indexed within the chunk's frame range (or full timeline
   // when `rangeStart === 0`); translate to absolute composition indices so
@@ -776,13 +1100,96 @@ export function buildMissingFrameRetryBatches(
       workerId,
       startFrame: rangeStart + range.startFrame,
       endFrame: rangeStart + range.endFrame,
-      outputDir: join(workDir, `retry-${attempt}-batch-${batchIndex}-worker-${workerId}`),
+      outputDir: outputDirFor(batchIndex, workerId),
       outputFrameOffset: rangeStart,
     }));
     batches.push(batch);
   }
 
   return batches;
+}
+
+/**
+ * The capture mode this render will REPORT, pre-capture.
+ *
+ * BeginFrame is Linux-only. Both real entry points enforce that —
+ * `frameCapture`'s preMode (`headlessShell && isLinux && !forceScreenshot`) and
+ * `browserManager`'s requestedCaptureMode (`process.platform === "linux"`) —
+ * but the observability field derived the mode from `forceScreenshot` alone,
+ * with no platform test. Every non-Linux render that did not force screenshot
+ * therefore reported `beginframe` for a capture that was really screenshot:
+ * 30,625 Windows renders over 14 days, a fifth of the fast-capture dashboard's
+ * capture-mode data.
+ *
+ * `config.ts` documents this same failure for "darwin + software" and adds a
+ * `forceScreenshot` clamp as defence-in-depth — but that clamp only fires on
+ * software GPU, so Windows-on-hardware slipped straight past it (41,102 of the
+ * mislabelled renders).
+ *
+ * NECESSARY, NOT SUFFICIENT — read this before trusting the value on Linux.
+ * The platform test is the only condition modelled here. Linux BeginFrame
+ * additionally requires a headless-shell binary, no supersampling, no
+ * transparent drawElement route (`frameCapture.ts` preMode) and the
+ * `--enable-begin-frame-control` flag (`browserManager.ts`). Any of those can
+ * make the ACTUAL mode screenshot while this still reports `beginframe`, so a
+ * Linux `beginframe` reading is an upper bound, not a fact. The authoritative
+ * value is the session's own `launchCaptureMode` — the same field the runtime
+ * video gate already falls back to. Deriving this field from the resolved
+ * session instead of from config is the real fix and is deliberately NOT in
+ * this change: it closes the Windows mislabel, which is platform-only and
+ * needs no session plumbing.
+ *
+ * Pure; exported for tests.
+ */
+export function resolveObservedCaptureMode(
+  forceScreenshot: boolean,
+  platform: NodeJS.Platform = process.platform,
+): "screenshot" | "beginframe" {
+  return forceScreenshot || platform !== "linux" ? "screenshot" : "beginframe";
+}
+
+/**
+ * Capture-mode label for the trace checkpoints when no probe session is open
+ * (the multi-worker path closes its probe before capture starts). Falls back
+ * to the platform rule rather than assuming BeginFrame, which labelled every
+ * non-Linux multi-worker render `"beginframe"` while its workers captured via
+ * screenshot. Pure; exported for tests.
+ */
+export function fallbackCaptureModeLabel(args: {
+  forceScreenshot: boolean;
+  useDrawElement: boolean;
+  platform?: NodeJS.Platform;
+}): CaptureSession["captureMode"] {
+  if (args.forceScreenshot) return "screenshot";
+  if (args.useDrawElement) return "drawelement";
+  return resolveObservedCaptureMode(false, args.platform);
+}
+
+/**
+ * Build the observability patcher, re-deriving `captureMode` on every patch.
+ *
+ * Extracted and exported because the previous inline closure was where the
+ * Windows mislabel actually lived. Seeding `captureMode` correctly at
+ * construction is NOT sufficient: this updater is invoked at 23 sites through
+ * the pipeline, and one of them —
+ * `updateCaptureObservability({ forceScreenshot: captureForceScreenshot })`
+ * straight after compile — runs unconditionally on every render. The old body
+ * re-derived from `forceScreenshot` alone, so the seeded value was overwritten
+ * with `beginframe` again before capture began, and both the success and error
+ * telemetry emits read the reverted object. A helper-only test cannot catch
+ * that: it never round-trips through this closure. Hence the export.
+ */
+export function createCaptureObservabilityUpdater(
+  observability: RenderCaptureObservability,
+  platform: NodeJS.Platform = process.platform,
+): (patch: Partial<RenderCaptureObservability>) => void {
+  return (patch: Partial<RenderCaptureObservability>): void => {
+    Object.assign(observability, patch);
+    observability.captureMode = resolveObservedCaptureMode(
+      Boolean(observability.forceScreenshot),
+      platform,
+    );
+  };
 }
 
 export function getNextRetryWorkerCount(currentWorkers: number): number {
@@ -795,7 +1202,7 @@ export function resolveRenderWorkDirPrefix(
   platform: NodeJS.Platform = process.platform,
   systemTempDir: string = tmpdir(),
 ): string {
-  if (platform === "win32") return join(systemTempDir, "hf-render-");
+  if (platform === "win32" || platform === "darwin") return join(systemTempDir, "hf-render-");
   return join(dirname(outputPath), `work-${jobId}-`);
 }
 
@@ -809,6 +1216,19 @@ export function resolveRenderWorkDirPrefix(
  * tab can't loop.
  */
 export const MAX_TRANSIENT_CAPTURE_RETRIES = 1;
+
+/** Single owner of the bounded transient-browser retry policy for both disk-capture paths. */
+export function isTransientCaptureRetryEligible(
+  failureKind: CaptureFailureKind,
+  missing: readonly FrameRange[],
+  retriesUsed: number,
+): boolean {
+  return (
+    missing.length > 0 &&
+    failureKind === "transient_browser" &&
+    retriesUsed < MAX_TRANSIENT_CAPTURE_RETRIES
+  );
+}
 
 /**
  * A retry only pays off if the attempt that just finished captured at least one
@@ -831,7 +1251,41 @@ export function resetCaptureAttemptProgress(job: { framesRendered?: number }): v
   job.framesRendered = 0;
 }
 
+const FIRST_FRAME_STALL_MS = 300_000;
+// Capture browsers start like the probe's did: allow twice its start-up before the first frame, up to the ceiling.
+const FIRST_FRAME_STARTUP_FACTOR = 2;
+const FIRST_FRAME_STALL_CEILING_MS = 900_000;
+const TAIL_STALL_MS = FIRST_FRAME_STALL_MS;
+
+/** Allowed wait for the first frame, given how long the probe's browser took to start; 0 or unknown keeps 300 s. */
+export function firstFrameWindowMs(probeStartupMs: number | undefined): number {
+  const fromStartup = (probeStartupMs ?? 0) * FIRST_FRAME_STARTUP_FACTOR;
+  if (!Number.isFinite(fromStartup)) return FIRST_FRAME_STALL_MS;
+  return Math.max(FIRST_FRAME_STALL_MS, Math.min(FIRST_FRAME_STALL_CEILING_MS, fromStartup));
+}
+
+/** The no-progress rule for capture stages that have no watchdog of their own: disk, HDR, chunk. Once
+ * `totalFrames` have landed the frame count can no longer change, so the stage is judged on the tail budget. */
+export function frameStallRule(
+  job: { framesRendered?: number },
+  totalFrames: number,
+  probeStartupMs: number | undefined,
+): StageStallRule {
+  const noProgressMs = resolveCaptureStallTimeoutMs();
+  return {
+    progress: () => job.framesRendered ?? 0,
+    noProgressMs,
+    firstProgressMs: Math.max(firstFrameWindowMs(probeStartupMs), noProgressMs),
+    complete: () => (job.framesRendered ?? 0) >= totalFrames,
+    tailMs: Math.max(TAIL_STALL_MS, noProgressMs),
+    detail: () => describeWorkerPhases(job),
+    attemptOpened: () => forgetWorkerPhases(job),
+    activity: () => staticDedupActivity(job),
+  };
+}
+
 export function isRecoverableParallelCaptureError(error: unknown): boolean {
+  if (error instanceof RenderStageStalledError) return true;
   const message = normalizeErrorMessage(error);
   if (!message.includes("[Parallel] Capture failed")) return false;
   const kind = classifyCaptureFailure(error).kind;
@@ -895,6 +1349,8 @@ export async function executeDiskCaptureWithAdaptiveRetry(options: {
   createBeforeCaptureHook: () => BeforeCaptureHook | null;
   abortSignal?: AbortSignal;
   onProgress?: (progress: ParallelProgress) => void;
+  /** Workers take frames round-robin so an in-order consumer (the overlapped encoder) is never starved. */
+  interleaveFrames?: boolean;
   cfg: EngineConfig;
   log: ProducerLogger;
   /**
@@ -905,12 +1361,17 @@ export async function executeDiskCaptureWithAdaptiveRetry(options: {
   frameRangeStart?: number;
   /** Mutated in place — replaced each attempt so only the final attempt's worker perf survives (see retry reset below). */
   dedupPerfs: CapturePerfSummary[];
+  /** Mutated in place: the workers' page-error console lines, for the render's error count. */
+  pageErrorLines?: string[];
+  openAttempt?: OpenStallAttempt;
+  verifyFirstSession?: (session: CaptureSession) => Promise<void>;
 }): Promise<CaptureAttemptSummary[]> {
   const attempts: CaptureAttemptSummary[] = [];
   let currentWorkers = options.initialWorkerCount;
   let missingRanges: FrameRange[] | null = null;
   let attempt = 0;
   let transientRetriesUsed = 0;
+  let initializationRetriesUsed = 0;
   // Set when the *previous* iteration retried after a transient browser death,
   // so the attempt it spawns is tagged `"transient-retry"` (vs the worker-halving
   // `"retry"`) for telemetry. Reset after each attempt is recorded.
@@ -935,16 +1396,26 @@ export async function executeDiskCaptureWithAdaptiveRetry(options: {
           attemptWorkDir,
           attempt,
           rangeStart,
+          options.interleaveFrames ? options.initialWorkerCount : 1,
         )
-      : [distributeFrames(options.totalFrames, currentWorkers, attemptWorkDir, rangeStart)];
+      : [
+          (options.interleaveFrames ? distributeFramesInterleaved : distributeFrames)(
+            options.totalFrames,
+            currentWorkers,
+            attemptWorkDir,
+            rangeStart,
+          ),
+        ];
 
     // Reset before each attempt so a retry REPLACES (not accumulates) worker perf —
     // otherwise a frame captured in attempt 0 AND re-captured on retry would be counted
     // twice, inflating reused/predicted past totalFrames. The common no-retry path keeps
     // exactly one attempt's perf; a retry reports only the final attempt's set.
     options.dedupPerfs.length = 0;
+    let attemptSignal = options.abortSignal;
     try {
       for (const tasks of batches) {
+        attemptSignal = options.openAttempt?.(options.abortSignal) ?? options.abortSignal;
         const capturedBeforeBatch = countCapturedFrames(
           options.totalFrames,
           options.framesDir,
@@ -957,7 +1428,7 @@ export async function executeDiskCaptureWithAdaptiveRetry(options: {
             tasks,
             options.captureOptions,
             options.createBeforeCaptureHook,
-            options.abortSignal,
+            attemptSignal,
             options.onProgress
               ? (progress) => {
                   options.onProgress?.({
@@ -972,8 +1443,10 @@ export async function executeDiskCaptureWithAdaptiveRetry(options: {
               : undefined,
             undefined,
             options.cfg,
+            { verifyFirstSession: options.verifyFirstSession },
           );
           pushWorkerDedupPerfs(workerResults, options.dedupPerfs);
+          if (options.pageErrorLines) pushWorkerPageErrors(workerResults, options.pageErrorLines);
         } finally {
           await mergeWorkerFrames(attemptWorkDir, tasks, options.framesDir);
         }
@@ -991,7 +1464,7 @@ export async function executeDiskCaptureWithAdaptiveRetry(options: {
       const madeProgress = captureAttemptMadeProgress(frameCount, remainingCount);
       if (!madeProgress) {
         options.log.warn(
-          "[Render] Capture attempt made no forward progress; composition is likely structurally broken — not retrying.",
+          "[Render] Capture attempt made no forward progress; composition is likely structurally broken, not retrying.",
           { attempt, frameCount, remainingCount, workers: currentWorkers },
         );
       }
@@ -1008,13 +1481,31 @@ export async function executeDiskCaptureWithAdaptiveRetry(options: {
       currentWorkers = nextWorkers;
       missingRanges = remaining;
       attempt++;
-    } catch (error) {
+    } catch (caught) {
+      // A stalled attempt fails like the per-call protocol timeout it stands in for.
+      const error =
+        attemptSignal?.aborted && !options.abortSignal?.aborted ? attemptSignal.reason : caught;
       const failure = classifyCaptureFailure(error, { signal: options.abortSignal });
       // A cancelled render tears the browser down, which surfaces as a
       // transient-looking `Target closed`. Rethrow immediately so cancellation
       // never burns a retry (or logs a misleading transient-failure warning) —
       // the caller's abort handling owns cancellation.
       if (failure.kind === "cancelled") {
+        throw error;
+      }
+      // A drawElement self-verify breach (a parallel disk worker's sampled
+      // frame diverged from its pre-injection ground truth) is a CORRECTNESS
+      // failure, not a missing-frame one: the damaged frames are written
+      // complete to disk, so the presence/size-only findMissingFrameRanges
+      // below would count them present and wrongly return success — shipping
+      // the exact compositor damage this verify exists to catch. Rethrow so
+      // the orchestrator's disk-stage screenshot retry fires (mirrors the
+      // `cancelled` guard; a worker-halving retry here would only re-run
+      // drawElement and re-damage). Structural detection walks the aggregated
+      // CaptureFailure → worker CaptureFailure → DrawElementVerificationError
+      // cause chain. Missing canvas/paint records also require this fresh-page
+      // recovery; their completed prefix must not make the attempt look valid.
+      if (isDrawElementVerificationError(error) || isDrawElementCaptureError(error)) {
         throw error;
       }
       const remaining = findMissingFrameRanges(
@@ -1028,23 +1519,42 @@ export async function executeDiskCaptureWithAdaptiveRetry(options: {
       const remainingCount = countFrameRanges(remaining);
       const madeProgress = captureAttemptMadeProgress(frameCount, remainingCount);
 
+      // A browser that times out starting up or loading its page before any frame exists had too many pages
+      // opening at once: retry with half the workers, down to one. Other zero-progress errors fail below.
+      // A lone worker gets one retry: here for Network.enable, as the transient retry below for a page load.
+      if (
+        options.allowRetry &&
+        !madeProgress &&
+        (currentWorkers > 1 ||
+          (initializationRetriesUsed === 0 && failure.kind === "protocol_timeout")) &&
+        /\bNetwork\.enable timed out|Navigation timeout of \d+ ms exceeded/i.test(failure.message)
+      ) {
+        initializationRetriesUsed++;
+        const nextWorkers = getNextRetryWorkerCount(currentWorkers);
+        options.log.warn(
+          "[Render] Browser initialization timed out; retrying with fewer workers.",
+          {
+            fromWorkers: currentWorkers,
+            toWorkers: nextWorkers,
+            error: failure.message,
+          },
+        );
+        currentWorkers = nextWorkers;
+        missingRanges = remaining;
+        attempt++;
+        continue;
+      }
+
       // Single bounded retry for a transient browser death (`Target closed` /
       // `Page crashed` / `Session closed`): the tab died mid-capture, not the
       // composition. Unlike the worker-halving retry below, this keeps the same
       // worker count (parallelism isn't the problem) and does NOT require
       // forward progress — a tab that dies before frame 0 is the exact case we
-      // want to recover. Bounded by MAX_TRANSIENT_CAPTURE_RETRIES so a
-      // deterministically-dying tab still fails instead of looping.
-      //
-      // Scope: this covers the parallel disk-capture path (the multi-worker
-      // renders where a contended host most often drops a tab). The sequential
-      // and streaming capture paths run a single stateful session/encoder and
-      // don't route through here; probeStage already has its own transient
-      // retry for the session-init phase they share.
+      // want to recover. Eligibility is shared with the sequential branch in
+      // captureStage.ts; streaming capture doesn't route through here.
       if (
         options.allowRetry &&
-        failure.kind === "transient_browser" &&
-        transientRetriesUsed < MAX_TRANSIENT_CAPTURE_RETRIES
+        isTransientCaptureRetryEligible(failure.kind, remaining, transientRetriesUsed)
       ) {
         transientRetriesUsed++;
         options.log.warn(
@@ -1065,7 +1575,7 @@ export async function executeDiskCaptureWithAdaptiveRetry(options: {
 
       if (!madeProgress) {
         options.log.warn(
-          "[Render] Capture attempt made no forward progress; composition is likely structurally broken — not retrying.",
+          "[Render] Capture attempt made no forward progress; composition is likely structurally broken, not retrying.",
           { attempt, frameCount, remainingCount, workers: currentWorkers },
         );
       }
@@ -1096,6 +1606,7 @@ export type RenderConfigInput = Omit<RenderConfig, "fps"> & { fps: FpsInput };
 
 export function createRenderJob(config: RenderConfigInput): RenderJob {
   return {
+    ...referenceBackgroundResult(undefined),
     id: randomUUID(),
     config: {
       ...config,
@@ -1110,107 +1621,722 @@ export function createRenderJob(config: RenderConfigInput): RenderJob {
   };
 }
 
-function normalizeCompositionSrcPath(srcPath: string): string {
-  return srcPath.replace(/\\/g, "/").replace(/^\.\//, "");
+export type StreamingEncodeGateReason =
+  | "disabled_by_config"
+  | "format_excluded"
+  | "invalid_duration"
+  | "duration_cap"
+  | "low_memory_mode"
+  | "parallel_forced"
+  | "single_worker"
+  | "multi_worker";
+
+export interface StreamingEncodeGateDecision {
+  enabled: boolean;
+  /** Why `enabled` is what it is. Logged as `reason` on the streaming-encode gate line. */
+  reason: StreamingEncodeGateReason;
 }
+
+type StreamingGateConfig = Pick<
+  EngineConfig,
+  "enableStreamingEncode" | "streamingEncodeMaxDurationSeconds"
+> &
+  Partial<Pick<EngineConfig, "lowMemoryMode" | "streamingEncodeDurationCapEnabled">>;
 
 /**
- * Read the `data-duration` off a scene file's `<template>` root — the scene's
- * own authored length. linkedom does not implement inert `<template>` content,
- * so we re-parse `template.innerHTML` (the pattern htmlBundler uses) to reach
- * the composition root inside it. Returns null when the file has no template
- * or the root declares no duration.
+ * Decide whether captured frames stream into ffmpeg (bounded scratch) or land
+ * on disk as raw RGBA (`frames × w × h × 4` bytes). Every `false` names the
+ * gate that fired so the log line and telemetry can attribute disk-path
+ * renders. Order matters and mirrors the historical predicate:
+ * config → format → duration validity → duration cap → parallel override →
+ * worker count.
  */
-function readSceneRootDuration(entryHtml: string | undefined): string | null {
-  if (!entryHtml) return null;
-  const { document } = parseHTML(entryHtml);
-  const template = document.querySelector("template");
-  const scope = template ? parseHTML(template.innerHTML).document : document;
-  const root = scope.querySelector("[data-composition-id]") as Element | null;
-  return root?.getAttribute("data-duration") ?? null;
-}
-
-function createStandaloneEntryRenderClone(
-  root: Element,
-  host: Element,
-  sceneDuration: string | null,
-): Element {
-  // linkedom's cloneNode returns `any` (not `Node`), so the Element cast
-  // is needed to access setAttribute/appendChild without losing type safety.
-  const hostClone = host.cloneNode(true) as Element;
-  hostClone.setAttribute("data-start", "0");
-
-  if (root === host) return hostClone;
-
-  const rootClone = root.cloneNode(false) as Element;
-  // The standalone composition IS the mounted scene, not the master shell that
-  // wraps it. A shallow clone of the master root otherwise keeps the master's
-  // data-duration (the whole project's length), so `render -c <scene>` rendered
-  // the scene for the entire project duration — or threw "Composition has zero
-  // duration" when the master derived its length from siblings now removed.
-  // Re-point the wrapper's duration at the scene's own; drop it (derive from the
-  // single child) only when the scene declared none.
-  if (sceneDuration != null) {
-    rootClone.setAttribute("data-duration", sceneDuration);
-  } else {
-    rootClone.removeAttribute("data-duration");
-  }
-  rootClone.appendChild(hostClone);
-  return rootClone;
-}
-
-function replaceBodyWithRenderClone(body: HTMLElement, renderClone: Element): void {
-  while (body.firstChild) {
-    body.removeChild(body.firstChild);
-  }
-  body.appendChild(renderClone);
-}
-
-export function shouldUseStreamingEncode(
-  cfg: Pick<EngineConfig, "enableStreamingEncode" | "streamingEncodeMaxDurationSeconds"> &
-    Partial<Pick<EngineConfig, "lowMemoryMode">>,
+export function explainStreamingEncodeGate(
+  cfg: StreamingGateConfig,
   outputFormat: NonNullable<RenderConfig["format"]>,
   workerCount: number,
   // Composition timeline duration in seconds.
   durationSeconds: number,
-  // Per-render override (set by the DE parallel router) — see
-  // deParallelStreamForced's declaration in executeRenderJob for why this is
-  // a parameter instead of an env-var read.
+  // Per-render override (set by the DE parallel router or the non-DE
+  // parallel-stream router) — see deParallelStreamForced's declaration in
+  // executeRenderJob for why this is a parameter instead of an env-var read.
   forceParallelStream = false,
-): boolean {
-  if (!cfg.enableStreamingEncode) return false;
-  if (outputFormat === "png-sequence") return false;
-  if (outputFormat === "gif") return false;
-  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return false;
+): StreamingEncodeGateDecision {
+  if (!cfg.enableStreamingEncode) return { enabled: false, reason: "disabled_by_config" };
+  if (outputFormat === "png-sequence" || outputFormat === "gif") {
+    return { enabled: false, reason: "format_excluded" };
+  }
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+    return { enabled: false, reason: "invalid_duration" };
+  }
+  // The duration cap is an operator opt-in (streamingEncodeDurationCapEnabled);
+  // its original reason — a total-render ffmpeg timeout — became an inactivity
+  // timeout in efc16a945, so by default long renders keep streaming.
+  const overCap =
+    cfg.streamingEncodeDurationCapEnabled === true &&
+    durationSeconds > cfg.streamingEncodeMaxDurationSeconds;
   // Low-memory mode already pins capture to one worker. Keep those renders on
   // the streaming path regardless of duration so captured frames are drained
   // directly into FFmpeg instead of accumulating hundreds of gigabytes of
-  // data URIs / disk frames until Chrome OOMs.
-  if (!cfg.lowMemoryMode && durationSeconds > cfg.streamingEncodeMaxDurationSeconds) return false;
+  // data URIs / disk frames until Chrome OOMs. It only bypasses the cap: an
+  // explicit `--workers N` under low-memory mode still falls to the
+  // worker-count gate below.
+  if (overCap && !cfg.lowMemoryMode) return { enabled: false, reason: "duration_cap" };
   // HF_DE_PARALLEL_STREAM (manual opt-in) / forceParallelStream (router):
-  // allow multi-worker streaming for the interleaved drawElement produce
-  // path. Contiguous-chunk parallel streaming stalls (worker k+1's first
-  // frame waits for ALL of worker k's), so this only makes sense with the
+  // allow multi-worker streaming for the interleaved produce paths.
+  // Contiguous-chunk parallel streaming stalls (worker k+1's first frame
+  // waits for ALL of worker k's), so this only makes sense with the
   // interleaved distribution the capture stage selects under the same
   // condition.
-  if (forceParallelStream || process.env.HF_DE_PARALLEL_STREAM === "true") return true;
-  return workerCount === 1;
+  if (forceParallelStream || process.env.HF_DE_PARALLEL_STREAM === "true") {
+    return { enabled: true, reason: "parallel_forced" };
+  }
+  if (workerCount === 1) {
+    return { enabled: true, reason: overCap ? "low_memory_mode" : "single_worker" };
+  }
+  return { enabled: false, reason: "multi_worker" };
+}
+
+export function shouldUseStreamingEncode(
+  cfg: StreamingGateConfig,
+  outputFormat: NonNullable<RenderConfig["format"]>,
+  workerCount: number,
+  durationSeconds: number,
+  forceParallelStream = false,
+): boolean {
+  return explainStreamingEncodeGate(
+    cfg,
+    outputFormat,
+    workerCount,
+    durationSeconds,
+    forceParallelStream,
+  ).enabled;
 }
 
 /**
- * DE priority inversion predicate: should an AUTO-resolved multi-worker render
- * drop to single-worker verified drawElement streaming?
+ * Integer tuning knob from the environment. Matches the convention the
+ * surrounding DE thresholds already use: unset OR set-but-empty falls back to
+ * the default (a blank var is not a kill switch), and so does anything
+ * non-numeric — a typo must never silently disable a routing guard.
+ */
+export function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  // Integer-only, per the name: a fractional threshold would compare
+  // sensibly against integer counts but silently means something the knob
+  // never promised, so treat it as a typo and fall back (review nit).
+  return Number.isInteger(parsed) ? parsed : fallback;
+}
+
+/**
+ * `scanElementTags`'s per-tag breakdown, capped so a pathological composition
+ * with thousands of distinct tag names can't inflate the telemetry payload:
+ * the top `MAX_REPORTED_ELEMENT_TAGS` tags by count survive as named keys,
+ * everything past the cap folds into `other`. `total` is unaffected by the
+ * cap — it is the sum of every match, capped or not.
+ */
+export interface ElementTagScan {
+  total: number;
+  byTag: Readonly<Record<string, number>>;
+  arollVideoCount: number;
+  heygenVideoCount: number;
+  audioCount: number;
+  imageCount: number;
+  subCompositionCount: number;
+  audioGroupCount: number;
+  colorGradingCount: number;
+  hasLut: boolean;
+  /** Authored root data-width/height vs. the scaffold's html/body CSS size; absent when either is undetectable. */
+  rootBodyMismatch?: boolean;
+  rootBodyDeltaPxBucket?: "0" | "1-10" | "11-50" | "51+";
+  /** `data-vfx-chain` host count — each occurrence of the attribute is one host, regardless of how many nodes its chain has. */
+  vfxHostCount: number;
+  /** Strongest enabled node's capture across every host (`chainCapture`, max: backdrop > self > none). Undefined when vfxHostCount is 0. */
+  vfxCapture?: HfVfxCapture;
+  /** Sorted unique def ids across every enabled node in every chain, comma-joined ("" when vfxHostCount is 0). */
+  vfxTypes: string;
+}
+
+const MAX_REPORTED_ELEMENT_TAGS = 50;
+const MAX_SCRIPT_STYLE_STRIP_PASSES = 8;
+/** none < self < backdrop — mirrors @hyperframes/core vfx.ts's internal CAPTURE_RANK, duplicated here (not exported) to combine per-host captures across an entire composition's static scan. */
+const VFX_CAPTURE_RANK: Record<HfVfxCapture, number> = { none: 0, self: 1, backdrop: 2 };
+
+function bucketPxDelta(delta: number): NonNullable<ElementTagScan["rootBodyDeltaPxBucket"]> {
+  if (delta === 0) return "0";
+  if (delta <= 10) return "1-10";
+  if (delta <= 50) return "11-50";
+  return "51+";
+}
+
+/** Authored root size vs. the scaffold's html/body CSS size, a source-level fact this HTML
+ * string carries whether or not init.ts's runtime DOM correction ran. Undefined, not a false/"0"
+ * default, when either side can't be read; a lighter root-tag heuristic than lint's findRootTag. */
+function detectRootBodySizeMismatch(
+  html: string,
+): Pick<ElementTagScan, "rootBodyMismatch" | "rootBodyDeltaPxBucket"> {
+  // The first element carrying data-composition-id, the root marker other queries here use.
+  const rootTag = firstCompositionIdTag(html);
+  const dataWidth = rootTag && Number(rootTag.match(/\bdata-width=["'](\d+)["']/i)?.[1]);
+  const dataHeight = rootTag && Number(rootTag.match(/\bdata-height=["'](\d+)["']/i)?.[1]);
+  if (!dataWidth || !dataHeight) return {};
+
+  // Groups 1 and 3 are prefix text for applyResolutionPreset's in-place
+  // replace; this read-only comparison only needs the digit groups (2 and 4).
+  const widthFirst = matchHtmlBodyCssWidthFirst(html);
+  const heightFirst = widthFirst ? undefined : matchHtmlBodyCssHeightFirst(html);
+  const [cssWidth, cssHeight] = widthFirst
+    ? [Number(widthFirst[2]), Number(widthFirst[4])]
+    : heightFirst
+      ? [Number(heightFirst[4]), Number(heightFirst[2])]
+      : [undefined, undefined];
+  if (!cssWidth || !cssHeight) return {};
+
+  const delta = Math.max(Math.abs(dataWidth - cssWidth), Math.abs(dataHeight - cssHeight));
+  return { rootBodyMismatch: delta > 0, rootBodyDeltaPxBucket: bucketPxDelta(delta) };
+}
+
+/**
+ * Rough element count (and per-tag breakdown) for compiled composition HTML.
  *
- * Benchmarked 2026-07-08: above ~900 frames DE-single beats screenshot-parallel
- * at every worker count (2,380f: 66s vs 109–127s at W2–W5); below it DE's fixed
- * init cost (verify + dedup arming) loses by a small margin. Only fires for the
- * exact benchmarked configuration: default-on DE, mp4, streaming-eligible,
- * no compile gate, no forced screenshot, workers not explicitly requested.
+ * Deliberately a string scan and not a `parseHTML` + `querySelectorAll` (the
+ * `countAuthoredTimedClips` approach): this runs on EVERY render before the
+ * routing decision, and a full linkedom parse of the exact documents that
+ * matter here — the 20k-40k node ones — is the most expensive case. Precision
+ * is not needed. It feeds a threshold whose measured crossover is ~3.9k and
+ * whose default sits at 2500, so tag counting is comfortably inside the
+ * margin — PROVIDED the count is not unboundedly low for some real content
+ * shape. Three sources are counted, each catching a case the others miss:
+ *
+ *   1. Closing tags (`</div>`) — the base count for ordinary HTML.
+ *   2. Named HTML void elements (`<img>`, `<br>`, …), bare or self-closed —
+ *      voids matter because they skew EXPENSIVE to paint (images), and
+ *      counting only closers would read an image gallery as a tiny comp and
+ *      open the band on exactly the content most likely to lose it.
+ *   3. Any self-closing tag (`<circle/>`, `<path d="…"/>`) — SVG's own
+ *      elements are neither closing-tag-shaped nor in the void list, so
+ *      without this a self-closing-SVG-heavy composition (`<circle/>` x 40k)
+ *      counted as ZERO — an unbounded undercount, not a rounding error, and
+ *      exactly the shape of comp the 1.8x regression case is made of
+ *      (review finding: the ceiling cannot compensate for an error with no
+ *      bound).
+ *
+ * Opening (non-self-closing, non-void) tags are deliberately NOT counted:
+ * compiled comps embed inline scripts, and `a < b` or `x <breadth` would
+ * false-positive on a bare `<letter` scan. All three counted forms require a
+ * literal closing marker (`</`, a void name at a word boundary, or `/>`), so
+ * ordinary JS comparisons and divisions don't qualify — verified by test.
+ *
+ * Every other property derives from the SAME script/style-stripped markup as
+ * `total`, and the per-tag counts come from the SAME matched set, so one scan
+ * feeds everything this function returns and none of them can drift apart.
+ *
+ * FALLBACK ONLY as of the live-DOM fix below — a string scan of the SOURCE
+ * markup cannot see elements a composition's own script creates at runtime
+ * (`document.createElement`), which is an unbounded undercount no regex can
+ * close: `style-10-prod`'s per-transcript-word caption generator measures 2
+ * source tags against thousands of live nodes after init (review finding).
+ * `resolveCompositionElementCount` prefers the initialized probe session's
+ * live count and uses this only when no such session exists.
+ */
+export function scanElementTags(html: string): ElementTagScan {
+  // Strip inline <script>/<style> bodies BEFORE matching. Every alternation
+  // below can fire on ordinary JS text — `const html = "</div>"` or a
+  // template literal building `</span>` inflates the count once per
+  // occurrence — and compiled comps embed large inline scripts. That bias is
+  // systematic, not noise, and it lands entirely on the ~83% of renders with
+  // no probe session, for which this scan is the only element signal (review
+  // finding). Removing the bodies also drops their own closing tags, which
+  // costs 1-2 counts against a threshold in the thousands.
+  // Looped to a fixed point rather than a single pass: one pass can REFORM
+  // the pattern it just removed (`<scr<script>ipt>` leaves `<script>`), which
+  // CodeQL flags as incomplete multi-character sanitization. The impact here
+  // is nil — the stripped string is counted and discarded, never rendered —
+  // but the incompleteness is real, and a stray reformed tag would perturb
+  // the count this gate reads. Each pass takes time linear in the markup, and
+  // the loop stops after MAX_SCRIPT_STYLE_STRIP_PASSES passes. Only a tag
+  // re-formed from pieces nested more deeply than that stops short of the
+  // fixed point, which no real composition does.
+  let markup = html;
+  for (
+    let previous = "", pass = 0;
+    markup !== previous && pass < MAX_SCRIPT_STYLE_STRIP_PASSES;
+    pass++
+  ) {
+    previous = markup;
+    markup = removeScriptAndStyleBlocks(markup);
+  }
+  let total = 0;
+  const counts = new Map<string, number>();
+  for (const name of countedTagNames(markup)) {
+    total++;
+    const tag = name.toLowerCase();
+    counts.set(tag, (counts.get(tag) ?? 0) + 1);
+  }
+  const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  const byTag: Record<string, number> = Object.fromEntries(
+    ranked.slice(0, MAX_REPORTED_ELEMENT_TAGS),
+  );
+  const otherCount = ranked
+    .slice(MAX_REPORTED_ELEMENT_TAGS)
+    .reduce((sum, [, count]) => sum + count, 0);
+  // `+=`, not `=`: a real (if exotic) tag literally named "other" could
+  // already occupy this key from the top-N slice above — adding preserves
+  // sum(byTag) === total in every case; overwriting would silently drop it.
+  if (otherCount > 0) byTag.other = (byTag.other ?? 0) + otherCount;
+  // `data-aroll="true"` is stamped on any media element type the composition
+  // generator emits (video/img/audio — see hyperframes.ts's isMediaElement
+  // gate), but this count is scoped to <video> only, matching its name: a-roll
+  // is a video-editing term for primary-take footage, and every real usage in
+  // this codebase's fixtures stamps it on video elements.
+  const arollVideoCount = countTagsWithAttr(markup, "video", `\\bdata-aroll=["']true["']`);
+  // `data-media-source="heygen"` is the media-use skill's own provenance
+  // stamp (see resolve.md), written only when the mounted video's ledger
+  // record traces to the "heygen.video" provider — never any other provider
+  // or value, so a plain presence check is exact, not a substring guess.
+  const heygenVideoCount = countTagsWithAttr(
+    markup,
+    "video",
+    `\\bdata-media-source=["']heygen["']`,
+  );
+  // Uncapped `counts` Map, not `byTag`: 50+ distinct tags could push these
+  // into the "other" bucket, zeroing a named field the cap shouldn't affect.
+  const audioCount = counts.get("audio") ?? 0;
+  const imageCount = counts.get("img") ?? 0;
+  const audioGroupCount = counts.get(HF_AUDIO_GROUP_TAG) ?? 0;
+  // Not collectSubCompositionSrcs (@hyperframes/parsers/asset-resolution):
+  // that dedupes by src and drops placeholder/remote mounts, so its length is
+  // distinct resolvable sub-comps, not this field's mount-element count.
+  const subCompositionCount = countCompositionSrcMounts(markup);
+  let colorGradingCount = 0;
+  let hasLut = false;
+  for (const m of markup.matchAll(
+    new RegExp(`\\b${HF_COLOR_GRADING_ATTR}=(?:"([^"]*)"|'([^']*)')`, "gi"),
+  )) {
+    colorGradingCount++;
+    // Guarded, not unconditional: one LUT anywhere settles the flag, so the
+    // JSON parse stops running for every element after the first hit.
+    if (!hasLut) hasLut = colorGradingValueHasLut(m[1] ?? m[2] ?? "");
+  }
+  let vfxHostCount = 0;
+  let vfxCapture: HfVfxCapture | undefined;
+  const vfxTypeSet = new Set<string>();
+  for (const m of markup.matchAll(new RegExp(`\\b${HF_VFX_ATTR}=(?:"([^"]*)"|'([^']*)')`, "gi"))) {
+    vfxHostCount++;
+    // A chain the runtime would refuse (bad JSON, unknown type, wrong
+    // version) is skipped rather than thrown here: this scan is
+    // observational telemetry, and the runtime already reports the bad
+    // chain loudly at paint time (interface spec's failure modes).
+    try {
+      const chain = parseVfxChain(decodeHtmlAttrJson(m[1] ?? m[2] ?? ""));
+      for (const node of chain.nodes) {
+        if (node.enabled === false) continue;
+        vfxTypeSet.add(node.type);
+      }
+      const capture = chainCapture(chain);
+      if (vfxCapture === undefined || VFX_CAPTURE_RANK[capture] > VFX_CAPTURE_RANK[vfxCapture]) {
+        vfxCapture = capture;
+      }
+    } catch {
+      // Unparsable — not counted toward vfxCapture/vfxTypes, but the host
+      // itself still counts toward vfxHostCount (it IS a data-vfx-chain host).
+    }
+  }
+  const vfxTypes = [...vfxTypeSet].sort().join(",");
+  return {
+    total,
+    byTag,
+    arollVideoCount,
+    heygenVideoCount,
+    audioCount,
+    imageCount,
+    subCompositionCount,
+    audioGroupCount,
+    colorGradingCount,
+    hasLut,
+    vfxHostCount,
+    vfxCapture,
+    vfxTypes,
+    ...detectRootBodySizeMismatch(html),
+  };
+}
+
+/** `data-color-grading`'s JSON `lut` field means "has a LUT" (see `HF_COLOR_GRADING_ATTR`).
+ * Decode is load-bearing: linkedom re-serializes this `&quot;`-escaped, or `JSON.parse` throws. */
+/** Undoes the HTML-entity escaping compiled markup applies to an attribute value with embedded quotes, so it can be `JSON.parse`d. Shared by every attribute-value-is-JSON static scan in this file. */
+function decodeHtmlAttrJson(rawAttributeValue: string): string {
+  return rawAttributeValue
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+function colorGradingValueHasLut(rawAttributeValue: string): boolean {
+  const decoded = decodeHtmlAttrJson(rawAttributeValue);
+  try {
+    const parsed: unknown = JSON.parse(decoded);
+    if (typeof parsed !== "object" || parsed === null || !("lut" in parsed)) return false;
+    const lut = parsed.lut;
+    // Mirrors normalizeLut (@hyperframes/core colorGrading.ts): a bare
+    // non-blank string, or an object with a non-blank string `src`, counts.
+    // null/absent/empty-string/blank-src does not.
+    if (typeof lut === "string") return lut.trim() !== "";
+    if (typeof lut !== "object" || lut === null) return false;
+    const src = (lut as { src?: unknown }).src;
+    return typeof src === "string" && src.trim() !== "";
+  } catch {
+    return false;
+  }
+}
+
+/** Longest a live probe-page read may hold the render; a busy page otherwise waits out the CDP timeout. */
+export const PROBE_READ_TIMEOUT_MS = 5_000;
+
+/** `page.evaluate` that rejects after `PROBE_READ_TIMEOUT_MS`, so callers fall back to their static answer. */
+async function evaluateWithinBound<T>(
+  page: Pick<CaptureSession["page"], "evaluate">,
+  fn: () => T,
+  what: string,
+  log: Pick<ProducerLogger, "warn">,
+): Promise<Awaited<T>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`no answer within ${PROBE_READ_TIMEOUT_MS} ms (page busy)`)),
+      PROBE_READ_TIMEOUT_MS,
+    );
+  });
+  try {
+    return await Promise.race([page.evaluate(fn) as Promise<Awaited<T>>, timedOut]);
+  } catch (err) {
+    log.warn(`[Render] live ${what} read skipped; using the static answer`, {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Element count for the short-comp band's gate, WITH PROVENANCE.
+ *
+ * `live` — measured from the initialized probe session's real DOM. This is
+ * the only trustworthy source: it sees elements a composition's own script
+ * created after load, which no scan of the source markup can (the
+ * caption-word-span pattern above builds thousands of nodes from two source
+ * tags).
+ *
+ * `static` — the `scanElementTags` fallback. Emitted for diagnostics, but
+ * NOT trusted to open the band: the probe is conditional (see
+ * `probeStage.ts`'s `needsBrowser` — only unknown duration, unresolved
+ * compositions, or specific media cases launch one), so a known-duration,
+ * media-free composition that builds 40k nodes in script gets no probe, and
+ * a static count that says "2". Treating that as measured would admit
+ * exactly the regression case the ceiling exists to exclude (review finding,
+ * R4). The caller fails closed on anything but `live`.
+ *
+ * These semantics are FROZEN while the short-band baseline is being read —
+ * the fleet distribution recorded by the baseline release must be measured
+ * by the same resolver that later gates routing, or the baseline is invalid.
+ */
+export async function resolveCompositionElementCount(
+  probeSession: Pick<CaptureSession, "isInitialized" | "page"> | null,
+  html: string,
+  log: Pick<ProducerLogger, "warn"> = defaultLogger,
+): Promise<{
+  count: number;
+  source: "live" | "static";
+  byTag?: Readonly<Record<string, number>>;
+  arollVideoCount?: number;
+  heygenVideoCount?: number;
+  audioCount?: number;
+  imageCount?: number;
+  subCompositionCount?: number;
+  audioGroupCount?: number;
+  colorGradingCount?: number;
+  hasLut?: boolean;
+  rootBodyMismatch?: boolean;
+  rootBodyDeltaPxBucket?: ElementTagScan["rootBodyDeltaPxBucket"];
+  vfxHostCount?: number;
+  vfxCapture?: HfVfxCapture;
+  vfxTypes?: string;
+}> {
+  if (probeSession?.isInitialized) {
+    try {
+      const liveCount = await evaluateWithinBound(
+        probeSession.page,
+        // Live HTMLCollection length — avoids materializing a static NodeList
+        // on the large-DOM comps this gate exists to catch (review nit).
+        () => document.getElementsByTagName("*").length,
+        "element count",
+        log,
+      );
+      if (typeof liveCount === "number" && Number.isFinite(liveCount)) {
+        return { count: liveCount, source: "live" };
+      }
+    } catch {
+      // Probe page evaluate can fail (navigation mid-flight, detached frame,
+      // page crash) — fall through to the static scan rather than block the
+      // render on a routing-gate measurement.
+    }
+  }
+  // Every field below `source` is static-only: the live path measures a real
+  // DOM node count and never runs this string scan, so it has nothing to
+  // report for any of them.
+  const scan = scanElementTags(html);
+  return {
+    count: scan.total,
+    source: "static",
+    byTag: scan.byTag,
+    arollVideoCount: scan.arollVideoCount,
+    heygenVideoCount: scan.heygenVideoCount,
+    audioCount: scan.audioCount,
+    imageCount: scan.imageCount,
+    subCompositionCount: scan.subCompositionCount,
+    audioGroupCount: scan.audioGroupCount,
+    colorGradingCount: scan.colorGradingCount,
+    hasLut: scan.hasLut,
+    rootBodyMismatch: scan.rootBodyMismatch,
+    rootBodyDeltaPxBucket: scan.rootBodyDeltaPxBucket,
+    vfxHostCount: scan.vfxHostCount,
+    vfxCapture: scan.vfxCapture,
+    vfxTypes: scan.vfxTypes,
+  };
+}
+
+/**
+ * All 12 real runtime adapters registered by `runtime/init.ts`, including the
+ * map/data-source ones (d3/leaflet/mapbox/maplibre/google-maps) alongside animation ones.
+ */
+const KNOWN_RUNTIME_ADAPTERS = [
+  "animejs",
+  "css",
+  "d3",
+  "google-maps",
+  "gsap",
+  "leaflet",
+  "lottie",
+  "mapbox",
+  "maplibre",
+  "three",
+  "typegpu",
+  "waapi",
+] as const;
+
+export type RuntimeAdapterName = (typeof KNOWN_RUNTIME_ADAPTERS)[number];
+
+/**
+ * Static, authoring-time signature per adapter. Most match the adapter's own
+ * `window.__hf<Name>` registration token; gsap/three/css/waapi match a library-specific shape.
+ */
+const ADAPTER_STATIC_SIGNATURES: Readonly<Record<RuntimeAdapterName, RegExp>> = {
+  animejs: /\b__hfAnime\b/,
+  css: /@keyframes\s+[\w-]/,
+  d3: /\b__hfD3\b/,
+  "google-maps": /\b__hfGoogleMaps\b/,
+  gsap: /\bgsap\.(timeline|to|from|fromTo|set)\s*\(/,
+  leaflet: /\b__hfLeaflet\b/,
+  lottie: /\b__hfLottie\b/,
+  mapbox: /\b__hfMapbox\b/,
+  maplibre: /\b__hfMaplibre\b/,
+  three:
+    /\bwindow\.THREE\b|\bTHREE\.(Scene|WebGLRenderer|PerspectiveCamera|DefaultLoadingManager)\b/,
+  typegpu: /\bdata-requires-webgpu\b|\b__hfTypegpuTime\b/,
+  waapi: /\.animate\s*\(\s*\[/,
+};
+
+/**
+ * Static regex fallback for `resolveAdaptersUsed`, the sole signal with no probe session.
+ * Scans inline `<script>` bodies too, unlike `scanElementTags`, which strips them.
+ */
+export function detectAdaptersStatic(html: string): RuntimeAdapterName[] {
+  return KNOWN_RUNTIME_ADAPTERS.filter((name) => ADAPTER_STATIC_SIGNATURES[name].test(html));
+}
+
+/**
+ * Live-DOM probe body for `resolveAdaptersUsed`. Self-contained since `page.evaluate` serializes it.
+ * css/waapi split verified against `runtime/adapters/css.ts` (happy-dom can't exercise it here).
+ */
+function probeAdaptersUsed(): string[] {
+  const used: string[] = [];
+  const w = window as unknown as Record<string, unknown>;
+  const isNonEmptyArray = (value: unknown): boolean => Array.isArray(value) && value.length > 0;
+  // Libraries the adapter auto-detects from their own global.
+  if (typeof w.gsap !== "undefined") used.push("gsap");
+  if (typeof w.THREE !== "undefined") used.push("three");
+  // Adapters whose authoring convention is to push each instance onto a
+  // `window.__hf<Name>` registration array.
+  if (isNonEmptyArray(w.__hfAnime)) used.push("animejs");
+  if (isNonEmptyArray(w.__hfD3)) used.push("d3");
+  if (isNonEmptyArray(w.__hfGoogleMaps)) used.push("google-maps");
+  if (isNonEmptyArray(w.__hfLeaflet)) used.push("leaflet");
+  if (isNonEmptyArray(w.__hfLottie)) used.push("lottie");
+  if (isNonEmptyArray(w.__hfMapbox)) used.push("mapbox");
+  if (isNonEmptyArray(w.__hfMaplibre)) used.push("maplibre");
+  // typegpu registers a scalar clock rather than an instance array.
+  if (
+    typeof w.__hfTypegpuTime === "number" ||
+    document.querySelector("[data-composition-id][data-requires-webgpu]")
+  ) {
+    used.push("typegpu");
+  }
+  let liveAnimations: Animation[] = [];
+  try {
+    if (typeof document.getAnimations === "function") liveAnimations = document.getAnimations();
+  } catch {
+    // Detached or mid-navigation document: leave the list empty so the
+    // adapters resolved above are still reported.
+  }
+  // The real "css" adapter only discovers @keyframes-driven animations, never
+  // CSS `transition:`. A `CSSTransition` instance is neither adapter-managed
+  // "css" nor an imperative "waapi" call, so it is excluded from both.
+  const isKeyframesCss = (animation: Animation): boolean =>
+    typeof CSSAnimation !== "undefined" && animation instanceof CSSAnimation;
+  const isTransition = (animation: Animation): boolean =>
+    typeof CSSTransition !== "undefined" && animation instanceof CSSTransition;
+  if (liveAnimations.some(isKeyframesCss)) used.push("css");
+  if (liveAnimations.some((animation) => !isKeyframesCss(animation) && !isTransition(animation))) {
+    used.push("waapi");
+  }
+  return used;
+}
+
+/**
+ * Runtime adapters a composition exercises. Unlike `resolveCompositionElementCount`
+ * (one source of truth, for gating), this is observational: unions live + static every render.
+ */
+export async function resolveAdaptersUsed(
+  probeSession: Pick<CaptureSession, "isInitialized" | "page"> | null,
+  html: string,
+  log: Pick<ProducerLogger, "warn"> = defaultLogger,
+): Promise<readonly RuntimeAdapterName[]> {
+  const staticAdapters = detectAdaptersStatic(html);
+  if (!probeSession?.isInitialized) return staticAdapters;
+  try {
+    const live = await evaluateWithinBound(probeSession.page, probeAdaptersUsed, "adapters", log);
+    if (!Array.isArray(live)) return staticAdapters;
+    const detected = new Set<string>([...staticAdapters, ...live]);
+    return KNOWN_RUNTIME_ADAPTERS.filter((name) => detected.has(name));
+  } catch {
+    // Probe page evaluate can fail (navigation mid-flight, detached frame,
+    // page crash), so fall back to the static-only signal rather than block
+    // the render on a purely observational telemetry probe.
+    return staticAdapters;
+  }
+}
+
+/**
+ * Max-merge init telemetry across per-worker capture perf summaries — the
+ * success-path channel for PARALLEL renders, whose worker console buffers
+ * (and so the `[FrameCapture:INIT]` line) only propagate on failure. Max
+ * matches summarizeInitObservability's own multi-session semantics: keep the
+ * worst observed startup cost for duration. Tween count is per-composition,
+ * so workers should agree — max is a defensive read against a worker that
+ * initializes before the timeline is fully wired, not an expected disagreement.
+ */
+export function mergeWorkerInitObservability(
+  perfs: ReadonlyArray<{
+    initDurationMs?: number;
+    initTweenCount?: number;
+    initElementCount?: number;
+  }>,
+): { initDurationMs?: number; tweenCount?: number; elementCount?: number } | undefined {
+  let initDurationMs: number | undefined;
+  let tweenCount: number | undefined;
+  let elementCount: number | undefined;
+  for (const perf of perfs) {
+    if (perf.initDurationMs !== undefined) {
+      initDurationMs =
+        initDurationMs === undefined
+          ? perf.initDurationMs
+          : Math.max(initDurationMs, perf.initDurationMs);
+    }
+    if (perf.initTweenCount !== undefined) {
+      tweenCount =
+        tweenCount === undefined ? perf.initTweenCount : Math.max(tweenCount, perf.initTweenCount);
+    }
+    // Max across workers: every worker loads the same composition, so they
+    // should agree — max is defensive against a worker sampled before its
+    // init script finished populating the DOM.
+    if (perf.initElementCount !== undefined) {
+      elementCount =
+        elementCount === undefined
+          ? perf.initElementCount
+          : Math.max(elementCount, perf.initElementCount);
+    }
+  }
+  if (initDurationMs === undefined && tweenCount === undefined && elementCount === undefined) {
+    return undefined;
+  }
+  return { initDurationMs, tweenCount, elementCount };
+}
+
+/**
+ * The short-comp band's attribution decision, extracted as a pure function so
+ * the gating fixes below are independently testable rather than living inline
+ * where only a full render pipeline run could exercise them.
+ *
+ * A value is emitted ONLY when the band is DECISIVE — every other
+ * inversion-eligibility condition already passed (both floor evaluations
+ * agree on everything except which floor they used) and the band floor alone
+ * flipped the answer. `bandEnabled` gates that decisiveness itself:
+ * `HF_DE_SHORT_MAX_ELEMENTS=0` is a documented kill switch (symmetric with
+ * `HF_DE_SHORT_MIN_FRAMES=0`, which already disables via the predicate's own
+ * `minFrames > 0` guard), and without this gate a fired kill switch left
+ * every in-band render decisive against a real floor comparison — reporting
+ * "skipped_elements" (comp too large) instead of undefined (band disabled)
+ * and corrupting the DiD control cohort with kill-switched renders (review
+ * finding).
+ *
+ * Three decisive outcomes, and the distinction between the last two is the
+ * point:
+ *   "applied"          — measured LIVE and under the ceiling. Only this
+ *                        routes (once HF_DE_SHORT_BAND_ROUTE is on) and only
+ *                        this joins the treatment cohort.
+ *   "skipped_elements" — measured live, over the ceiling. A real oversize
+ *                        observation; the DiD control group.
+ *   "unmeasured"       — no live DOM count available (no probe session ran;
+ *                        see `resolveCompositionElementCount`). FAILS CLOSED:
+ *                        never routes, and kept out of BOTH cohorts so a
+ *                        static undercount cannot masquerade as a small comp
+ *                        (review finding, R4). Emitted rather than dropped
+ *                        because its fleet rate sizes the population a
+ *                        future conditional-probe-launch would unlock.
+ */
+export function resolveDeShortBand(args: {
+  invertAtBaseFloor: boolean;
+  invertAtBandFloor: boolean;
+  bandEnabled: boolean;
+  bandOpen: boolean;
+  elementCountSource: "live" | "static";
+}): "applied" | "skipped_elements" | "unmeasured" | undefined {
+  const decisive = args.bandEnabled && args.invertAtBandFloor && !args.invertAtBaseFloor;
+  if (!decisive) return undefined;
+  if (args.elementCountSource !== "live") return "unmeasured";
+  return args.bandOpen ? "applied" : "skipped_elements";
+}
+
+/** Single-worker drawElement inversion floor; off (0) by default: parallel screenshot capture was
+ * ~25% faster wherever it fired. HF_DE_SINGLE_MIN_FRAMES=<n> turns it back on. */
+export function resolveDeSingleMinFrames(env: NodeJS.ProcessEnv): number {
+  const raw = env.HF_DE_SINGLE_MIN_FRAMES;
+  const value = raw === undefined || raw.trim() === "" ? 0 : Number(raw);
+  return Number.isFinite(value) ? value : 0;
+}
+
+/**
+ * DE priority inversion predicate: should a multi-worker render drop to
+ * single-worker verified drawElement streaming?
+ *
+ * Opt-in (see resolveDeSingleMinFrames): re-measured on hardware-GL Macs, one
+ * drawElement worker was ~25% slower than 4 screenshot workers at 1,271 and 9,000
+ * frames. Only fires for default-on DE, mp4, streaming-eligible, no compile gate,
+ * no forced screenshot.
  */
 export function shouldPreferSingleWorkerDrawElement(args: {
   workerCount: number;
-  /** job.config.workers — a number means the user explicitly chose. */
-  requestedWorkers: number | "auto" | undefined;
   useDrawElement: boolean;
   deCompileGate: string | undefined;
   forceScreenshot: boolean;
@@ -1227,7 +2353,7 @@ export function shouldPreferSingleWorkerDrawElement(args: {
    * telemetry and keep the probe session alive through the heaviest stage.
    */
   layeredOrEffectRoute: boolean;
-  /** deviceScaleFactor > 1 — the engine's supersampling gate blocks DE. */
+  /** deviceScaleFactor other than 1 — the engine's supersampling gate blocks DE. */
   supersampling: boolean;
   /**
    * The probe session already ran the engine's init-time DE gates and DE did
@@ -1244,11 +2370,10 @@ export function shouldPreferSingleWorkerDrawElement(args: {
 }): boolean {
   return (
     args.workerCount > 1 &&
-    typeof args.requestedWorkers !== "number" &&
     args.useDrawElement &&
     !args.deCompileGate &&
     !args.forceScreenshot &&
-    args.outputFormat === "mp4" &&
+    outputUsesH264Pipeline(args.outputFormat) &&
     args.minFrames > 0 &&
     args.totalFrames >= args.minFrames &&
     args.singleWorkerStreamingOk &&
@@ -1257,6 +2382,30 @@ export function shouldPreferSingleWorkerDrawElement(args: {
     !args.probeDeGated &&
     !args.experimentalParallelDeOptIn
   );
+}
+
+/** Why drawElement is off before capture; the compile stage's content gates are not config refusals. */
+export function initialDeClampReason(args: {
+  useDrawElement: boolean;
+  deCompileGate: string | undefined;
+  config: Parameters<typeof explainDrawElementDisabled>[0];
+}): string | undefined {
+  if (args.useDrawElement) return undefined;
+  if (args.deCompileGate) return "compile_gate";
+  return explainDrawElementDisabled(args.config);
+}
+
+/**
+ * The session kept drawElement but left some frames to a screenshot session. Only the
+ * single-worker streaming capture hands those over, so parallel drawElement must not be chosen.
+ */
+function probeNeedsScreenshotFrames(session: CaptureSession | null): boolean {
+  return (session?.deRiskFrames?.size ?? 0) > 0;
+}
+
+/** The session ran the engine's init-time drawElement gates and one refused it. */
+function isProbeDeGated(session: CaptureSession | null): session is CaptureSession {
+  return session !== null && session.captureMode !== "drawelement" && !session.deInitDeferred;
 }
 
 /**
@@ -1310,15 +2459,44 @@ export function resolveInversionRetryPlan(args: {
  * clear 1.25x (3,600f, 39% static/dedup-heavy) still didn't LOSE to single-
  * worker (1.16x) — dedup already skips the capture work parallelism would
  * split, so there's mechanically less headroom, not a regression. No comp
- * anywhere showed par3 < single. Default-off (HF_DE_PARALLEL_ROUTER): this
- * promotes the opt-in mechanism from #2056 into the auto-routing decision,
- * but the decision itself stays gated behind its own flag pending the
- * telemetry soak (revert rate, de_verify_min_db distribution) on real wild
- * traffic — there is currently none, since nothing routes here by default.
- * Takes priority over the single-worker inversion when both would fire (a
- * higher minFrames than HF_DE_SINGLE_MIN_FRAMES is the intended shape: this
- * only picks up the long tail the inversion's own benchmark didn't cover).
+ * anywhere showed par3 < single. Default ON since 2026-07-27
+ * (HF_DE_PARALLEL_ROUTER=false is the kill switch): the default-off soak
+ * proved the safety half (zero shipped damage, 100% revert recovery), so the
+ * flip trades an accepted ~2.3% revert rate for parallelizing the ≥700f
+ * band. This promotes the opt-in mechanism from #2056 into the auto-routing
+ * decision.
+ * Takes priority over the single-worker inversion when both would fire.
+ * Re-calibrated 2026-07-27: a controlled crossover sweep (three content
+ * profiles including a genuinely init-expensive 24-sub-composition comp;
+ * worker counts and capture modes verified per run) found par3 > single at
+ * every size from 350f up in every profile — workers init concurrently, so
+ * per-worker init duplication costs CPU, not wall-clock. minFrames therefore
+ * dropped below the inversion's threshold (700 vs 900): where both fire,
+ * parallel wins over the inversion's single-worker pick (+17–21% at 700f).
  */
+/**
+ * Is the DE parallel router enabled for this process?
+ *
+ * Default ON since 2026-07-27; `HF_DE_PARALLEL_ROUTER` is the kill switch.
+ * Every conventional spelling of "off" disables it — a naive
+ * `!== "false"` would silently ignore `0`, `off`, `no`, `FALSE`, and an
+ * exported-but-empty var, i.e. an opt-out that FAILS OPEN and hands the user
+ * 3-worker parallel DE anyway (review finding). A set-but-empty value means
+ * "unset" here, matching how the sibling HF_DE_* numeric knobs treat it.
+ *
+ * The CLI's circuit breaker relies on this accepting an explicit "false":
+ * once an install trips the breaker it writes that value rather than
+ * unsetting the var, because under a default-ON flag unsetting means ON.
+ * Pure; exported for tests.
+ */
+export function isDeParallelRouterEnabled(
+  env: Readonly<Record<string, string | undefined>>,
+): boolean {
+  const raw = env.HF_DE_PARALLEL_ROUTER?.trim().toLowerCase();
+  if (raw === undefined || raw === "") return true;
+  return !(raw === "false" || raw === "0" || raw === "off" || raw === "no");
+}
+
 export function shouldPreferParallelDrawElement(args: {
   workerCount: number;
   /** job.config.workers — a number means the user explicitly chose. */
@@ -1334,8 +2512,21 @@ export function shouldPreferParallelDrawElement(args: {
   supersampling: boolean;
   probeDeGated: boolean;
   experimentalParallelDeOptIn: boolean;
-  /** HF_DE_PARALLEL_ROUTER === "true" — the router's own kill switch, default off. */
+  /** HF_DE_PARALLEL_ROUTER !== "false" — default ON since 2026-07-27; env var is the kill switch. */
   routerEnabled: boolean;
+  /**
+   * Whether verified parallel DE STREAMING can actually run for this render
+   * (`shouldUseStreamingEncode` at the router's worker count with
+   * forceParallelStream). The router's entire value is that path; without it
+   * firing would pin workerCount to 3 and skip calibration while delivering
+   * none of the benefit — e.g. png-sequence / gif output, streaming disabled
+   * by config, or — only when the operator opt-in
+   * `streamingEncodeDurationCapEnabled` is on — a composition longer than
+   * `streamingEncodeMaxDurationSeconds` (240 s), where the duration cap
+   * disables streaming before the router's force flag is consulted. With the
+   * cap off (the default) long compositions are eligible here too.
+   */
+  parallelStreamingAvailable: boolean;
   /** Machine RAM (os.totalmem, MB). */
   totalMemoryMb: number;
   /** RAM floor for routing; <=0 disables the guard. */
@@ -1343,12 +2534,13 @@ export function shouldPreferParallelDrawElement(args: {
 }): boolean {
   return (
     args.routerEnabled &&
+    args.parallelStreamingAvailable &&
     args.workerCount > 1 &&
     typeof args.requestedWorkers !== "number" &&
     args.useDrawElement &&
     !args.deCompileGate &&
     !args.forceScreenshot &&
-    args.outputFormat === "mp4" &&
+    outputUsesH264Pipeline(args.outputFormat) &&
     args.minFrames > 0 &&
     args.totalFrames >= args.minFrames &&
     !args.layeredOrEffectRoute &&
@@ -1441,16 +2633,141 @@ export function resolveParallelRouterRetryPlan(args: {
  * before the outer catch's `RenderCancelledError` branch ends the render —
  * that would delay honoring "stop" with a pointless resource spin-up/
  * tear-down cycle.
+ *
+ * A typed sequential capture stall is independent of routing and retries on
+ * any cohort. This includes low-memory screenshot capture: its failed stage
+ * closes the wedged session before the retry creates a fresh screenshot
+ * session. Encoder interruptions remain excluded so a host shutdown cannot
+ * be hidden behind same-host retry work.
  */
 export function shouldRetryViaPinnedFallback(args: {
   isVerifyError: boolean;
+  /** An injected drawElement page cannot supply trusted pixels. */
+  isDeCaptureError?: boolean;
   isCancellation: boolean;
+  isEncoderInterrupted?: boolean;
   deWorkerInversion: "inverted" | "reverted" | undefined;
   deParallelRouter: "routed" | "reverted" | undefined;
+  /**
+   * The drawElement capture wedged the renderer (PRINFRA-488). Retryable on ANY
+   * routing, not just a pinned one: the failure is a property of drawElement
+   * itself, and the retry re-renders on a fresh page via screenshot — the only
+   * recovery that works once the renderer stops scheduling. Without this a comp
+   * that engaged drawElement on the ordinary single-worker path (neither
+   * inverted nor routed) had NO whole-render fallback, so one wedged frame
+   * failed the entire render.
+   */
+  isDeRendererStall?: boolean;
+  /** The producer's no-progress watchdog tripped around a sequential capture call. */
+  isSequentialCaptureStall?: boolean;
+  /**
+   * The parallel streaming stage's watchdog tripped. Routing-independent
+   * like the sequential stall: on the non-drawElement router (default
+   * routing) it used to fail the render hard while promising a fallback.
+   */
+  isParallelCaptureStall?: boolean;
+  /** The streaming encoder died after frames had started — see isRetryableEncoderDeath. */
+  isEncoderDeath?: boolean;
+  /**
+   * A transient browser failure around the capture call itself
+   * (`classifyCaptureFailure` → `transient_browser`, e.g. a CDP
+   * `Page.captureScreenshot` refusal). Routing-independent like the stalls
+   * above: `--low-memory-mode` pins single-worker screenshot capture with no
+   * drawElement, so neither inversion nor the router ever pins a count, and
+   * that mode otherwise had no whole-render fallback for a one-off refusal.
+   */
+  isTransientCaptureError?: boolean;
+  /** The failed attempt captured through BeginFrame; screenshot is the baseline for any failure there. */
+  isBeginFrameCapture?: boolean;
 }): boolean {
-  if (args.isCancellation) return false;
-  if (args.isVerifyError) return true;
+  if (args.isCancellation || args.isEncoderInterrupted) return false;
+  if (args.isVerifyError || args.isDeCaptureError) return true;
+  if (args.isBeginFrameCapture === true) return true;
+  if (args.isDeRendererStall === true || args.isSequentialCaptureStall === true) return true;
+  if (args.isParallelCaptureStall === true || args.isEncoderDeath === true) return true;
+  if (args.isTransientCaptureError === true) return true;
   return args.deWorkerInversion === "inverted" || args.deParallelRouter === "routed";
+}
+
+/**
+ * True for the drawElement per-frame deadline breach raised by the engine when
+ * the renderer stops scheduling after `drawElementImage` returns (PRINFRA-488).
+ * Matched on name+message rather than by class because the error crosses the
+ * engine/producer package boundary.
+ */
+export function isDeRendererStallError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return err.name === "DeFrameTimeoutError" || err.message.includes("renderer stopped scheduling");
+}
+
+/**
+ * True when the producer's sequential no-progress deadline won. The stage
+ * wraps its typed cause in CaptureStageError, so match both the inner name and
+ * the stable, mode-bearing outer message.
+ */
+export function isSequentialCaptureStallError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return (
+    err.name === "SequentialCaptureStallError" ||
+    /^\[Render\] Sequential (?:drawElement|BeginFrame|screenshot) capture stalled:/.test(
+      err.message,
+    )
+  );
+}
+
+/**
+ * The parallel streaming stage's no-progress watchdog tripped
+ * (`ParallelCaptureStallError`). Matched on name+message like the sequential
+ * one so it survives a boundary that rebuilds the error from its message.
+ */
+export function isParallelCaptureStallError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return (
+    err.name === "ParallelCaptureStallError" ||
+    /^\[Render\] Parallel \S+ capture stalled/.test(err.message)
+  );
+}
+
+const ENCODER_DEATH_FRAME_RE = /^Streaming encoder exited before frame (\d+) was written/;
+
+/**
+ * The streaming encoder died mid-render in a way a fresh ffmpeg might not
+ * repeat: an inactivity kill, a crash, an ENOSPC that cleared. Death before
+ * frame 2 is the encoder rejecting its own arguments or input (bad codec
+ * params, unsupported pixel format, a broken user ffmpeg) and reproduces
+ * exactly, so retrying it only doubles the time to the same failure. A host
+ * lifecycle interruption is typed separately and is never retried here — the
+ * producer that owns the render is what retries that.
+ */
+export function isRetryableEncoderDeath(err: unknown): boolean {
+  if (!(err instanceof Error) || err instanceof EncoderInterruptedError) return false;
+  const match = ENCODER_DEATH_FRAME_RE.exec(err.message);
+  return match !== null && Number(match[1]) >= 2;
+}
+
+/**
+ * When a self-verify (or pinned-fallback) retry is triggered mid-capture, the
+ * caller may still hold a live probe session that the failed stage was passed
+ * but did not (or could not) close in its own `finally` before it threw. Left
+ * behind, that session's Chrome process orphans until the containing render
+ * exits — precisely when we are recovering from GPU/memory pressure and can
+ * least afford an unaccounted Chrome. Close it before the caller clears its
+ * reference; swallow any close error with a warn so the retry itself is never
+ * derailed by a shutdown hiccup.
+ */
+export async function closeOrphanedProbeForRetry(
+  probe: CaptureSession,
+  closer: (session: CaptureSession) => Promise<void>,
+  log: Pick<ProducerLogger, "warn">,
+  retryContext: string,
+): Promise<void> {
+  try {
+    await closer(probe);
+  } catch (closeErr) {
+    log.warn(`[Render] probe close before ${retryContext} retry failed; continuing with retry`, {
+      error: closeErr instanceof Error ? closeErr.message : String(closeErr),
+    });
+  }
 }
 
 /**
@@ -1476,8 +2793,146 @@ export function shouldRetryViaPinnedFallback(args: {
  * machinery; both DE predicates independently require useDrawElement, making
  * the two routers mutually exclusive by construction.
  */
+/**
+ * The capture mode each parallel worker will launch with, mirroring the
+ * engine's `preMode` (frameCapture.ts): BeginFrame only on Linux with
+ * chrome-headless-shell, at DPR 1, with no forced screenshot. The engine's
+ * `drawElementTransparent` term is absent because the router requires
+ * `!useDrawElement`.
+ *
+ * Deliberately stricter than {@link resolveObservedCaptureMode}, which knows
+ * only the platform and so calls Linux-with-system-Chrome and Linux-at-DPR>1
+ * "beginframe" when the engine actually launches screenshot. The default-on
+ * decision keys on this, so being stricter only narrows what is enabled by
+ * default. One case remains that this cannot see: the engine's concrete
+ * software-GPU clamp can still move a Linux headless-shell render to
+ * screenshot. Those renders are inside the cohort the default was measured
+ * on, since the telemetry label uses the looser predicate.
+ */
+export function resolveParallelCaptureMode(args: {
+  platform: NodeJS.Platform;
+  /** The chrome-headless-shell binary resolved for this render, if any. */
+  headlessShellPath: string | undefined;
+  forceScreenshot: boolean;
+  deviceScaleFactor?: number;
+}): "screenshot" | "beginframe" {
+  const supersampling = (args.deviceScaleFactor ?? 1) !== 1;
+  const headlessShell = args.headlessShellPath !== undefined;
+  return headlessShell && args.platform === "linux" && !args.forceScreenshot && !supersampling
+    ? "beginframe"
+    : "screenshot";
+}
+
+/**
+ * Non-DE parallel-stream router switch. Default ON for BeginFrame capture
+ * (Phase 1 of the long-form render plan): those multi-worker mp4/mov renders
+ * stream through the interleaved writer instead of writing raw RGBA frames to
+ * disk, and their opt-in cohort fails at 0.05%. Screenshot capture stays
+ * opt-in — its opt-in cohort fails at 5.5% against a ~1.1% baseline, in two
+ * classes the streaming path owns (the parallel stall watchdog hard-fails
+ * with no retry; a dying encoder surfaces as a bare write EPIPE). Flipping it
+ * waits on those being fixed.
+ *
+ * Off-spellings match {@link isDeParallelRouterEnabled} so the two kill
+ * switches cannot disagree; any other explicit value is an opt-in.
+ */
+export function isCaptureParallelStreamRouterEnabled(
+  env: Readonly<Record<string, string | undefined>>,
+  resolvedMode: "screenshot" | "beginframe",
+): boolean {
+  const raw = env.HF_CAPTURE_PARALLEL_STREAM?.trim().toLowerCase();
+  if (raw === undefined || raw === "") return resolvedMode === "beginframe";
+  if (raw === "false" || raw === "0" || raw === "off" || raw === "no") return false;
+  return true;
+}
+
+/**
+ * Whether this render distributes frames interleaved across its workers. The
+ * two routers set their flags; `HF_DE_PARALLEL_STREAM=true` is the manual
+ * opt-in the streaming stage also honours on its own. Folding all three into
+ * the plan is what keeps the plan, and so the retry target and telemetry, in
+ * agreement with the distribution the stage actually picks: before this, an
+ * env-opt-in render below the DE router's frame floor carried
+ * `forceParallelStream: false`, so its retry kept N workers, which the env
+ * var then re-interleaved instead of dropping to the hardened single-worker
+ * path. Pure; exported for tests.
+ */
+export function isParallelStreamForced(
+  env: Readonly<Record<string, string | undefined>>,
+  flags: { deParallelStreamForced: boolean; captureParallelStreamForced: boolean },
+): boolean {
+  return (
+    flags.deParallelStreamForced ||
+    flags.captureParallelStreamForced ||
+    env.HF_DE_PARALLEL_STREAM === "true"
+  );
+}
+
+/**
+ * The duration at which segmented capture is meant to become the default
+ * (spec §5 Phase 2d). Not the shipped default: that flip is its own release
+ * step, gated on the 40-minute soak, and shipping it alongside the rest of
+ * this work would change the route for every long render in the same release
+ * that introduced the route. Set `HF_SEGMENTED_MIN_SECONDS=600` to opt a
+ * fleet in ahead of the flip; flipping the constant below is the whole
+ * change when the soak passes.
+ */
+export const SEGMENTED_MIN_SECONDS_AFTER_SOAK = 600;
+
+/** No duration routes to segmented capture until the soak gate is cleared. */
+const DEFAULT_SEGMENTED_MIN_SECONDS = Number.POSITIVE_INFINITY;
+
+function resolveSegmentedMinSeconds(env: Readonly<Record<string, string | undefined>>): number {
+  const raw = env.HF_SEGMENTED_MIN_SECONDS;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_SEGMENTED_MIN_SECONDS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_SEGMENTED_MIN_SECONDS;
+}
+
+/**
+ * Whether this render captures in segments. The worker count is not an
+ * input: any count segments (Phase 2d), so nothing here consults it.
+ * `HF_SEGMENTED_CAPTURE=true`
+ * forces it at any duration and `=false` is the kill switch; otherwise it is
+ * the duration threshold above. The exclusions are the routes whose
+ * concat-copy or capture loop the segment contract does not cover: webm's VP9
+ * concat is fragile across ffmpeg versions, png-sequence and gif have no
+ * encoded video output, and HDR/shader-transition renders run their own
+ * compositor.
+ */
+export function shouldSegmentCapture(args: {
+  env: Readonly<Record<string, string | undefined>>;
+  durationSeconds: number;
+  outputFormat: string;
+  layeredOrEffectRoute: boolean;
+  /** shouldUseStreamingEncode(cfg, format, 1, duration) at the call site. */
+  streamingOk: boolean;
+}): boolean {
+  const raw = args.env.HF_SEGMENTED_CAPTURE?.trim().toLowerCase();
+  if (raw === "false" || raw === "0" || raw === "off" || raw === "no") return false;
+  if (!args.streamingOk || args.layeredOrEffectRoute) return false;
+  if (args.outputFormat !== "mp4" && args.outputFormat !== "mov") return false;
+  if (raw === "true") return true;
+  return args.durationSeconds >= resolveSegmentedMinSeconds(args.env);
+}
+
+/** Worker sizing's Apple-GPU budget fits only frames written to disk by screenshot workers. */
+export function isAppleGpuDiskCapture(args: {
+  platform: NodeJS.Platform;
+  browserGpuMode: "software" | "hardware";
+  layered: boolean;
+  parallelStream: boolean;
+}): boolean {
+  return (
+    args.platform === "darwin" &&
+    args.browserGpuMode === "hardware" &&
+    !args.layered &&
+    !args.parallelStream
+  );
+}
+
 export function shouldStreamParallelCapture(args: {
-  /** HF_CAPTURE_PARALLEL_STREAM === "true" — kill switch, default OFF. */
+  /** Router switch for this render — see isCaptureParallelStreamRouterEnabled. */
   routerEnabled: boolean;
   workerCount: number;
   /** cfg.useDrawElement AFTER resolveConfig clamps. */
@@ -1495,10 +2950,55 @@ export function shouldStreamParallelCapture(args: {
     args.routerEnabled &&
     args.workerCount > 1 &&
     !args.useDrawElement &&
-    args.outputFormat === "mp4" &&
+    outputUsesH264Pipeline(args.outputFormat) &&
     args.streamingOk &&
     !args.layeredOrEffectRoute
   );
+}
+
+/**
+ * Default-on drawElement clamp: is this render's runtime self-verification
+ * net absent, so `useDrawElement` must fall back to the screenshot/beginframe
+ * baseline? The disk path and unverified parallel capture ship frames no
+ * drain verifies — see the call site's comment on why this clamp's own
+ * outcome is independent of running before or after
+ * {@link shouldStreamParallelCapture} in the caller. Pure; exported for tests.
+ */
+export function shouldClampDefaultDrawElement(args: {
+  useDrawElement: boolean;
+  /** PRODUCER_EXPERIMENTAL_FAST_CAPTURE === "true" — explicit opt-in always wins. */
+  fastCaptureExplicitOptIn: boolean;
+  useStreamingEncode: boolean;
+  workerCount: number;
+  /** (deParallelStreamForced || HF_DE_PARALLEL_STREAM === "true") &&
+   * useStreamingEncode && workerCount > 1 — the multi-worker streaming
+   * self-verification net is present. */
+  deParallelStreamVerified: boolean;
+}): boolean {
+  return (
+    args.useDrawElement &&
+    !args.fastCaptureExplicitOptIn &&
+    (!args.useStreamingEncode || args.workerCount > 1) &&
+    !args.deParallelStreamVerified
+  );
+}
+
+/**
+ * Calibration sizes a parallel render, and parallel workers capture by screenshot
+ * unless drawElement was opted into: measure that mode, without a drawElement init.
+ */
+export function calibrationCaptureConfig(
+  cfg: EngineConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): EngineConfig {
+  const parallelKeepsDrawElement = !shouldClampDefaultDrawElement({
+    useDrawElement: cfg.useDrawElement,
+    fastCaptureExplicitOptIn: env.PRODUCER_EXPERIMENTAL_FAST_CAPTURE === "true",
+    useStreamingEncode: true,
+    workerCount: 2,
+    deParallelStreamVerified: env.HF_DE_PARALLEL_STREAM === "true",
+  });
+  return parallelKeepsDrawElement ? cfg : { ...cfg, useDrawElement: false };
 }
 
 export function resolveCaptureForceScreenshotForPageSideCompositing(args: {
@@ -1515,48 +3015,59 @@ export function shouldDiscardProbeSessionForPageSideCompositing(args: {
   return args.hasProbeSession && args.usePageSideCompositing;
 }
 
+// Every published @hyperframes/shader-transitions build adds this canvas once its page-side compositor installs.
+const PAGE_SIDE_COMPOSITOR_CANVAS_ID = "__hf-page-side-compositor";
+
+/** Loads the page with the page-side stub and reports whether its shader-transitions build installed the compositor. */
+export async function pageInstallsShaderCompositor(
+  open: () => Promise<CaptureSession>,
+  session = { initializeSession, closeCaptureSession },
+): Promise<boolean> {
+  const probe = await open();
+  try {
+    await session.initializeSession(probe);
+    return await probe.page.evaluate(
+      (id) => document.getElementById(id) !== null,
+      PAGE_SIDE_COMPOSITOR_CANVAS_ID,
+    );
+  } finally {
+    await session.closeCaptureSession(probe);
+  }
+}
+
 /**
  * Main render pipeline
  */
 
-export function extractStandaloneEntryFromIndex(
-  indexHtml: string,
-  entryFile: string,
-  entryHtml?: string,
-): string | null {
-  const normalizedEntryFile = normalizeCompositionSrcPath(entryFile);
-  const { document } = parseHTML(indexHtml);
-  const body = document.querySelector("body");
-  if (!body) return null;
+/**
+ * Telemetry fields a drawElement self-verify failure contributes to the
+ * fallback record. Shared by the streaming and parallel-disk verify catches
+ * so the `verifyDetails` → `de_fallback_*` mapping lives in one place — a new
+ * field is added once, not once per capture path. `kind` is read structurally
+ * off the error (never from message text), so a reworded/translated/
+ * cross-module-serialized error can't flip "blank" into "psnr".
+ */
+function deVerifyFallbackTelemetry(err: unknown): {
+  reason: "psnr" | "blank";
+  failedDb?: number;
+  frameIndex?: number;
+  thresholdDb?: number;
+} {
+  const details = getDrawElementVerificationDetails(err);
+  return {
+    reason: details?.kind ?? "psnr",
+    failedDb: roundDb(details?.failedDb),
+    frameIndex: details?.frameIndex,
+    thresholdDb: roundDb(details?.verifyThresholdDb),
+  };
+}
 
-  // linkedom's querySelectorAll returns `any` on Document and `NodeList` on
-  // the ParentNode mixin. Neither types the elements as `Element`, so the
-  // cast is required to call getAttribute / hasAttribute without `any`.
-  const hosts = Array.from(document.querySelectorAll("[data-composition-src]")) as Element[];
-  const host = hosts.find(
-    (candidate) =>
-      normalizeCompositionSrcPath(candidate.getAttribute("data-composition-src") || "") ===
-      normalizedEntryFile,
-  );
-  if (!host) return null;
-
-  // linkedom's `children` is typed as `NodeList` (not `HTMLCollection<Element>`),
-  // so the Element[] cast is needed.
-  const root =
-    (Array.from(body.children) as Element[]).find((candidate) =>
-      candidate.hasAttribute("data-composition-id"),
-    ) ?? null;
-  if (!root) return null;
-
-  // The scene file is the source of truth for its own duration; fall back to the
-  // mount's data-duration (its window in the master timeline) when the scene
-  // file content isn't supplied.
-  const sceneDuration = readSceneRootDuration(entryHtml) ?? host.getAttribute("data-duration");
-
-  const renderClone = createStandaloneEntryRenderClone(root, host, sceneDuration);
-  replaceBodyWithRenderClone(body, renderClone);
-
-  return document.toString();
+/** Where `--debug` renders keep their work dirs, one per job id. */
+export function resolveRenderDebugDir(): string {
+  const producerRoot = process.env.PRODUCER_RENDERS_DIR
+    ? resolve(process.env.PRODUCER_RENDERS_DIR, "..")
+    : resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+  return join(producerRoot, ".debug");
 }
 
 /**
@@ -1575,17 +3086,19 @@ export async function executeRenderJob(
   outputPath: string,
   progressSink?: ProgressCallback,
   abortSignal?: AbortSignal,
+  assertRenderActive?: () => void,
 ): Promise<void> {
-  const moduleDir = dirname(fileURLToPath(import.meta.url));
-  const producerRoot = process.env.PRODUCER_RENDERS_DIR
-    ? resolve(process.env.PRODUCER_RENDERS_DIR, "..")
-    : resolve(moduleDir, "../..");
-  const debugDir = join(producerRoot, ".debug");
+  // Ahead of the work dir / log file / execution context: a config the format
+  // cannot honor must fail before anything is written to disk.
+  validateHlsRenderConfig(job.config);
+  validateDeliveryEncoderConfig(job.config);
+  validateChromaSubsamplingConfig(job.config);
+  const debugDir = resolveRenderDebugDir();
   const outputDir = dirname(outputPath);
   if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
   const workDir = job.config.debug
     ? join(debugDir, job.id)
-    : mkdtempSync(resolveRenderWorkDirPrefix(outputPath, job.id));
+    : createRenderWorkDir(resolveRenderWorkDirPrefix(outputPath, job.id), outputDir);
   const pipelineStart = Date.now();
   const baseLog = job.config.logger ?? defaultLogger;
   const logPath = job.config.debug ? join(workDir, "render.log") : null;
@@ -1599,7 +3112,7 @@ export async function executeRenderJob(
   execution.defer("remove workDir", () => {
     if (job.config.debug) return;
     if (job.status === "complete" && process.env.KEEP_TEMP === "1") {
-      log.info("KEEP_TEMP=1 — leaving workDir on disk for inspection", { workDir });
+      log.info("KEEP_TEMP=1, leaving workDir on disk for inspection", { workDir });
       return;
     }
     rmSync(workDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
@@ -1614,10 +3127,21 @@ export async function executeRenderJob(
       logPath,
       pipelineStart,
       execution,
+      assertRenderActive,
     });
   } finally {
     await execution.dispose();
   }
+}
+
+function loadResumeKeyOrWarn(resume: boolean, log: ProducerLogger): Buffer | null {
+  const key = segmentManifestKey();
+  if (resume && !key) {
+    log.warn(
+      "[Render] --resume: no preview token could be read or created, so every segment will be captured again",
+    );
+  }
+  return key;
 }
 
 async function executeRenderPipeline(input: {
@@ -1628,12 +3152,32 @@ async function executeRenderPipeline(input: {
   logPath: string | null;
   pipelineStart: number;
   execution: RenderExecutionContext;
+  assertRenderActive?: () => void;
 }): Promise<void> {
-  const { job, projectDir, outputPath, workDir, logPath, pipelineStart, execution } = input;
+  const {
+    job,
+    projectDir,
+    outputPath,
+    workDir,
+    logPath,
+    pipelineStart,
+    execution,
+    assertRenderActive,
+  } = input;
   const log = execution.logger;
   const eventPublisher = execution.events;
   const onProgress = execution.onProgress;
-  const executionSignal = execution.signal;
+  const tooSlow = new AbortController();
+  let tooSlowError: RenderTooSlowError | undefined;
+  // Frames are drawn while the audio mixes; a failed mix stops them and is the render's error.
+  const audioFailed = new AbortController();
+  let audioFailure: unknown;
+  let calibrationEvaluateTimedOut = false;
+  const executionSignal = AbortSignal.any([
+    audioFailed.signal,
+    ...(job.config.maxRenderMs ? [tooSlow.signal] : []),
+    ...(execution.signal ? [execution.signal] : []),
+  ]);
   let fileServer: FileServerHandle | null = null;
   let probeSession: CaptureSession | null = null;
   let lastBrowserConsole: string[] = [];
@@ -1643,6 +3187,8 @@ async function executeRenderPipeline(input: {
   let captureCompositionHeight: number | undefined;
   let captureTotalFrames: number | undefined;
   const perfStages: Record<string, number> = {};
+  // The audio mix runs while capture sets up; a failure in between still waits for it.
+  let pendingAudio: Promise<unknown> | undefined;
   const hdrDiagnostics: HdrDiagnostics = {
     videoExtractionFailures: 0,
     imageDecodeFailures: 0,
@@ -1656,16 +3202,31 @@ async function executeRenderPipeline(input: {
     renderJobId: job.id,
   });
   const outputFormat = job.config.format ?? ("mp4" as const);
-  const isWebm = outputFormat === "webm";
-  const isMov = outputFormat === "mov";
   const isPngSequence = outputFormat === "png-sequence";
   const isGif = outputFormat === "gif";
+  const isHls = outputFormat === "hls";
+  // Segment length and the matching GOP, resolved once. Both encoder paths
+  // spread the same `deliveryEncoder`, so they cannot disagree — a GOP that
+  // is not exactly `segmentSeconds × fps` frames silently produces
+  // variable-length segments instead of failing.
+  const hlsSegmentSeconds = isHls ? resolveHlsSegmentSeconds(job.config) : undefined;
+  const deliveryEncoder = resolveDeliveryEncoderOptions({
+    format: outputFormat,
+    fps: job.config.fps,
+    hlsSegmentSeconds: job.config.hlsSegmentSeconds,
+    keyframeIntervalSeconds: job.config.keyframeIntervalSeconds,
+    maxBitrate: job.config.maxBitrate,
+    bufferSize: job.config.bufferSize,
+  });
   const artifactTransaction = new ArtifactTransaction(
     outputPath,
-    isPngSequence ? "directory" : "file",
+    isPngSequence || isHls ? "directory" : "file",
+    undefined,
+    undefined,
+    log,
   );
   const stagedOutputPath = artifactTransaction.stagingPath;
-  const needsAlpha = isWebm || isMov || isPngSequence;
+  const needsAlpha = outputNeedsAlpha(outputFormat);
   // `forceScreenshot` is resolved exactly once inside `compileStage` (alpha
   // output + composition `renderModeHints` are folded together there) and
   // returned on `compileResult.forceScreenshot`. The sequencer stores it
@@ -1677,7 +3238,7 @@ async function executeRenderPipeline(input: {
   const chunkedEncodeSize = cfg.chunkSizeFrames;
   const captureObservability: RenderCaptureObservability = {
     forceScreenshot: Boolean(cfg.forceScreenshot),
-    captureMode: cfg.forceScreenshot ? "screenshot" : "beginframe",
+    captureMode: resolveObservedCaptureMode(Boolean(cfg.forceScreenshot)),
     browserGpuMode: cfg.browserGpuMode,
     protocolTimeoutMs: cfg.protocolTimeout,
     pageNavigationTimeoutMs: cfg.pageNavigationTimeout,
@@ -1685,12 +3246,7 @@ async function executeRenderPipeline(input: {
   };
   let extractionObservability: RenderExtractionObservability | undefined;
   let compositionHash: string | undefined;
-  const updateCaptureObservability = (patch: Partial<RenderCaptureObservability>): void => {
-    Object.assign(captureObservability, patch);
-    captureObservability.captureMode = captureObservability.forceScreenshot
-      ? "screenshot"
-      : "beginframe";
-  };
+  const updateCaptureObservability = createCaptureObservabilityUpdater(captureObservability);
   // Function-scoped (not inside the try) so both the success path AND the catch
   // can read it — the catch records transient-retry burn on renders that still
   // failed, which is the more actionable signal for tuning the retry cap.
@@ -1773,50 +3329,22 @@ async function executeRenderPipeline(input: {
     });
 
     const entryFile = job.config.entryFile || "index.html";
-    let htmlPath = join(projectDir, entryFile);
+    const htmlPath = join(projectDir, entryFile);
     if (!existsSync(htmlPath)) {
       throw new Error(`Entry file not found: ${htmlPath}`);
     }
     assertNotAborted();
 
-    // If entryFile is a sub-composition (<template> wrapper), reuse the real
-    // index.html shell and isolate the matching host instead of fabricating
-    // a new standalone document.
-    const rawEntry = readFileSync(htmlPath, "utf-8");
-    if (entryFile !== "index.html" && rawEntry.trimStart().startsWith("<template")) {
-      const wrapperPath = join(workDir, "standalone-entry.html");
-      const projectIndexPath = join(projectDir, "index.html");
-      if (!existsSync(projectIndexPath)) {
-        throw new Error(
-          `Template entry file "${entryFile}" requires a project index.html to extract its render shell.`,
-        );
-      }
-      const standaloneHtml = extractStandaloneEntryFromIndex(
-        readFileSync(projectIndexPath, "utf-8"),
-        entryFile,
-        rawEntry,
-      );
-      if (!standaloneHtml) {
-        throw new Error(
-          `Entry file "${entryFile}" is not mounted from index.html via data-composition-src, so it cannot be rendered independently.`,
-        );
-      }
-      writeFileSync(wrapperPath, standaloneHtml, "utf-8");
-      htmlPath = wrapperPath;
-      log.info("Extracted standalone entry from index.html host context", {
-        entryFile,
-      });
-    }
-
     // ── Stage 1: Compile ─────────────────────────────────────────────────
     const stage1Start = Date.now();
-    updateJobStatus(job, "preprocessing", "Compiling composition", 5, onProgress);
+    updateJobStatus(job, "preprocessing", "Compiling composition", 5, onProgress, {
+      code: "compile",
+    });
 
     const compileResult = await observeRenderStage(observability, "compile", { needsAlpha }, () =>
       runCompileStage({
         projectDir,
         workDir,
-        htmlPath,
         entryFile,
         job,
         cfg,
@@ -1824,6 +3352,7 @@ async function executeRenderPipeline(input: {
         log,
         assertNotAborted,
         variables: job.config.variables,
+        pageMotionBlur: job.config.pageMotionBlur,
       }),
     );
     let compiled = compileResult.compiled;
@@ -1847,7 +3376,24 @@ async function executeRenderPipeline(input: {
     // drawElement release telemetry: why default DE disengaged (if it did),
     // whether self-verify fell back, and the drain-side counters.
     const deCompileGate = compileResult.deCompileGate;
-    let deClampReason: string | undefined;
+    // Seed with the CONFIG-TIME refusal, if there was one. The clamp further
+    // down only runs `if (cfg.useDrawElement && ...)`, so a render that never
+    // became a drawElement candidate at all could never acquire a reason —
+    // it reached telemetry with every DE field empty and landed in the
+    // dashboard's `other` bucket (56,507 renders / 14d, second-largest bar on
+    // "Why not drawElement", explaining nothing). Re-derived from the same
+    // inputs `resolveConfig` used, so it cannot disagree with the decision.
+    // Later clamps overwrite this: a more specific reason always wins.
+    let deClampReason = initialDeClampReason({
+      useDrawElement: cfg.useDrawElement,
+      deCompileGate,
+      config: {
+        platform: process.platform,
+        browserGpuMode: cfg.browserGpuMode,
+        workerEncode: cfg.enableDrawElementWorkerEncode,
+        chromeCeiling: chromeMajorCeiling(),
+      },
+    });
     // "inverted" = fired and held; "reverted" = fired but the self-verify
     // retry rolled back to the parallel path; undefined = never fired.
     let deWorkerInversion: "inverted" | "reverted" | undefined;
@@ -1910,7 +3456,7 @@ async function executeRenderPipeline(input: {
       captureForceScreenshot = true;
       updateCaptureObservability({ forceScreenshot: captureForceScreenshot });
       log.info(
-        "[Render] Low-memory render profile active — " +
+        "[Render] Low-memory render profile active: " +
           "screenshot capture, auto-worker calibration skipped" +
           (job.config.workers === undefined ? ", pinned to 1 worker" : "") +
           ". Override with --no-low-memory-mode or PRODUCER_LOW_MEMORY_MODE=false.",
@@ -1943,6 +3489,18 @@ async function executeRenderPipeline(input: {
       updateCaptureObservability({ protocolTimeoutMs: scaledProtocolTimeout });
     }
 
+    const recordReferenceBackground = createReferenceBackgroundRecorder((result) =>
+      Object.assign(job, result),
+    );
+    const subTimelineWaitMemo: SubTimelineWaitMemo = {};
+    const staticDedupMemo: StaticDedupMemo = {};
+    // Only a video larger than the canvas can be extracted smaller; the probe page then measures where it is drawn.
+    const largerThanCanvas = await oversizedVideos(
+      composition.videos,
+      projectDir,
+      join(workDir, "compiled"),
+      { width: outputWidth, height: outputHeight },
+    );
     const probeResult = await observeRenderStage(
       observability,
       "browser_probe",
@@ -1951,17 +3509,22 @@ async function executeRenderPipeline(input: {
         runProbeStage({
           projectDir,
           workDir,
+          measuresShownBoxes: largerThanCanvas.length > 0,
           job,
           cfg,
           forceScreenshot: captureForceScreenshot,
           log,
           assertNotAborted,
+          abortSignal: executionSignal,
           compiled,
           composition,
           width,
           height,
           needsAlpha,
           deviceScaleFactor,
+          subTimelineWaitMemo,
+          staticDedupMemo,
+          recordReferenceBackground,
         }),
       // Browser probe is pre-capture; report `browser calibrating` so a
       // slow probe (~64s SwiftShader warm-up on Windows was the reported
@@ -1972,6 +3535,7 @@ async function executeRenderPipeline(input: {
     compositionHash = computeCompositionObservabilityHash(compiled.html);
     fileServer = probeResult.fileServer;
     probeSession = probeResult.probeSession;
+    job.strictVariablesChecked = probeResult.strictVariablesChecked;
     lastBrowserConsole = probeResult.lastBrowserConsole;
     let resolvedCaptureBeyondViewport = probeSession?.options.captureBeyondViewport;
     if (resolvedCaptureBeyondViewport !== undefined) {
@@ -1988,6 +3552,17 @@ async function executeRenderPipeline(input: {
       totalFrames,
       fps: fpsToNumber(job.config.fps),
     });
+    // Before the video layer may close the probe page; no box means full size, as before.
+    const shownBoxes =
+      largerThanCanvas.length > 0 && probeSession?.isInitialized
+        ? await measureLocalShownBoxes(
+            probeSession.page,
+            largerThanCanvas,
+            job.config.fps,
+            probeResult.duration,
+            log,
+          )
+        : undefined;
 
     perfStages.browserProbeMs = probeResult.browserProbeMs;
     perfStages.compileMs = Date.now() - stage1Start;
@@ -2001,15 +3576,95 @@ async function executeRenderPipeline(input: {
     }
     observability.checkpoint("browser_probe", "duration resolved", {
       durationSeconds: probeResult.duration,
+      lengthFrom: probeResult.lengthSource?.from ?? null,
+      ...(probeResult.lengthSource?.from === "media"
+        ? {
+            lengthTag: probeResult.lengthSource.tag,
+            lengthTrimmed: probeResult.lengthSource.trimmed,
+            lengthSrcHash: probeResult.lengthSource.srcHash,
+          }
+        : {}),
       totalFrames,
       compositionHash,
       beginFrameStalled: probeResult.beginFrameStalled,
     });
 
+    // Opt-in: one full-canvas video is composited by ffmpeg instead of injected frame by frame.
+    let videoLayerPlan: VideoLayerPlan | undefined;
+    if (cfg.videoLayerPassthrough) {
+      const gates = {
+        mp4: outputFormat === "mp4",
+        software_encode: !job.config.useGpu,
+        opaque_output: !needsAlpha,
+        sdr:
+          rendersSdrOnly(job.config, composition) ||
+          ((job.config.hdrMode === undefined || job.config.hdrMode === "auto") &&
+            composition.images.length === 0),
+        streaming: shouldUseStreamingEncode(cfg, outputFormat, 1, probeResult.duration),
+        probe_page: probeSession?.isInitialized === true,
+      };
+      const failed = Object.entries(gates).find(([, ok]) => !ok)?.[0];
+      if (failed || !probeSession) {
+        log.info(`[Render] Video layer passthrough off: ${failed ?? "probe_page"}`);
+      } else {
+        videoLayerPlan = await planVideoLayerPassthrough({
+          videos: composition.videos,
+          duration: probeResult.duration,
+          fps: job.config.fps,
+          canvas: { width, height },
+          page: probeSession.page,
+          projectDir,
+          compiledDir: join(workDir, "compiled"),
+        });
+        if (videoLayerPlan.videoId === undefined) {
+          log.info(`[Render] Video layer passthrough off: ${videoLayerPlan.reason}`);
+        } else {
+          cfg.useDrawElement = false;
+          cfg.forceScreenshot = true;
+          captureForceScreenshot = true;
+          // The probe page was opened for plain JPEG capture; capture needs a transparent PNG session.
+          const opened = probeSession;
+          probeSession = null;
+          await closeCaptureSession(opened);
+        }
+      }
+    }
+    const videoLayer = videoLayerPlan?.videoId === undefined ? undefined : videoLayerPlan;
+
     // ── Stage 2: Video frame extraction ─────────────────────────────────
-    updateJobStatus(job, "preprocessing", "Extracting video frames", 10, onProgress);
+    updateJobStatus(job, "preprocessing", "Extracting video frames", 10, onProgress, {
+      code: "extract_video",
+    });
 
     const compiledDir = join(workDir, "compiled");
+    // Settled before extraction, from what is known then. HDR content, which turns a
+    // segmented render into a layered one, only shows up once the videos are probed;
+    // the final plan is checked against this below.
+    const segmentsCapture = (layeredOrEffectRoute: boolean): boolean =>
+      shouldSegmentCapture({
+        env: process.env,
+        durationSeconds: probeResult.duration,
+        outputFormat,
+        layeredOrEffectRoute,
+        streamingOk: shouldUseStreamingEncode(cfg, outputFormat, 1, probeResult.duration),
+      });
+    // A blur sample at a clip's edge shows a source frame the output frames do not, and a window
+    // holds only the frames the output frames show (videoFrameInjector.ts, `heldVideoTime`).
+    const segmentedForWindow = segmentsCapture(compiled.hasShaderTransitions);
+    const windowVideoFrames =
+      job.config.motionBlur === undefined &&
+      shouldWindowVideoFrames({ env: process.env, segmented: segmentedForWindow });
+    if (!windowVideoFrames && shouldWindowVideoFrames({ env: process.env, segmented: true })) {
+      const reason =
+        job.config.motionBlur !== undefined
+          ? "motion blur"
+          : outputFormat !== "mp4" && outputFormat !== "mov"
+            ? `${outputFormat} output`
+            : "capture is not segmented";
+      log.info("[Render] HF_VIDEO_FRAME_WINDOW is set but this render extracts every frame", {
+        reason,
+      });
+    }
     const extractResult = await observeRenderStage(
       observability,
       "video_extract",
@@ -2022,11 +3677,15 @@ async function executeRenderPipeline(input: {
           cfg,
           log,
           composition,
+          skipFrameExtractionIds: videoLayer ? [videoLayer.videoId] : [],
+          audioDownloadDir: audioWorkDir(workDir),
           abortSignal: executionSignal,
           assertNotAborted,
-          // Copy (don't symlink) extracted frames on Windows — symlinkSync throws
-          // EPERM there without Developer Mode/admin, which failed local renders.
-          materializeSymlinks: shouldCopyExtractedFrames(process.platform),
+          // Local staging can use links; distributed plan() alone requires real copies.
+          materializeSymlinks: false,
+          deferRangeExtraction: windowVideoFrames ? true : undefined,
+          shownBoxes,
+          onProgress,
         }),
     );
     const {
@@ -2040,6 +3699,7 @@ async function executeRenderPipeline(input: {
       imageTransfers,
       hdrImageSrcPaths,
       imageColorSpaces,
+      failureToEnforce,
     } = extractResult;
     perfStages.videoExtractMs = extractResult.videoExtractMs;
 
@@ -2051,11 +3711,7 @@ async function executeRenderPipeline(input: {
     // Also count authored `[data-start]` clip windows as a coarse proxy
     // for the ts=1784144554 authored-clip-count-scaled failure shape.
     const coverageReports: VideoFrameCoverageReport[] = extractionResult
-      ? computeVideoFrameCoverage(
-          composition.videos,
-          extractionResult.extracted,
-          fpsToNumber(job.config.fps),
-        )
+      ? computeVideoFrameCoverage(composition.videos, extractionResult.extracted, job.config.fps)
       : [];
     const coverageThreshold = resolveVideoCoverageThreshold();
     const authoredTimedClipCount = countAuthoredTimedClips(compiled.html);
@@ -2075,9 +3731,11 @@ async function executeRenderPipeline(input: {
       vfrPreflightMs: extractionObservability.vfrPreflightMs ?? null,
       cacheHits: extractionObservability.cacheHits ?? null,
       cacheMisses: extractionObservability.cacheMisses ?? null,
+      transientRetries: extractionObservability.transientRetries ?? null,
       minVideoFrameCoverageRatio: extractionObservability.minVideoFrameCoverageRatio ?? null,
       authoredTimedClipCount: extractionObservability.authoredTimedClipCount ?? null,
     });
+    if (failureToEnforce) throw failureToEnforce;
     // Gate AFTER the checkpoint so a coverage-failed render still emits
     // the observability row (partial telemetry is still worth having).
     // `assertVideoFrameCoverage` no-ops on an empty report list AND on a
@@ -2086,11 +3744,19 @@ async function executeRenderPipeline(input: {
     assertVideoFrameCoverage(coverageReports, coverageThreshold);
 
     // ── HDR auto-detection ──────────────────────────────────────────────
+    const autoPromotionTrigger = findRenderHdrAutoPromotionTrigger({
+      extractionResult,
+      videos: composition.videos,
+      images: composition.images,
+      nativeHdrImageIds,
+    });
     const effectiveHdr = resolveEffectiveHdrMode({
       hdrMode: job.config.hdrMode,
+      media: composition,
       outputFormat,
       extractionResult,
       imageColorSpaces,
+      autoPromotionTrigger,
       log,
     });
     observability.checkpoint("hdr_detection", "resolved", {
@@ -2101,9 +3767,12 @@ async function executeRenderPipeline(input: {
     });
 
     // ── Stage 3: Audio processing ───────────────────────────────────────
-    updateJobStatus(job, "preprocessing", "Processing audio tracks", 20, onProgress);
+    updateJobStatus(job, "preprocessing", AUDIO_STAGE, 20, onProgress, {
+      code: "process_audio",
+    });
 
-    const audioResult = await observeRenderStage(
+    const audioWait = audioWaitReporter(job, onProgress);
+    const audioStage = observeRenderStage(
       observability,
       "audio_process",
       { audioCount: composition.audios.length },
@@ -2112,31 +3781,30 @@ async function executeRenderPipeline(input: {
           projectDir,
           workDir,
           compiledDir,
-          duration: probeResult.duration,
+          totalFrames: probeResult.totalFrames,
+          fps: job.config.fps,
+          ffmpegProcessTimeout: cfg.ffmpegProcessTimeout,
+          audioGain: cfg.audioGain,
           audios: composition.audios,
+          masterFxChain: composition.masterFxChain,
+          allowOutsideProjectAssets: job.config.allowOutsideProjectAssets,
           abortSignal: executionSignal,
           assertNotAborted,
+          log,
+          keepDeliverySource: true,
+          onFfmpegProgress: audioWait.progressed,
         }),
     );
-    const { audioOutputPath, hasAudio } = audioResult;
-    perfStages.audioProcessMs = audioResult.audioProcessMs;
-    if (audioResult.audioError) {
-      applyRenderWarningPolicy(
-        job,
-        [
-          {
-            code: "audio_processing_failed",
-            message: `Audio mix failed; output would be video-only: ${audioResult.audioError}`,
-            details: { mediaType: "audio" },
-          },
-        ],
-        log,
-      );
-    }
+    pendingAudio = audioStage.catch(() => undefined);
 
     // ── Stage 4: Frame capture ──────────────────────────────────────────
     const stage4Start = Date.now();
-    updateJobStatus(job, "rendering", "Starting frame capture", 25, onProgress);
+    const EFFECT_SCAN_STAGE = "Checking effects";
+    const startingFrameCapture = () =>
+      updateJobStatus(job, "rendering", "Starting frame capture", 25, onProgress, {
+        code: "start_browsers",
+      });
+    startingFrameCapture();
 
     // Start file server (may already be running from duration discovery).
     // The page-side compositing stub is injected later (after hasHdrContent
@@ -2150,6 +3818,8 @@ async function executeRenderPipeline(input: {
           port: 0,
           preHeadScripts: [VIRTUAL_TIME_SHIM],
           fps: job.config.fps,
+          allowOutsideProjectAssets: job.config.allowOutsideProjectAssets,
+          includeOutsideScripts: job.config.includeOutsideScripts,
         });
         assertNotAborted();
         observability.stageEnd("file_server", fileServerStart);
@@ -2168,10 +3838,14 @@ async function executeRenderPipeline(input: {
     const framesDir = join(workDir, "captured-frames");
     if (!existsSync(framesDir)) mkdirSync(framesDir, { recursive: true });
 
+    updateJobStatus(job, "rendering", "Checking browser GPU", 25, onProgress, {
+      code: "start_browsers",
+    });
     const resolvedBrowserGpuMode = await resolveBrowserGpuMode(cfg.browserGpuMode, {
       chromePath: resolveHeadlessShellPath(cfg),
       browserTimeout: cfg.browserTimeout,
     });
+    startingFrameCapture();
     // Apply the software-GPU→screenshot clamp to the AUTHORITATIVE local
     // `captureForceScreenshot` (not just the observability copy) so all
     // downstream strategy + telemetry code reads the corrected value.
@@ -2196,14 +3870,34 @@ async function executeRenderPipeline(input: {
     });
     const videoCaptureBeyondViewport = resolveVideoCaptureBeyondViewport(composition.videos.length);
 
+    const captureSurface = resolveCaptureSurface(
+      {
+        needsAlpha,
+        motionBlur: job.config.motionBlur,
+        chromaSubsampling: job.config.chromaSubsampling,
+      },
+      job.config.quality,
+    );
+    if (job.config.chromaSubsampling === "444") {
+      log.info("[Render] Capture: png (chromaSubsampling 444, lossless)");
+    }
     const captureOptions: CaptureOptions = {
       width,
       height,
       fps: job.config.fps,
-      format: needsAlpha ? "png" : "jpeg",
-      quality: needsAlpha ? undefined : job.config.quality === "draft" ? 80 : 95,
+      ...captureSurface,
+      ...(videoLayer
+        ? {
+            format: "png",
+            quality: undefined,
+            transparent: true,
+            hiddenElementIds: [videoLayer.videoId],
+          }
+        : {}),
       variables: job.config.variables,
       deviceScaleFactor,
+      motionBlur: job.config.motionBlur,
+      pageMotionBlur: job.config.pageMotionBlur,
       ...(videoCaptureBeyondViewport !== undefined
         ? { captureBeyondViewport: videoCaptureBeyondViewport }
         : {}),
@@ -2222,49 +3916,111 @@ async function executeRenderPipeline(input: {
     // aspect ratio stay stable before the first injected frame. Native HDR
     // videos are included for the same reason: Chrome may not decode them at
     // all, while the renderer composites their extracted frames separately.
+    // Set once the route is known (HDR just below, layered after page-side compositing is decided).
+    let routePageMotionBlur: CaptureOptions["pageMotionBlur"];
     const buildCaptureOptions = (): CaptureOptions => ({
       ...captureOptions,
+      recordReferenceBackground,
+      ...(routePageMotionBlur ? { pageMotionBlur: routePageMotionBlur } : {}),
       videoMetadataHints,
       skipReadinessVideoIds: videoReadinessSkipIds,
+      subTimelineWaitMemo,
+      staticDedupMemo,
+      compositionHash,
+      onStaticDedupActivity: () => noteStaticDedupActivity(job),
       // Probe-resolved duration: drawElement self-verification derives its
       // sample frame indices from this so they land inside the drained range.
       compositionDurationSeconds: job.duration,
+      deFrameFallback: true,
+      // A line per scanned chunk, so a long effect scan reads as preparing, not as a stall.
+      onEffectScanProgress: (scanned, total) =>
+        updateJobStatus(
+          job,
+          "rendering",
+          `${EFFECT_SCAN_STAGE}, ${scanned} of ${total} frames`,
+          25,
+          onProgress,
+        ),
+      onEffectScanEnd: () => {
+        if (job.currentStage.startsWith(EFFECT_SCAN_STAGE)) startingFrameCapture();
+      },
+      requiresWebGpu: compositionRequiresWebGpu(compiled.html),
+      // Live route for Chrome memory (spec §5 Phase −1). The aggregate route
+      // through CapturePerfSummary only exists on success; a mid-capture
+      // target loss never builds one, and that is the case this telemetry is
+      // for. With parallel workers each session reports through the same
+      // callback, so the record holds the most recent session's stats.
+      onMemorySample: (stats) => {
+        updateCaptureObservability({
+          chromeBrowserRssPeakMb: stats.browserRssPeakMb,
+          chromeRendererRssPeakMb: stats.rendererRssPeakMb,
+          chromeRssLastMb: stats.rssLastMb,
+          chromeGpuProcessSeenLastSample: stats.gpuProcessSeenLastSample,
+          chromeMemorySamples: stats.samples,
+        });
+      },
     });
-    // The URL-served frame path (PR #596) hands each injected `<img>` a
-    // fileServer URL instead of a base64 data URI, on the theory that
-    // shipping a short URL through `page.evaluate` beats shipping a
-    // multi-MB base64 string per frame. That holds when the fileServer
-    // is otherwise idle — but on video-heavy compositions, the same
-    // fileServer also serves every `<video>.src`. The runtime's
-    // drift-recovery branch (`runtime/media.ts:294-302`) issues
-    // `el.load()` on the underlying `<video>` during seeks, kicking off
-    // full-file downloads that occupy the fileServer's single Node
-    // event loop (it uses `readFileSync` and offers no `Accept-Ranges`).
-    // The injector's `<img>.decode()` then queues behind those video
-    // fetches and is never serviced before puppeteer's protocol timeout
-    // fires (`Runtime.callFunctionOn timed out`).
-    //
-    // Repro: synth 30 × 32 MB videos / 90 s comp on an 8-core / 30 GB
-    // host = 537 s wall (broken corpus) / 428 s (corpus-fixed), every
-    // render fails. Disabling the resolver (force base64-inline) gives
-    // 1:59 (119 s) wall and a clean MP4 on the same comp, with no
-    // regression on the 30 × 1.6 MB control corpus (137 s vs 135 s
-    // baseline).
-    //
-    // Until this is properly gated (e.g. only enable URL-served when the
-    // page has zero fileServer-bound `<video>.src` traffic), the inline
-    // path is the safe default. The cache memory ceiling
-    // (`frameDataUriCacheBytesLimitMb`, default 1500 MB above 8 GB
-    // hosts) already bounds the cost. `createCompiledFrameSrcResolver`
-    // and the `frameSrcResolver` option remain in their respective
-    // modules (`packages/producer/src/services/render/shared.ts`,
-    // `packages/engine/src/services/videoFrameInjector.ts`); the gating
-    // PR will re-import the builder here.
-    const createRenderVideoFrameInjector = (): BeforeCaptureHook | null =>
-      createVideoFrameInjector(frameLookup, {
-        frameDataUriCacheLimit: cfg.frameDataUriCacheLimit,
-        frameDataUriCacheBytesLimitMb: cfg.frameDataUriCacheBytesLimitMb,
+    const buildPrepCaptureOptions = () => stopPrepSessionOnScriptFailure(buildCaptureOptions());
+    const buildWorkerCaptureOptions = () => withScriptFailureStop(buildCaptureOptions(), job, log);
+    // The engine delivers cached frame bytes as no-store CDP responses.
+    // Frame requests bypass the file server's source-video downloads, which
+    // can occupy all HTTP connections during native-video drift recovery.
+    // The byte ceiling bounds the Node LRU; Chrome receives short URLs so
+    // its resource cache does not retain the corresponding inline strings.
+    // True while some video's frames are still to be read per segment.
+    let videoFrameWindow =
+      windowVideoFrames &&
+      (extractionResult?.extracted.some((video) => video.deferredRange) ?? false);
+    if (windowVideoFrames) {
+      const extracted = extractionResult?.extracted ?? [];
+      log.info("[Render] Video frame window", {
+        windowed: extracted.filter((video) => video.deferredRange).length,
+        fullyExtracted: extracted.filter((video) => !video.deferredRange).length,
       });
+    }
+    const buildSegmentVideoFrames = () =>
+      trackSegmentFramePeak(
+        createSegmentVideoFrames({
+          videos: composition.videos,
+          extracted: extractionResult?.extracted ?? [],
+          fps: job.config.fps,
+          rootDir: workDir,
+          cfg,
+          injectorOptions: frameCacheOptions(cfg, workerCount),
+          abortSignal: executionSignal,
+          shownBoxes,
+        }),
+        workDir,
+        (bytes) => updateCaptureObservability({ videoFrameWindowPeakBytes: bytes }),
+      );
+    const createRenderVideoFrameInjector = (): BeforeCaptureHook | null =>
+      createVideoFrameInjector(frameLookup, frameCacheOptions(cfg, workerCount));
+    // Every route but the segmented one reads whole videos, so it needs the frames a window would have held back.
+    const extractDeferredVideoFrames = async (): Promise<void> => {
+      videoFrameWindow = false;
+      updateCaptureObservability({ videoFrameWindow: "off" });
+      const extracted = extractionResult?.extracted ?? [];
+      const videoCount = extracted.filter((video) => video.deferredRange).length;
+      const startedAt = Date.now();
+      log.info("[Render] Extracting the frames of the videos a window would have held back", {
+        videoCount,
+      });
+      await observeRenderStage(observability, "video_extract_deferred", { videoCount }, () =>
+        extractAllDeferredFrames(extracted, {
+          fps: job.config.fps,
+          cfg,
+          shownBoxes,
+          signal: executionSignal,
+          maxTransientRetries: resolveVideoExtractionPolicy().maxTransientRetries,
+          onProgress: (done, total) => reportExtractProgress(job, done, total, onProgress),
+        }),
+      );
+      assertNotAborted();
+      log.info("[Render] Extracted the deferred video frames", {
+        videoCount,
+        elapsedMs: Date.now() - startedAt,
+      });
+    };
 
     let captureCalibration:
       | {
@@ -2284,24 +4040,84 @@ async function executeRenderPipeline(input: {
     // comps that route to the layered/HDR paths.)
     const nativeHdrIds = new Set([...nativeHdrVideoIds, ...nativeHdrImageIds]);
     const hasHdrContent = Boolean(effectiveHdr && nativeHdrIds.size > 0);
+    assertChromaSubsamplingSdr(job.config, hasHdrContent);
+    if (hasHdrContent) assertOutputScaleSupported(deviceScaleFactor, "hdr_layered");
+    routePageMotionBlur = pageMotionBlurForRoute({ hasHdrContent, useLayeredComposite: false });
     // DE priority inversion eligibility — evaluated BEFORE capture calibration
     // because when every multi-worker resolution would be inverted to 1 anyway,
     // the calibration stage (a throwaway Chrome launch + timeline-spread sample
     // captures, seconds of wall clock) buys nothing and is skipped.
-    // Threshold override: HF_DE_SINGLE_MIN_FRAMES (0 disables the inversion;
-    // a set-but-empty var falls back to the default, it is NOT the kill switch).
-    const deSingleMinFramesRaw = process.env.HF_DE_SINGLE_MIN_FRAMES;
-    const deSingleMinFramesNum =
-      deSingleMinFramesRaw === undefined || deSingleMinFramesRaw.trim() === ""
-        ? 900
-        : Number(deSingleMinFramesRaw);
-    const deSingleMinFrames = Number.isFinite(deSingleMinFramesNum) ? deSingleMinFramesNum : 900;
+    const deSingleMinFrames = resolveDeSingleMinFrames(process.env);
+    // Short-comp band: 31% of fleet renders (24h, 0.7.78+) are DE-eligible
+    // comps clamped to parallel screenshot purely because they sit under this
+    // floor. A controlled sweep (fixed synthetic content, {250,400,600,900}f,
+    // single-DE vs parallel-screenshot-W4, 3 reps, capture modes verified per
+    // run) showed single-DE winning 1.16-1.24x at EVERY size — but only for
+    // content in constant motion. A follow-up 2x2 (movers x static DOM nodes)
+    // found the two variables pull in opposite directions: motion favours DE,
+    // DOM size punishes it, and DE's wall-clock scales ~0.50ms/node against
+    // parallel screenshot's ~0.22ms (drawElement repaints the whole tree per
+    // frame; fan-out amortizes it). At 24 movers / 400f the measured curve is
+    // +5% for DE at 0 nodes, -4% at 7k, -41% at 20k, -80% at 40k — crossover
+    // near ~3.9k. Since motion only ever helps DE, a node ceiling calibrated
+    // at the LOWEST-motion case is safe for every motion level, so the short
+    // band opens only below `deShortBandMaxElements`. Above it the
+    // HF_DE_SINGLE_MIN_FRAMES floor stands (off by default).
+    const deShortBandMinFrames = envInt("HF_DE_SHORT_MIN_FRAMES", 250);
+    const deShortBandMaxElements = envInt("HF_DE_SHORT_MAX_ELEMENTS", 2500);
+    // `source` is load-bearing, not diagnostic: the probe is CONDITIONAL
+    // (probeStage's `needsBrowser` — unknown duration, unresolved
+    // compositions, or specific media cases), so a known-duration media-free
+    // comp that builds its DOM in script has no live count available and the
+    // static scan reads it as tiny. Only a `live` count may open the band.
+    const {
+      count: compositionElementCount,
+      source: compositionElementCountSource,
+      byTag: compositionElementTags,
+      arollVideoCount,
+      heygenVideoCount,
+      audioCount,
+      imageCount,
+      subCompositionCount,
+      audioGroupCount,
+      colorGradingCount,
+      hasLut,
+      rootBodyMismatch,
+      rootBodyDeltaPxBucket,
+      vfxHostCount,
+      vfxCapture,
+      vfxTypes,
+    } = await resolveCompositionElementCount(probeSession, compiled.html, log);
+    const adaptersUsed = await resolveAdaptersUsed(probeSession, compiled.html, log);
+    // HF_DE_SHORT_MAX_ELEMENTS=0 is the documented kill switch (symmetric
+    // with HF_DE_SHORT_MIN_FRAMES=0, which disables via the predicate's own
+    // minFrames > 0 guard). Gated explicitly here too — without it, a fired
+    // max-elements kill switch left every in-band render decisive against a
+    // real floor comparison, so it reported "skipped_elements" (comp too
+    // large) instead of undefined (band disabled), corrupting the DiD
+    // control cohort with kill-switched renders (review finding).
+    const deShortBandEnabled = deShortBandMaxElements > 0;
+    const deShortBandOpen =
+      deShortBandEnabled &&
+      deShortBandMinFrames > 0 &&
+      compositionElementCountSource === "live" &&
+      compositionElementCount <= deShortBandMaxElements;
+    // Baseline-first sequencing: this release EVALUATES the band on every
+    // render and emits the decision, but only routes on it when
+    // HF_DE_SHORT_BAND_ROUTE=true (flipped by default in a follow-up release).
+    // The point is a difference-in-differences read: the cohort selector
+    // (`de_short_band`) is computed identically before and after the flip —
+    // "applied" is counterfactual in the baseline release and factual after —
+    // and the skipped/oversize renders in the same frame band form a
+    // concurrent control that absorbs secular drift (content mix, version-
+    // correlated populations, hardware). A plain before/after cannot
+    // attribute a fleet perf shift to this change; this can.
+    const deShortBandRoute = process.env.HF_DE_SHORT_BAND_ROUTE === "true";
     // "Would ANY multi-worker resolution be inverted?" — if workers resolve
     // to 1 naturally the outcome is identical either way.
     const WOULD_RESOLVE_MULTI_WORKER = 2;
-    const deInversionEligible = shouldPreferSingleWorkerDrawElement({
+    const deInversionArgs = {
       workerCount: WOULD_RESOLVE_MULTI_WORKER,
-      requestedWorkers: job.config.workers,
       useDrawElement: cfg.useDrawElement,
       deCompileGate,
       forceScreenshot: captureForceScreenshot,
@@ -2310,29 +4126,75 @@ async function executeRenderPipeline(input: {
       minFrames: deSingleMinFrames,
       singleWorkerStreamingOk: shouldUseStreamingEncode(cfg, outputFormat, 1, job.duration),
       layeredOrEffectRoute: hasHdrContent || compiled.hasShaderTransitions,
-      supersampling: deviceScaleFactor > 1,
-      probeDeGated:
-        probeSession !== null &&
-        probeSession.captureMode !== "drawelement" &&
-        !probeSession.deInitDeferred,
+      supersampling: deviceScaleFactor !== 1,
+      probeDeGated: isProbeDeGated(probeSession),
       experimentalParallelDeOptIn:
         process.env.PRODUCER_EXPERIMENTAL_FAST_CAPTURE === "true" ||
         // Verified parallel DE streaming (opt-in) wants its parallelism kept.
         process.env.HF_DE_PARALLEL_STREAM === "true",
+    };
+    const invertAtBaseFloor = shouldPreferSingleWorkerDrawElement(deInversionArgs);
+    // Same render, same eligibility, band floor instead of 900. Math.min so a
+    // user override of HF_DE_SINGLE_MIN_FRAMES below the band floor keeps
+    // winning; HF_DE_SHORT_MIN_FRAMES=0 disables via the predicate's own
+    // minFrames > 0 check.
+    const invertAtBandFloor = shouldPreferSingleWorkerDrawElement({
+      ...deInversionArgs,
+      minFrames: Math.min(deSingleMinFrames, deShortBandMinFrames),
     });
+    // Attribution runs even when routing is OFF — that is the whole point of
+    // the baseline release: "applied" is the counterfactual "would have
+    // inverted", and emitting it now is what establishes the DiD cohort
+    // before the flip. Do not short-circuit this block behind
+    // `deShortBandRoute` (review nit).
+    let deShortBand = resolveDeShortBand({
+      invertAtBaseFloor,
+      invertAtBandFloor,
+      bandEnabled: deShortBandEnabled,
+      bandOpen: deShortBandOpen,
+      elementCountSource: compositionElementCountSource,
+    });
+    let deInversionEligible =
+      deShortBandRoute && deShortBand === "applied" ? invertAtBandFloor : invertAtBaseFloor;
+    // The floor that actually decided this render — for the human-facing log
+    // below, so it never claims e.g. "400 frames >= 900" for a band-routed
+    // inversion (review finding).
+    const deInversionEffectiveMinFrames =
+      deShortBandRoute && deShortBand === "applied"
+        ? Math.min(deSingleMinFrames, deShortBandMinFrames)
+        : deSingleMinFrames;
     // DE parallel-router eligibility — see shouldPreferParallelDrawElement.
-    // Default-off (HF_DE_PARALLEL_ROUTER); HF_DE_PARALLEL_MIN_FRAMES defaults
-    // higher than the single-worker inversion's threshold since it targets
-    // the long tail the inversion's own benchmark didn't cover.
-    const deParallelRouterEnabled = process.env.HF_DE_PARALLEL_ROUTER === "true";
+    // Default ON since 2026-07-27 (kill switch: HF_DE_PARALLEL_ROUTER=false).
+    // The soak that gated this flip answered the safety question: zero
+    // damaged frames shipped across the entire default-off window — every
+    // revert was the self-verify net catching a bad frame and recovering via
+    // screenshot. The residual metric (revert rate ~2.3% vs the 2% goal) is
+    // an efficiency cost (a revert forfeits the speedup, never correctness),
+    // accepted in exchange for parallelizing the ≥700-frame band (~80% of
+    // all DE capture wall-clock). Post-flip tripwire on dashboard 1807532:
+    // sustained revert >10% or any verify-missed damage rolls this back —
+    // one env default, decoupled from the floor change one release earlier.
+    // HF_DE_PARALLEL_MIN_FRAMES default
+    // 700, re-calibrated 2026-07-27 from the original safe-high 2000. A
+    // controlled frame-count sweep (fixed content-per-frame, three synthetic
+    // profiles × {350..3000f} × {single,par2,par3} × 3 reps, worker counts +
+    // capture modes verified per run) showed par3 beating single at EVERY
+    // size in every profile — +17–21% at 700f rising to +28–34% at 3000f —
+    // including a 24-sub-composition profile built to reproduce the
+    // "workers re-pay init" failure (92k tweens, ~2.5s
+    // pollSubCompositionTimelines per worker): workers init CONCURRENTLY, so
+    // duplicated init costs CPU, not wall-clock. Below ~700f the win thins
+    // toward ~+10% while still paying 3 hardware-GPU browsers, so the floor
+    // stays. Harness: plans/drawelement-fast-capture/de-crossover-bench.sh.
+    const deParallelRouterEnabled = isDeParallelRouterEnabled(process.env);
     const deParallelMinFramesRaw = process.env.HF_DE_PARALLEL_MIN_FRAMES;
     const deParallelMinFramesNum =
       deParallelMinFramesRaw === undefined || deParallelMinFramesRaw.trim() === ""
-        ? 2000
+        ? 700
         : Number(deParallelMinFramesRaw);
     const deParallelMinFrames = Number.isFinite(deParallelMinFramesNum)
       ? deParallelMinFramesNum
-      : 2000;
+      : 700;
     // RAM floor default 24 GB: the wild black-slab report was a 16 GB
     // machine; every clean routed cohort in telemetry so far is >=24 GB.
     // HF_DE_PARALLEL_MIN_MEM_MB overrides (0 disables the guard).
@@ -2344,7 +4206,7 @@ async function executeRenderPipeline(input: {
     const deParallelMinMemoryMb = Number.isFinite(deParallelMinMemNum)
       ? deParallelMinMemNum
       : 24576;
-    const deParallelRouterEligible = shouldPreferParallelDrawElement({
+    let deParallelRouterEligible = shouldPreferParallelDrawElement({
       workerCount: WOULD_RESOLVE_MULTI_WORKER,
       requestedWorkers: job.config.workers,
       useDrawElement: cfg.useDrawElement,
@@ -2354,18 +4216,61 @@ async function executeRenderPipeline(input: {
       totalFrames,
       minFrames: deParallelMinFrames,
       layeredOrEffectRoute: hasHdrContent || compiled.hasShaderTransitions,
-      supersampling: deviceScaleFactor > 1,
-      probeDeGated:
-        probeSession !== null &&
-        probeSession.captureMode !== "drawelement" &&
-        !probeSession.deInitDeferred,
+      supersampling: deviceScaleFactor !== 1,
+      probeDeGated: isProbeDeGated(probeSession) || probeNeedsScreenshotFrames(probeSession),
       experimentalParallelDeOptIn:
         process.env.PRODUCER_EXPERIMENTAL_FAST_CAPTURE === "true" ||
         process.env.HF_DE_PARALLEL_STREAM === "true",
       routerEnabled: deParallelRouterEnabled,
+      // Router pins 3 workers for the streaming path; don't pin when a
+      // streaming gate (config, format, or the opt-in duration cap) would turn
+      // that path off.
+      parallelStreamingAvailable: shouldUseStreamingEncode(
+        cfg,
+        outputFormat,
+        3,
+        job.duration,
+        true,
+      ),
       totalMemoryMb: Math.round(totalmem() / (1024 * 1024)),
       minMemoryMb: deParallelMinMemoryMb,
     });
+    // The browser probe is conditional, so most renders arrive here without the engine's
+    // init-time drawElement gates having run. Run them before pinning 1 or 3 workers: a
+    // refused comp captures by screenshot and keeps the resolver's parallelism.
+    if (probeSession === null && (deInversionEligible || deParallelRouterEligible)) {
+      try {
+        probeSession = await createCaptureSession(
+          activeFileServer.url,
+          framesDir,
+          buildPrepCaptureOptions(),
+          null,
+          { ...cfg, forceScreenshot: captureForceScreenshot },
+        );
+        await initializeSession(probeSession);
+      } catch (error) {
+        assertNotAborted();
+        if (probeSession) {
+          lastBrowserConsole = probeSession.browserConsoleBuffer;
+          await closeCaptureSession(probeSession).catch(() => {});
+          probeSession = null;
+        }
+        // The capture stage opens its own session and owns retrying or failing it.
+        log.warn("[Render] Fast capture gate check failed; routing without it.", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      if (isProbeDeGated(probeSession)) {
+        // What both predicates and the band answer for a gated probe.
+        deInversionEligible = false;
+        deParallelRouterEligible = false;
+        deShortBand = undefined;
+      } else if (probeNeedsScreenshotFrames(probeSession)) {
+        deParallelRouterEligible = false;
+      }
+    }
+    // Workers capturing by screenshot report no gate of their own, so carry the probe's.
+    const deProbeGateReason = isProbeDeGated(probeSession) ? probeSession.deGateReason : undefined;
     // Declared ahead of resolution (assigned below, after calibration) so
     // captureStageObservationData can close over it for the calibration
     // stage itself — reads as undefined until resolveRenderWorkerCount runs.
@@ -2395,22 +4300,20 @@ async function executeRenderPipeline(input: {
       get captureMode() {
         return (
           probeSession?.captureMode ??
-          (captureForceScreenshot
-            ? "screenshot"
-            : cfg.useDrawElement
-              ? "drawelement"
-              : "beginframe")
+          fallbackCaptureModeLabel({
+            forceScreenshot: captureForceScreenshot,
+            useDrawElement: cfg.useDrawElement,
+          })
         );
       },
       get captureOperation() {
         if ((job.framesRendered ?? 0) >= totalFrames) return "encode";
         const mode =
           probeSession?.captureMode ??
-          (captureForceScreenshot
-            ? "screenshot"
-            : cfg.useDrawElement
-              ? "drawelement"
-              : "beginframe");
+          fallbackCaptureModeLabel({
+            forceScreenshot: captureForceScreenshot,
+            useDrawElement: cfg.useDrawElement,
+          });
         if (mode === "screenshot") return "captureScreenshot";
         if (mode === "drawelement") return "drawElement";
         return "beginFrame";
@@ -2425,34 +4328,54 @@ async function executeRenderPipeline(input: {
       !deInversionEligible &&
       !deParallelRouterEligible
     ) {
-      const outcome = await observeRenderStage(
-        observability,
-        "capture_calibration",
-        captureStageObservationData({
-          forceScreenshot: captureForceScreenshot,
-          // Override the default `capturing` — calibration writes probe
-          // frames only, not `job.framesRendered`, so heartbeats reporting
-          // `framesCompleted: 0` misread as broken. Field signal
-          // ts=1784019503.
-          stagePhase: "calibrating",
-        }),
-        () =>
-          runCaptureCalibration({
-            cfg,
-            fileServer: activeFileServer,
-            workDir,
-            log,
-            job,
-            totalFrames,
+      updateJobStatus(job, "rendering", "Measuring capture speed", 25, onProgress, {
+        code: "start_browsers",
+      });
+      // Calibration samples fixed frames, so the windowed videos it shows are extracted for just
+      // those here, outside its timing, and removed when it ends however it ends.
+      const calibrationFrames = videoFrameWindow
+        ? await buildSegmentVideoFrames().forFrames(
+            selectCaptureCalibrationFrames(totalFrames),
+            "calibration",
+          )
+        : undefined;
+      let outcome: Awaited<ReturnType<typeof runCaptureCalibration>>;
+      try {
+        outcome = await observeRenderStage(
+          observability,
+          "capture_calibration",
+          captureStageObservationData({
             forceScreenshot: captureForceScreenshot,
-            probeSession,
-            buildCaptureOptions,
-            createRenderVideoFrameInjector,
-            assertNotAborted,
+            // Override the default `capturing` — calibration writes probe
+            // frames only, not `job.framesRendered`, so heartbeats reporting
+            // `framesCompleted: 0` misread as broken. Field signal
+            // ts=1784019503.
+            stagePhase: "calibrating",
           }),
-        { heartbeatMessage: "browser calibrating (frames not started)" },
-      );
+          () =>
+            runCaptureCalibration({
+              cfg: calibrationCaptureConfig(cfg),
+              fileServer: activeFileServer,
+              workDir,
+              log,
+              job,
+              totalFrames,
+              forceScreenshot: captureForceScreenshot,
+              probeSession,
+              buildCaptureOptions: buildPrepCaptureOptions,
+              createRenderVideoFrameInjector: calibrationFrames
+                ? calibrationFrames.injector
+                : createRenderVideoFrameInjector,
+              assertNotAborted,
+            }),
+          { heartbeatMessage: "browser calibrating (frames not started)" },
+        );
+      } finally {
+        calibrationFrames?.release();
+      }
+      startingFrameCapture();
       captureCalibration = outcome.calibration;
+      calibrationEvaluateTimedOut = outcome.calibrationEvaluateTimedOut;
       captureForceScreenshot = outcome.forceScreenshot;
       updateCaptureObservability({ forceScreenshot: captureForceScreenshot });
       probeSession = outcome.probeSession;
@@ -2463,6 +4386,7 @@ async function executeRenderPipeline(input: {
         forceScreenshot: captureForceScreenshot,
         multiplier: outcome.calibration?.estimate.multiplier ?? null,
         p95Ms: outcome.calibration?.estimate.p95Ms ?? null,
+        medianMs: outcome.calibration?.estimate.medianMs ?? null,
       });
     } else {
       observability.checkpoint("capture_calibration", "skipped", {
@@ -2477,10 +4401,28 @@ async function executeRenderPipeline(input: {
 
     // Low-memory safe-mode's single-worker pin lives inside
     // resolveRenderWorkerCount so its "why workers=N" logging stays coherent.
+    const appleGpuDiskCapture = isAppleGpuDiskCapture({
+      platform: process.platform,
+      browserGpuMode: resolvedBrowserGpuMode,
+      layered: shouldUseLayeredComposite({
+        hasHdrContent,
+        hasShaderTransitions: compiled.hasShaderTransitions && !isGif,
+        isPngSequence,
+      }),
+      parallelStream: isCaptureParallelStreamRouterEnabled(
+        process.env,
+        resolveParallelCaptureMode({
+          platform: process.platform,
+          headlessShellPath: resolveHeadlessShellPath(cfg),
+          forceScreenshot: captureForceScreenshot,
+          deviceScaleFactor: captureOptions.deviceScaleFactor,
+        }),
+      ),
+    });
     workerCount = resolveRenderWorkerCount(
       totalFrames,
       job.config.workers,
-      cfg,
+      { ...cfg, appleGpuDiskCapture },
       compiled,
       log,
       captureCalibration?.estimate,
@@ -2495,13 +4437,11 @@ async function executeRenderPipeline(input: {
         }
       },
     );
+    if (videoLayer) workerCount = 1;
     // DE priority inversion — see shouldPreferSingleWorkerDrawElement for the
     // policy and benchmark rationale (eligibility resolved above, before
-    // calibration). Comps that pass every static check but hit an engine
-    // INIT-time gate at capture (css-effects / at-risk, ~1.5% of local
-    // renders) render single-worker screenshot streaming — slower than
-    // parallel would have been, accepted for the routing win everywhere else.
-    // `preRoutingWorkerCount` lets the self-verify retry return to the
+    // calibration; a comp the engine's init-time gates refuse is never
+    // eligible). `preRoutingWorkerCount` lets the self-verify retry return to the
     // parallel path when the drawElement bet loses — shared by both the
     // inversion and the router below, whichever fires (mutually exclusive).
     const preRoutingWorkerCount = workerCount;
@@ -2535,8 +4475,8 @@ async function executeRenderPipeline(input: {
       log.info(
         "[Render] Fast capture: single-worker drawElement streaming preferred over " +
           `${workerCount}-worker screenshot capture (${totalFrames} frames >= ` +
-          `${deSingleMinFrames}; verified path, measured faster at every worker count). ` +
-          "Set HF_DE_SINGLE_MIN_FRAMES=0 or --workers N to override.",
+          `${deInversionEffectiveMinFrames}; verified path, measured faster at every worker count). ` +
+          "Set HF_DE_SINGLE_MIN_FRAMES=0 to override.",
       );
       workerCount = 1;
     }
@@ -2551,6 +4491,29 @@ async function executeRenderPipeline(input: {
       // any resource-pressure failure unique to this cohort.
       dePreInversionWorkers: deWorkerInversion ? preRoutingWorkerCount : undefined,
       dePreRouterWorkers: deParallelRouter ? preRoutingWorkerCount : undefined,
+      // Short-comp band attribution — see the field docs. Emitted on every
+      // render so the fleet element-count distribution is readable, and so a
+      // perf shift can be split into "the new band did it" vs "unchanged".
+      compositionElementCount,
+      compositionElementCountSource,
+      compositionElementTags,
+      arollVideoCount,
+      heygenVideoCount,
+      adaptersUsed,
+      audioCount,
+      imageCount,
+      subCompositionCount,
+      audioGroupCount,
+      colorGradingCount,
+      hasLut,
+      rootBodyMismatch,
+      rootBodyDeltaPxBucket,
+      deShortBand,
+      // Same rationale as the counters above: carried on live capture
+      // observability, not only the success-path perfSummary, so a crash /
+      // OOM / timeout still reports which GPU backend it happened on. That
+      // is the cohort the win32 D3D11 rollout most needs to attribute.
+      deGpuRenderer: probeSession?.gpuRenderer,
     });
     observability.checkpoint("worker_resolution", "resolved", {
       workerCount,
@@ -2558,10 +4521,107 @@ async function executeRenderPipeline(input: {
       deParallelRouter: deParallelRouter ?? "none",
     });
 
+    // No calibration estimate (explicit workers, short or forced-screenshot renders) skips the
+    // pre-capture check; the measured-rate guard below still covers capture.
+    const calibratedTooSlow = checkCalibratedRenderEta({
+      maxRenderMs: job.config.maxRenderMs,
+      elapsedMs: Date.now() - pipelineStart,
+      totalFrames,
+      estimate: captureCalibration?.estimate,
+      workerCount,
+    });
+    if (calibratedTooSlow) throw calibratedTooSlow;
+    execution.defer(
+      "stop render ETA guard",
+      startRenderEtaGuard({
+        maxRenderMs: job.config.maxRenderMs,
+        job,
+        totalFrames,
+        pipelineStartMs: pipelineStart,
+        onTooSlow: (error) => {
+          tooSlowError = error;
+          tooSlow.abort(error);
+        },
+      }),
+    );
+
+    // Streaming encode pipes captured frames through ffmpeg's stdin to produce
+    // a single video file. Keep the default enabled for sequential capture, but
+    // let auto-parallel renders use disk frames: the current ordered streaming
+    // writer would otherwise stall later workers behind earlier frame ranges.
+    // png-sequence has no encoded video output, so streaming is always bypassed.
+    let useStreamingEncode = shouldUseStreamingEncode(
+      cfg,
+      outputFormat,
+      workerCount,
+      job.duration,
+      deParallelStreamForced,
+    );
+    // Default-on drawElement is only safe where the runtime self-verification
+    // net actually runs: the single-worker streaming worker-encode drain, or
+    // (HF_DE_PARALLEL_STREAM) a verified multi-worker streaming render. The
+    // disk path and unverified parallel capture ship frames no drain
+    // verifies, so they clamp to the screenshot baseline unless drawElement
+    // was explicitly opted into.
+    //
+    // This must run before the non-DE parallel-streaming router below, which
+    // needs `cfg.useDrawElement` post-clamp to know whether this render will
+    // actually use non-DE capture. The router's own force flag
+    // (`captureParallelStreamForced`) requires `!useDrawElement`, so it can
+    // only be true once this clamp has already fired — meaning the router's
+    // flag is always false while this clamp's guard is still evaluating,
+    // and `deParallelStreamForced` above is the only flag that can affect it.
+    const deParallelStreamVerified =
+      (deParallelStreamForced || process.env.HF_DE_PARALLEL_STREAM === "true") &&
+      useStreamingEncode &&
+      workerCount > 1;
+    // Frames drawElement cannot reproduce go to a screenshot session only on single-worker
+    // streaming capture; any other route captures them all by screenshot, as before.
+    const routeDropsScreenshotFrames =
+      cfg.useDrawElement &&
+      probeNeedsScreenshotFrames(probeSession) &&
+      (!useStreamingEncode || workerCount !== 1);
+    if (
+      routeDropsScreenshotFrames ||
+      shouldClampDefaultDrawElement({
+        useDrawElement: cfg.useDrawElement,
+        fastCaptureExplicitOptIn: process.env.PRODUCER_EXPERIMENTAL_FAST_CAPTURE === "true",
+        useStreamingEncode,
+        workerCount,
+        deParallelStreamVerified,
+      })
+    ) {
+      cfg.useDrawElement = false;
+      deClampReason = workerCount > 1 ? "parallel" : "disk_path";
+      log.info(
+        "[Render] Fast capture: default-on drawElement disabled for this render: " +
+          (workerCount > 1 ? "parallel capture" : "the disk capture path") +
+          " has no runtime self-verification. Set PRODUCER_EXPERIMENTAL_FAST_CAPTURE=true to override.",
+      );
+      // The probe session already initialized in drawElement mode (canvas
+      // injected); it must not be reused by the unverified path.
+      if (probeSession && probeSession.captureMode === "drawelement") {
+        lastBrowserConsole = probeSession.browserConsoleBuffer;
+        await closeCaptureSession(probeSession);
+        probeSession = null;
+      }
+    }
+
     // Non-DE parallel-streaming router — see shouldStreamParallelCapture.
     // Mutually exclusive with the DE inversion/router above by construction
     // (both DE predicates require useDrawElement; this requires its negation).
-    const captureParallelStreamRouterEnabled = process.env.HF_CAPTURE_PARALLEL_STREAM === "true";
+    // Reads `cfg.useDrawElement` after the clamp above, so it sees the
+    // capture mode this render will actually use.
+    const parallelCaptureMode = resolveParallelCaptureMode({
+      platform: process.platform,
+      headlessShellPath: resolveHeadlessShellPath(cfg),
+      forceScreenshot: captureForceScreenshot,
+      deviceScaleFactor: captureOptions.deviceScaleFactor,
+    });
+    const captureParallelStreamRouterEnabled = isCaptureParallelStreamRouterEnabled(
+      process.env,
+      parallelCaptureMode,
+    );
     const captureParallelStreamArgs = {
       workerCount,
       useDrawElement: cfg.useDrawElement,
@@ -2575,11 +4635,10 @@ async function executeRenderPipeline(input: {
     });
     if (captureParallelStreamEligible) {
       captureParallelStreamForced = true;
-      // Which mode will stream: the engine picks beginframe only on Linux with
-      // headless-shell and no forced screenshot (frameCapture.ts preMode);
-      // everything else is screenshot. Recorded for telemetry cohorting.
-      const captureParallelStream =
-        process.platform === "linux" && !captureForceScreenshot ? "beginframe" : "screenshot";
+      // Which mode will stream — the same value the enablement decision used,
+      // so the routed cohort in telemetry cannot disagree with the predicate
+      // that routed it.
+      const captureParallelStream = parallelCaptureMode;
       log.info(
         `[Render] Parallel ${captureParallelStream} capture will stream to the encoder ` +
           `(interleaved, ${workerCount} workers) instead of the disk path. ` +
@@ -2594,11 +4653,11 @@ async function executeRenderPipeline(input: {
         `parallel ${captureParallelStream} capture routed to streaming`,
       );
     } else if (shouldStreamParallelCapture({ routerEnabled: true, ...captureParallelStreamArgs })) {
-      // The kill switch is the ONLY failed gate: emit a passive cohort-sizing
-      // signal (capture_parallel_stream = "eligible_off") so the default-off
-      // soak can measure how many fleet renders WOULD route before anyone
-      // enables the flag. Observability-only — no behavior change, no log
-      // noise on the default path.
+      // The router switch is the ONLY failed gate: emit a passive cohort-sizing
+      // signal (capture_parallel_stream = "eligible_off"). Post-split this is
+      // the screenshot-capture cohort held back by the default plus anyone who
+      // set the kill switch — i.e. exactly the population the Phase 1b flip
+      // would move. Observability-only, no log noise on the default path.
       updateCaptureObservability({ captureParallelStream: "eligible_off" });
     }
 
@@ -2608,70 +4667,44 @@ async function executeRenderPipeline(input: {
       probeSession = null;
     }
 
-    // Streaming encode pipes captured frames through ffmpeg's stdin to produce
-    // a single video file. Keep the default enabled for sequential capture, but
-    // let auto-parallel renders use disk frames: the current ordered streaming
-    // writer would otherwise stall later workers behind earlier frame ranges.
-    // png-sequence has no encoded video output, so streaming is always bypassed.
-    let useStreamingEncode = shouldUseStreamingEncode(
+    // Re-resolve now that the non-DE router above may have forced streaming
+    // on for this multi-worker render (same formula as the early value above,
+    // now including `captureParallelStreamForced`). This is the value the
+    // rest of the pipeline (encode/writer selection, logging) uses.
+    const streamingGate = explainStreamingEncodeGate(
       cfg,
       outputFormat,
       workerCount,
       job.duration,
       deParallelStreamForced || captureParallelStreamForced,
     );
+    useStreamingEncode = streamingGate.enabled;
     log.info("streaming-encode gate", {
       enabled: useStreamingEncode,
+      reason: streamingGate.reason,
       configFlag: cfg.enableStreamingEncode,
+      durationCapEnabled: cfg.streamingEncodeDurationCapEnabled,
       outputFormat,
       workerCount,
       durationSeconds: job.duration,
       maxDurationSeconds: cfg.streamingEncodeMaxDurationSeconds,
     });
-    // Default-on drawElement is only safe where the runtime self-verification
-    // net actually runs: the single-worker streaming worker-encode drain. The
-    // disk path (png-sequence / over the streaming duration cap) and parallel
-    // capture ship frames no drain verifies — route those renders to the
-    // screenshot baseline unless drawElement was explicitly opted into.
-    // HF_DE_PARALLEL_STREAM: multi-worker STREAMING renders now carry the
-    // full drain-time self-verification (per-worker ground truth + the shared
-    // drain guard), so the confinement rule is satisfied and the parallel
-    // clamp does not apply. The disk path stays clamped.
-    const deParallelStreamVerified =
-      (deParallelStreamForced || process.env.HF_DE_PARALLEL_STREAM === "true") &&
-      useStreamingEncode &&
-      workerCount > 1;
-    if (
-      cfg.useDrawElement &&
-      process.env.PRODUCER_EXPERIMENTAL_FAST_CAPTURE !== "true" &&
-      (!useStreamingEncode || workerCount > 1) &&
-      !deParallelStreamVerified
-    ) {
-      cfg.useDrawElement = false;
-      deClampReason = workerCount > 1 ? "parallel" : "disk_path";
-      log.info(
-        "[Render] Fast capture: default-on drawElement disabled for this render — " +
-          (workerCount > 1 ? "parallel capture" : "the disk capture path") +
-          " has no runtime self-verification. Set PRODUCER_EXPERIMENTAL_FAST_CAPTURE=true to override.",
-      );
-      // The probe session already initialized in drawElement mode (canvas
-      // injected); it must not be reused by the unverified path.
-      if (probeSession && probeSession.captureMode === "drawelement") {
-        await closeCaptureSession(probeSession);
-        probeSession = null;
-      }
-    }
 
     // png-sequence is "no container" — outputPath is treated as a directory and
     // the encode/mux/faststart stages are skipped entirely. The empty extension
     // keeps `videoOnlyPath` (which is constructed below) sensible even though
     // it will not be written.
+    //
+    // hls is a directory output too, but it does run encode + assemble: the
+    // intermediate stays an MP4 and only the assemble stage changes container,
+    // stream-copying it into segments.
     const FORMAT_EXT: Record<string, string> = {
       mp4: ".mp4",
       webm: ".webm",
       mov: ".mov",
       "png-sequence": "",
       gif: ".gif",
+      hls: ".mp4",
     };
     const videoExt = FORMAT_EXT[outputFormat] ?? ".mp4";
     const videoOnlyPath = join(workDir, `video-only${videoExt}`);
@@ -2680,19 +4713,16 @@ async function executeRenderPipeline(input: {
     // Page-side compositing opt-in: when the engine is configured to run the
     // shader blend inside Chrome via a page-side WebGL canvas, the layered
     // Node-side composite path is unnecessary for SDR shader transitions.
-    // The streaming path takes ONE opaque RGB screenshot per output frame —
-    // exactly the single capture the page-side compositor produces. HDR
-    // content still forces the layered path (HDR layers need per-layer
-    // alpha + native HDR raw frame compositing in Node; that's out of scope
-    // for this opt-in). GIF also uses this path for shader transitions
-    // because its two-pass palette encoder needs disk frames, not the
-    // layered path's streaming raw-video encoder.
-    const usePageSideCompositingForTransitions =
+    // MP4's streaming path takes one opaque RGB screenshot per output frame.
+    // GIF takes the same page-side composite through its RGBA PNG disk-frame
+    // path so the palette encoder can preserve transparency. HDR content still
+    // forces the layered path (HDR layers need per-layer alpha + native HDR raw
+    // frame compositing in Node; that's out of scope for this opt-in).
+    let usePageSideCompositingForTransitions =
       (cfg.enablePageSideCompositing || isGif) &&
       compiled.hasShaderTransitions &&
       !hasHdrContent &&
-      !isPngSequence &&
-      !needsAlpha;
+      outputSupportsPageSideShaderCompositing(outputFormat);
     if (usePageSideCompositingForTransitions) {
       activeFileServer.addPreHeadScript(HF_PAGE_SIDE_COMPOSITING_STUB);
       if (
@@ -2709,14 +4739,39 @@ async function executeRenderPipeline(input: {
           "[Render] Recreating capture session so page-side compositing pre-head script is loaded.",
         );
       }
+      // The composition's own shader-transitions build decides whether it can composite in this
+      // browser; a build that cannot leaves the blend to the Node-side layered path.
+      try {
+        usePageSideCompositingForTransitions = await pageInstallsShaderCompositor(() =>
+          createCaptureSession(activeFileServer.url, framesDir, buildPrepCaptureOptions(), null, {
+            ...cfg,
+            forceScreenshot: true,
+          }),
+        );
+      } catch (error) {
+        assertNotAborted();
+        // The capture stage opens its own session and owns retrying or failing it.
+        log.warn("[Render] Shader compositor check failed; keeping page-side compositing.", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      if (!usePageSideCompositingForTransitions) {
+        log.warn(
+          "[Render] The page's shader-transitions build cannot composite in this browser; " +
+            "shader transitions blend on the Node-side layered path.",
+        );
+      }
+    }
+    if (usePageSideCompositingForTransitions) {
       captureForceScreenshot = resolveCaptureForceScreenshotForPageSideCompositing({
         forceScreenshot: captureForceScreenshot,
         usePageSideCompositing: true,
       });
       updateCaptureObservability({ forceScreenshot: captureForceScreenshot });
       log.info(
-        "[Render] Page-side compositing enabled — bypassing Node-side layered " +
-          "shader-blend path. Engine will capture one opaque RGB screenshot per output frame.",
+        "[Render] Page-side compositing enabled, bypassing Node-side layered " +
+          `shader-blend path. Engine will capture one ${needsAlpha ? "RGBA PNG" : "opaque RGB"} ` +
+          "screenshot per output frame.",
       );
     }
     const useLayeredComposite =
@@ -2726,6 +4781,7 @@ async function executeRenderPipeline(input: {
         hasShaderTransitions: compiled.hasShaderTransitions && !isGif,
         isPngSequence,
       });
+    routePageMotionBlur = pageMotionBlurForRoute({ hasHdrContent, useLayeredComposite });
     const inversionFallback = resolveInversionRetryPlan({
       deWorkerInversion,
       preInversionWorkerCount: preRoutingWorkerCount,
@@ -2797,8 +4853,16 @@ async function executeRenderPipeline(input: {
     let capturePlan: CapturePlan = createCapturePlan({
       workerCount,
       forceScreenshot: captureForceScreenshot,
-      forceParallelStream: deParallelStreamForced || captureParallelStreamForced,
+      forceParallelStream: isParallelStreamForced(process.env, {
+        deParallelStreamForced,
+        captureParallelStreamForced,
+      }),
       useStreamingEncode,
+      // Segmented capture is opt-in in Phase 2a and single-worker only; the
+      // excluded routes are the ones whose concat-copy or capture loop the
+      // segment contract does not cover (webm VP9 concat is fragile, HDR and
+      // shader transitions run their own compositor).
+      useSegmentedCapture: segmentsCapture(hasHdrContent || compiled.hasShaderTransitions),
       useLayeredComposite,
       usePageSideCompositing: usePageSideCompositingForTransitions,
       hasHdrContent,
@@ -2806,6 +4870,10 @@ async function executeRenderPipeline(input: {
       routing: captureRouting,
     });
     const syncCapturePlan = (): void => {
+      // Every route the render can end up on passes through here, including the ones a
+      // replan lands on, so this is where motion blur's one supported-route answer belongs.
+      assertMotionBlurSupported(job.config.motionBlur, capturePlan.kind);
+      assertOutputScaleSupported(deviceScaleFactor, capturePlan.kind);
       workerCount = capturePlan.workerCount;
       captureForceScreenshot = capturePlan.forceScreenshot;
       useStreamingEncode = capturePlan.kind === "sdr_streaming";
@@ -2817,6 +4885,10 @@ async function executeRenderPipeline(input: {
       if (capturePlan.routing.kind === "parallel_router") {
         deParallelRouter = capturePlan.routing.state === "active" ? "routed" : "reverted";
       }
+      // Recorded here rather than beside the streaming-encode gate log: this
+      // runs for the initial plan AND every replan, so a render that falls
+      // back to disk reports the path it actually captured on.
+      updateCaptureObservability({ capturePath: capturePathForPlanKind(capturePlan.kind) });
     };
     syncCapturePlan();
     updateCaptureObservability({
@@ -2826,11 +4898,24 @@ async function executeRenderPipeline(input: {
       usePageSideCompositing: capturePlan.usePageSideCompositing,
       hasHdrContent: capturePlan.hasHdrContent,
       forceScreenshot: capturePlan.forceScreenshot,
+      // Re-recorded here because `syncCapturePlan` above is where routing is
+      // actually decided — including "reverted", which the earlier update
+      // could not know. Without this, capture observability keeps whatever
+      // was true before the plan resolved, so a render that failed while
+      // routed reports no routing state at all: `de_parallel_router` was
+      // present on 95% of render_complete events and 0.8% of render_error.
+      // The failure path is the one the rollout is watching.
+      deWorkerInversion,
+      deParallelRouter,
     });
+    if (videoFrameWindow && capturePlan.kind !== "sdr_segmented")
+      await extractDeferredVideoFrames();
+    updateCaptureObservability({ videoFrameWindow: videoFrameWindow ? "on" : "off" });
     observability.checkpoint("capture_strategy", "resolved", {
       plan: capturePlan.kind,
       workerCount: capturePlan.workerCount,
       forceScreenshot: capturePlan.forceScreenshot,
+      videoFrameWindow: videoFrameWindow ? "on" : "off",
       captureBeyondViewport: resolvedCaptureBeyondViewport ?? null,
       useStreamingEncode: capturePlan.kind === "sdr_streaming",
       useLayeredComposite: capturePlan.kind === "hdr_layered",
@@ -2838,6 +4923,8 @@ async function executeRenderPipeline(input: {
       hasHdrContent: capturePlan.hasHdrContent,
       hasShaderTransitions: compiled.hasShaderTransitions,
       isPngSequence,
+      captureImageFormat: captureOptions.format ?? "jpeg",
+      chromaSubsampling: job.config.chromaSubsampling ?? "420",
     });
     const encoderHdr = hasHdrContent ? effectiveHdr : undefined;
     // png-sequence has no encoder, but the rest of the orchestrator still
@@ -2846,7 +4933,13 @@ async function executeRenderPipeline(input: {
     // are never written to ffmpeg in the png-sequence path.
     const presetFormat: "mp4" | "webm" | "mov" =
       outputFormat === "webm" || outputFormat === "mov" ? outputFormat : "mp4";
-    const preset = getEncoderPreset(job.config.quality, presetFormat, encoderHdr);
+    const preset = getEncoderPreset(
+      job.config.quality,
+      presetFormat,
+      encoderHdr,
+      job.config.proresProfile,
+      job.config.chromaSubsampling,
+    );
 
     // CLI overrides (--crf, --video-bitrate) flow through job.config and must
     // win over the preset-derived defaults. The CLI enforces mutual exclusivity
@@ -2868,6 +4961,51 @@ async function executeRenderPipeline(input: {
     const effectiveQuality = job.config.crf ?? preset.quality;
     const effectiveBitrate = job.config.crf != null ? undefined : job.config.videoBitrate;
 
+    // Capture never reads the mix: it starts now, and the first step that needs the mix waits for it.
+    const audioReady = audioStage.then((audioResult) => {
+      perfStages.audioProcessMs = audioResult.audioProcessMs;
+      recordLimiterAttenuation(job, audioResult.audioLoweredDb);
+      if (audioResult.audioError) {
+        const audioFailures = audioResult.audioFailures ?? [];
+        const failureOwner =
+          audioFailures.length === 0
+            ? undefined
+            : audioFailures.some((failure) => failure.owner === "system")
+              ? "system"
+              : "user";
+        const retryable =
+          audioFailures.length === 0
+            ? undefined
+            : audioFailures.every((failure) => failure.retryable);
+        applyRenderWarningPolicy(
+          job,
+          [
+            {
+              code: "audio_processing_failed",
+              message: `Audio mix failed; output would be video-only: ${audioResult.audioError}`,
+              details: {
+                mediaType: "audio",
+                audioFailures: audioFailureDiagnostics(audioFailures),
+                failureReasons: [...new Set(audioFailures.map((failure) => failure.reason))],
+                failureStages: [...new Set(audioFailures.map((failure) => failure.stage))],
+                failureOwner,
+                retryable,
+              },
+            },
+          ],
+          log,
+        );
+      }
+      return audioResult;
+    });
+    audioReady.catch((error: unknown) => {
+      if (executionSignal.aborted) return;
+      audioFailure = error;
+      audioFailed.abort(error);
+    });
+    const mixedAudio = () => audioWait.wait(audioReady);
+    if (usableCpuCount() < MIN_CPUS_TO_CAPTURE_DURING_MIX) await mixedAudio();
+
     resetCaptureAttemptProgress(job);
 
     // ── Z-ordered multi-layer compositing ─────────────────────────────────
@@ -2888,8 +5026,9 @@ async function executeRenderPipeline(input: {
         observability,
         "capture_hdr_layered",
         captureStageObservationData({ hasHdrContent }),
-        () =>
-          runCaptureHdrStage({
+        (openAttempt) => {
+          const attempt = openAttempt(executionSignal);
+          return runCaptureHdrStage({
             job,
             cfg,
             plan: layeredPlan,
@@ -2912,14 +5051,20 @@ async function executeRenderPipeline(input: {
             preset,
             effectiveQuality,
             effectiveBitrate,
+            deliveryEncoder,
             fileServer: activeFileServer,
-            buildCaptureOptions,
+            buildCaptureOptions: buildWorkerCaptureOptions,
             createRenderVideoFrameInjector,
             hdrDiagnostics,
-            abortSignal: executionSignal,
-            assertNotAborted,
+            abortSignal: attempt,
+            assertNotAborted: () => {
+              assertNotAborted();
+              attempt.throwIfAborted();
+            },
             onProgress,
-          }),
+          });
+        },
+        { stall: frameStallRule(job, totalFrames, perfStages.browserProbeMs) },
       );
       lastBrowserConsole = hdrRes.lastBrowserConsole;
       layeredCaptureWarnings.push(...hdrRes.warnings);
@@ -2928,6 +5073,7 @@ async function executeRenderPipeline(input: {
       perfStages.captureFrameMs = hdrRes.captureDurationMs;
       perfStages.captureSetupMs = Math.max(0, Date.now() - stage4Start - hdrRes.captureDurationMs);
       perfStages.encodeMs = hdrRes.encodeMs;
+      perfStages.encoderDrainWaitMs = hdrRes.encoderDrainWaitMs ?? 0;
     } else {
       // ── Standard capture paths (SDR or DOM-only HDR) ──────────────────
       // Streaming encode mode pipes frame buffers directly to FFmpeg stdin,
@@ -2935,7 +5081,236 @@ async function executeRenderPipeline(input: {
       // streaming spawn fails (non-abort) the stage returns { success: false }
       // and we fall back to the disk path below.
       let streamingHandled = false;
-      if (capturePlan.kind === "sdr_streaming") {
+      if (capturePlan.kind === "sdr_segmented") {
+        const captureFrameStart = Date.now();
+        const segmentFrames = resolveSegmentFrames(process.env);
+        // One binding for the hash and the encoder so the two cannot drift.
+        const segmentImageFormat = captureOptions.format || "jpeg";
+        const segmentPlanHash = computeSegmentPlanHash({
+          compositionHash: compositionHash ?? "",
+          cliVersion: process.env.npm_package_version ?? "dev",
+          totalFrames,
+          segmentFrames,
+          fps: job.config.fps,
+          width,
+          height,
+          codec: preset.codec,
+          preset: preset.preset,
+          quality: effectiveQuality,
+          bitrate: effectiveBitrate,
+          maxBitrate: deliveryEncoder.maxBitrate,
+          bufferSize: deliveryEncoder.bufferSize,
+          gopSize: deliveryEncoder.gopSize,
+          pixelFormat: preset.pixelFormat,
+          imageFormat: segmentImageFormat,
+          useGpu: job.config.useGpu === true,
+          // Device-scaled: the capture buffer, not the CSS composition size.
+          outputWidth: captureCompositionWidth ?? width,
+          outputHeight: captureCompositionHeight ?? height,
+          motionBlur: job.config.motionBlur ? JSON.stringify(job.config.motionBlur) : "",
+          pageMotionBlur: job.config.pageMotionBlur,
+          captureQuality: captureOptions.quality,
+        });
+        const segmentDir = segmentDirFor(projectDir, segmentPlanHash);
+        const manifestKey = loadResumeKeyOrWarn(job.config.resumeSegments === true, log);
+        const emptySegmentManifest = (): SegmentManifest => ({
+          version: 1,
+          planHash: segmentPlanHash,
+          totalFrames,
+          segmentFrames,
+          completed: [],
+        });
+        let segmentManifest = emptySegmentManifest();
+        let completedSegments: ReadonlySet<number> = new Set<number>();
+        const existing = job.config.resumeSegments ? readSegmentManifest(segmentDir) : null;
+        if (existing) {
+          completedSegments = await validateCompletedSegments(existing, {
+            expectedHash: segmentPlanHash,
+            segmentDir,
+            totalFrames,
+            segmentFrames,
+            key: manifestKey,
+            probeFrames: (path) => probeSegmentFrameCount(path, extractMediaMetadata),
+          });
+          segmentManifest.completed = existing.completed.filter((entry) =>
+            completedSegments.has(entry.index),
+          );
+          log.info(`[Render] resuming: ${completedSegments.size} segments complete`, {
+            segmentDir,
+          });
+        }
+        if (completedSegments.size === 0) rmSync(segmentDir, { recursive: true, force: true });
+        const invokeSegmented = () => {
+          if (capturePlan.kind !== "sdr_segmented") {
+            throw new Error(`Cannot invoke segmented stage with ${capturePlan.kind} plan`);
+          }
+          const segmentedPlan = capturePlan;
+          resetCaptureAttemptProgress(job);
+          return observeRenderStage(
+            observability,
+            "capture_segmented",
+            captureStageObservationData(),
+            () =>
+              runCaptureSegmentedStage({
+                fileServer: activeFileServer,
+                workDir,
+                framesDir,
+                videoOnlyPath,
+                job,
+                totalFrames,
+                cfg,
+                plan: segmentedPlan,
+                log,
+                probeSession,
+                outputFormat,
+                streamingEncoderOptions: {
+                  fps: job.config.fps,
+                  width: captureCompositionWidth ?? width,
+                  height: captureCompositionHeight ?? height,
+                  codec: preset.codec,
+                  preset: preset.preset,
+                  quality: effectiveQuality,
+                  bitrate: effectiveBitrate,
+                  pixelFormat: preset.pixelFormat,
+                  vp9CpuUsed: cfg.vp9CpuUsed,
+                  useGpu: job.config.useGpu,
+                  imageFormat: segmentImageFormat,
+                  hdr: preset.hdr,
+                  // Each segment sets its own GOP (at most the interval); hls never reaches this route.
+                  ...deliveryEncoder,
+                },
+                buildCaptureOptions: buildWorkerCaptureOptions,
+                createRenderVideoFrameInjector,
+                segmentVideoFrames: videoFrameWindow ? buildSegmentVideoFrames() : undefined,
+                abortSignal: executionSignal,
+                assertNotAborted,
+                onProgress,
+                dedupPerfs,
+                segmentFrames,
+                segmentDir,
+                workerCount: segmentedPlan.workerCount,
+                browserRecycleEverySegments: resolveSegmentBrowserRecycle(process.env),
+                completedSegments,
+                onSegmentComplete: (entry) => {
+                  segmentManifest.completed = [
+                    ...segmentManifest.completed.filter((e) => e.index !== entry.index),
+                    { ...entry, completedAt: new Date().toISOString() },
+                  ];
+                  writeSegmentManifest(segmentDir, segmentManifest, manifestKey);
+                },
+                updateCaptureObservability,
+              }),
+          );
+        };
+        let segmentedRes;
+        try {
+          segmentedRes = await invokeSegmented();
+        } catch (err) {
+          const isVerifyError = isDrawElementVerificationError(err);
+          const isDeStall = isDeRendererStallError(err);
+          if (
+            (!isVerifyError && !isDrawElementCaptureError(err) && !isDeStall) ||
+            err instanceof RenderCancelledError ||
+            executionSignal.aborted === true
+          ) {
+            throw err;
+          }
+          deSelfVerifyFallback = isVerifyError;
+          const t = deVerifyFallbackTelemetry(err);
+          deFallbackReason = isVerifyError
+            ? t.reason
+            : isDeStall
+              ? "de_renderer_stall"
+              : "capture_error";
+          deFallbackFailedDb = t.failedDb;
+          deFallbackFrameIndex = t.frameIndex;
+          deFallbackThresholdDb = t.thresholdDb;
+          log.warn(
+            "[Render] drawElement capture failed on the segmented path; re-rendering via screenshot",
+            {
+              error: err instanceof Error ? err.message : String(err),
+            },
+          );
+          observability.checkpoint(
+            "capture_segmented",
+            "drawElement capture failed; retrying with a fresh screenshot session",
+          );
+          if (probeSession) {
+            lastBrowserConsole = probeSession.browserConsoleBuffer;
+            const orphaned = probeSession;
+            probeSession = null;
+            await closeOrphanedProbeForRetry(orphaned, closeCaptureSession, log, "segmented");
+          }
+          // The plan hash does not cover the capture mode, so segments this
+          // attempt (or a resumed run) encoded with drawElement would otherwise
+          // be spliced next to screenshot ones. drawElement and screenshot
+          // frames are not byte-identical, and those segments were never
+          // self-verified, so the retry re-captures every segment.
+          rmSync(segmentDir, { recursive: true, force: true });
+          completedSegments = new Set<number>();
+          segmentManifest = emptySegmentManifest();
+          dedupPerfs.length = 0;
+          capturePlan = replanAfterFailure(capturePlan, {
+            kind: isVerifyError ? "draw_element_verification" : "draw_element_capture",
+          });
+          syncCapturePlan();
+          updateCaptureObservability({
+            forceScreenshot: capturePlan.forceScreenshot,
+            deSelfVerifyFallback,
+            deFallbackReason,
+            deFallbackFailedDb,
+            deFallbackFrameIndex,
+            deFallbackThresholdDb,
+          });
+          segmentedRes = await invokeSegmented();
+          // The first attempt's error marked the phase failed; the retry
+          // recovered it, so the render is not branded as failed.
+          observability.clearFailure("capture_segmented");
+        }
+        if (segmentedRes.success) {
+          streamingHandled = true;
+          workerCount = segmentedRes.workerCount;
+          updateCaptureObservability({ workerCount });
+          probeSession = segmentedRes.probeSession;
+          lastBrowserConsole = segmentedRes.lastBrowserConsole;
+          perfStages.captureMs = Date.now() - stage4Start;
+          perfStages.captureFrameMs = Date.now() - captureFrameStart;
+          perfStages.captureSetupMs = Math.max(0, perfStages.captureMs - perfStages.captureFrameMs);
+          perfStages.encodeMs = segmentedRes.encodeMs;
+          perfStages.encoderDrainWaitMs = segmentedRes.encoderDrainWaitMs ?? 0;
+          log.info(
+            `[Render] Segmented capture complete: ${segmentedRes.segments} segment(s) concatenated.`,
+            {
+              segmentRetries: segmentedRes.segmentRetries,
+              browserRecycles: segmentedRes.browserRecycles,
+            },
+          );
+          updateCaptureObservability({ segmentRetries: segmentedRes.segmentRetries });
+          // Only after a successful capture: a failure leaves the directory
+          // in place, because that is exactly what --resume reads next time.
+          if (job.config.keepSegments !== true) {
+            rmSync(segmentDir, { recursive: true, force: true });
+          }
+        } else {
+          // Only the first segment's encoder can fail to spawn this way, so
+          // nothing was captured: drop to the plain streaming plan and let
+          // the branch below run the render normally.
+          capturePlan = replanAfterFailure(capturePlan, { kind: "streaming_unavailable" });
+          syncCapturePlan();
+          if (videoFrameWindow) await extractDeferredVideoFrames();
+          // The stage closed every session it opened in its own finally,
+          // including a reused probe. Drop the reference so the streaming
+          // branch below opens a fresh session instead of re-initialising a
+          // closed one and failing a stage later with a puzzling
+          // "page closed" (review finding on the Phase 2a PR).
+          probeSession = null;
+          observability.checkpoint(
+            "capture_segmented",
+            "segment encoder spawn failed; falling back to single-encoder streaming",
+          );
+        }
+      }
+      if (!streamingHandled && capturePlan.kind === "sdr_streaming") {
         const captureFrameStart = Date.now();
         const invokeStreaming = () => {
           if (capturePlan.kind !== "sdr_streaming") {
@@ -2962,8 +5337,8 @@ async function executeRenderPipeline(input: {
                 outputFormat,
                 streamingEncoderOptions: {
                   fps: job.config.fps,
-                  width,
-                  height,
+                  width: captureCompositionWidth ?? width,
+                  height: captureCompositionHeight ?? height,
                   codec: preset.codec,
                   preset: preset.preset,
                   quality: effectiveQuality,
@@ -2972,14 +5347,29 @@ async function executeRenderPipeline(input: {
                   vp9CpuUsed: cfg.vp9CpuUsed,
                   useGpu: job.config.useGpu,
                   imageFormat: captureOptions.format || "jpeg",
+                  ...(videoLayer ? { videoLayer: videoLayer.layer } : {}),
                   hdr: preset.hdr,
+                  // HLS only: force an IDR every `gopSize` frames so the
+                  // assemble stage's `-c copy` segmentation cuts exactly on
+                  // the segment boundary. Every other format leaves the
+                  // encoder's open-GOP output untouched.
+                  ...deliveryEncoder,
                 },
-                buildCaptureOptions,
+                buildCaptureOptions: buildWorkerCaptureOptions,
                 createRenderVideoFrameInjector,
                 abortSignal: executionSignal,
                 assertNotAborted,
                 onProgress,
                 dedupPerfs,
+                // The plan's forceScreenshot is per attempt (a retry forces
+                // it), so it outranks the mode resolved before the router.
+                parallelCaptureLabel: streamingPlan.forceScreenshot
+                  ? "screenshot"
+                  : cfg.useDrawElement
+                    ? "drawElement"
+                    : parallelCaptureMode === "beginframe"
+                      ? "BeginFrame"
+                      : "screenshot",
               }),
           );
         };
@@ -2987,64 +5377,96 @@ async function executeRenderPipeline(input: {
         try {
           streamingRes = await invokeStreaming();
         } catch (err) {
-          // drawElement self-verification tripped (blank frame or PSNR breach
-          // vs the pre-injection ground truth), OR — when the inversion/router
-          // pinned a fixed worker count regardless of calibration — any other
-          // capture-stage failure (host contention timeout, worker crash, OOM)
-          // on that pinned path. Both restart the whole render on the same
-          // tested screenshot/parallel-SS baseline: slower, never wrong. The
-          // failed attempt's session was closed by the stage's finally;
-          // probeSession (if any) was consumed by it, so a fresh session
-          // spawns on retry. See shouldRetryViaPinnedFallback for exactly
-          // which errors qualify.
+          // drawElement self-verification or a sequential no-progress deadline
+          // restarts the whole render from a fresh screenshot session. When an
+          // inversion/router pinned the worker count, other capture-stage
+          // failures (host timeout, worker crash, OOM) can use that same tested
+          // baseline. The stage closes the failed session before throwing;
+          // probeSession (if any) was consumed by it. See
+          // shouldRetryViaPinnedFallback for exactly which errors qualify.
           const isVerifyError = isDrawElementVerificationError(err);
+          const isDeCaptureError = isDrawElementCaptureError(err);
+          const isDeStall = isDeRendererStallError(err);
+          const isSequentialStall = isSequentialCaptureStallError(err);
+          const isParallelStall = isParallelCaptureStallError(err);
+          const isEncoderDeath = isRetryableEncoderDeath(err);
           const isCancellation =
-            err instanceof RenderCancelledError || executionSignal?.aborted === true;
+            err instanceof RenderCancelledError || executionSignal.aborted === true;
           if (
             !shouldRetryViaPinnedFallback({
               isVerifyError,
+              isDeCaptureError,
               isCancellation,
+              isEncoderInterrupted: err instanceof EncoderInterruptedError,
               deWorkerInversion,
               deParallelRouter,
+              isDeRendererStall: isDeStall,
+              isSequentialCaptureStall: isSequentialStall,
+              isParallelCaptureStall: isParallelStall,
+              isEncoderDeath,
+              isTransientCaptureError: isTransientBrowserError(err),
+              isBeginFrameCapture:
+                !capturePlan.forceScreenshot &&
+                !cfg.useDrawElement &&
+                parallelCaptureMode === "beginframe",
             })
           )
             throw err;
           const isMemoryExhaustion = !isVerifyError && isMemoryExhaustionError(err);
           deSelfVerifyFallback = isVerifyError;
-          // `kind` is a structural field on the error (DrawElementVerificationDetails),
-          // never derived from message text — a reworded message, a translated
-          // string, or a cross-module/serialized error must never be able to
-          // flip "blank" into "psnr" or vice versa (review finding).
-          const verifyDetails = isVerifyError ? getDrawElementVerificationDetails(err) : undefined;
-          deFallbackReason = isVerifyError
-            ? (verifyDetails?.kind ?? "psnr")
-            : isMemoryExhaustion
-              ? "oom"
-              : "capture_error";
           if (isVerifyError) {
-            deFallbackFailedDb = roundDb(verifyDetails?.failedDb);
-            deFallbackFrameIndex = verifyDetails?.frameIndex;
-            deFallbackThresholdDb = roundDb(verifyDetails?.verifyThresholdDb);
+            const t = deVerifyFallbackTelemetry(err);
+            deFallbackReason = t.reason;
+            deFallbackFailedDb = t.failedDb;
+            deFallbackFrameIndex = t.frameIndex;
+            deFallbackThresholdDb = t.thresholdDb;
+          } else {
+            deFallbackReason = isMemoryExhaustion
+              ? "oom"
+              : isDeStall
+                ? "de_renderer_stall"
+                : isEncoderDeath
+                  ? "encoder_death"
+                  : isParallelStall
+                    ? "parallel_stall"
+                    : "capture_error";
           }
           log.warn(
             isVerifyError
               ? "[Render] drawElement self-verification failed; re-rendering via screenshot"
-              : "[Render] capture failed on the pinned worker count; re-rendering via screenshot",
+              : isDeStall
+                ? "[Render] drawElement renderer stalled; re-rendering via screenshot"
+                : isSequentialStall
+                  ? "[Render] sequential capture stalled; retrying on a fresh screenshot session"
+                  : isParallelStall
+                    ? "[Render] parallel capture stalled; retrying on a fresh screenshot session"
+                    : isEncoderDeath
+                      ? "[Render] streaming encoder died mid-render; retrying on a fresh screenshot session"
+                      : "[Render] capture failed; re-rendering via a fresh screenshot session",
             { error: err instanceof Error ? err.message : String(err) },
           );
           observability.checkpoint(
             "capture_streaming",
             isVerifyError
               ? "drawElement self-verify failed; retrying with forceScreenshot"
-              : "capture failed on pinned worker count; retrying with forceScreenshot",
+              : isDeStall
+                ? "drawElement renderer stalled; retrying with forceScreenshot"
+                : isSequentialStall
+                  ? "sequential capture stalled; retrying with a fresh screenshot session"
+                  : isParallelStall
+                    ? "parallel capture stalled; retrying with a fresh screenshot session"
+                    : isEncoderDeath
+                      ? "streaming encoder died; retrying with a fresh screenshot session"
+                      : "capture failed; retrying with a fresh screenshot session",
           );
           const failedRouting = capturePlan.routing.kind;
-          capturePlan = replanAfterFailure(
+          const failure = streamingCaptureFailure(
             capturePlan,
-            isVerifyError
-              ? { kind: "draw_element_verification" }
-              : { kind: "capture_failure", memoryExhaustion: isMemoryExhaustion },
+            { isVerifyError, isMemoryExhaustion },
+            () =>
+              inspectDiskCaptureHeadroom(framesDir, totalFrames, buildCaptureOptions()).available,
           );
+          capturePlan = replanAfterFailure(capturePlan, failure);
           syncCapturePlan();
           updateCaptureObservability({
             forceScreenshot: capturePlan.forceScreenshot,
@@ -3058,25 +5480,36 @@ async function executeRenderPipeline(input: {
             deWorkerInversion,
             deParallelRouter,
           });
-          probeSession = null;
-          if (failedRouting === "worker_inversion") {
-            // The inversion bet on drawElement and lost — re-render on the
-            // pre-inversion parallel screenshot path instead of single-worker
-            // screenshot streaming (the slowest capture shape for this size).
-            // "reverted" (not cleared) so telemetry keeps the lost-inversion
-            // cohort distinguishable from renders that never inverted.
+          // Streaming stage aims to close the probe in its own finally; if it
+          // threw before doing so, the Chrome process would orphan through the
+          // pinned-fallback retry. Close defensively before we release the
+          // reference — see closeOrphanedProbeForRetry.
+          if (probeSession) {
+            lastBrowserConsole = probeSession.browserConsoleBuffer;
+            const orphaned = probeSession;
+            probeSession = null;
+            await closeOrphanedProbeForRetry(orphaned, closeCaptureSession, log, "streaming");
+          }
+          if (failedRouting !== "default") {
+            // The inversion's / router's bet on the pinned path lost. Prefer
+            // the pre-routing parallel screenshot route; a verification
+            // failure alone also retains the already supported low-worker
+            // screenshot stream when that disk route lacks storage headroom
+            // (OOM takes the same target for RAM; other capture failures
+            // revert unconditionally). Routing stays "reverted" (not
+            // cleared) so telemetry keeps the lost-bet cohort distinguishable
+            // from renders that never routed.
+            const route =
+              failedRouting === "worker_inversion" ? "worker inversion" : "parallel router";
+            const diskFallbackLacksHeadroom =
+              failure.kind === "draw_element_verification" &&
+              failure.diskFallbackAvailable === false;
             log.info(
-              `[Render] Reverting worker inversion for the retry: ${capturePlan.workerCount} workers, ` +
-                `plan=${capturePlan.kind}.`,
-            );
-          } else if (failedRouting === "parallel_router") {
-            // The router's bet on verified parallel streaming lost — re-render
-            // on the ordinary (non-DE) parallel path at the pre-router worker
-            // count, same "reverted, not cleared" telemetry contract as the
-            // inversion above.
-            log.info(
-              `[Render] Reverting parallel router for the retry: ${capturePlan.workerCount} workers, ` +
-                `plan=${capturePlan.kind}.`,
+              diskFallbackLacksHeadroom
+                ? `[Render] ${route} disk fallback lacks headroom; retrying with ` +
+                    `${capturePlan.workerCount}-worker screenshot streaming.`
+                : `[Render] Reverting ${route} for the retry: ${capturePlan.workerCount} workers, ` +
+                    `plan=${capturePlan.kind}.`,
             );
           }
           if (capturePlan.kind === "sdr_streaming") {
@@ -3107,6 +5540,7 @@ async function executeRenderPipeline(input: {
           perfStages.captureFrameMs = captureFrameMs;
           perfStages.captureSetupMs = Math.max(0, perfStages.captureMs - captureFrameMs);
           perfStages.encodeMs = streamingRes.encodeMs; // Overlapped with capture
+          perfStages.encoderDrainWaitMs = streamingRes.encoderDrainWaitMs ?? 0;
         } else {
           if (capturePlan.kind === "sdr_streaming") {
             capturePlan = replanAfterFailure(capturePlan, { kind: "streaming_unavailable" });
@@ -3125,7 +5559,7 @@ async function executeRenderPipeline(input: {
             cfg.useDrawElement = false;
             deClampReason = deClampReason ?? "disk_path";
             log.info(
-              "[Render] Fast capture: drawElement disabled for the disk fallback — " +
+              "[Render] Fast capture: drawElement disabled for the disk fallback: " +
                 "streaming encoder spawn failed and the disk path has no runtime " +
                 "self-verification.",
             );
@@ -3144,34 +5578,143 @@ async function executeRenderPipeline(input: {
         if (capturePlan.kind !== "sdr_disk") {
           throw new Error(`Disk capture requires sdr_disk plan; got ${capturePlan.kind}`);
         }
-        const diskPlan = capturePlan;
         // ── Disk-based capture (original flow) ────────────────────────────
         resetCaptureAttemptProgress(job);
+        const encodeInput: VideoEncodeInput = {
+          job,
+          log,
+          outputPath: stagedOutputPath,
+          framesDir,
+          videoOnlyPath,
+          width,
+          height,
+          needsAlpha,
+          captureImageFormat: captureOptions.format ?? "jpeg",
+          isPngSequence,
+          isGif,
+          preset,
+          effectiveQuality,
+          effectiveBitrate,
+          enableChunkedEncode,
+          chunkedEncodeSize,
+          engineConfig: cfg,
+          // Same value the streaming encoder above spreads — the disk and
+          // chunked-concat encoders need an identical GOP lock for HLS.
+          ...deliveryEncoder,
+          abortSignal: executionSignal,
+          assertNotAborted,
+          onProgress,
+        };
+        // Not under drawElement: its verify failure discards every frame and recaptures.
+        const overlap =
+          !cfg.useDrawElement &&
+          workerSizing !== undefined &&
+          canEncodeWhileCapturing(encodeInput, capturePlan.workerCount, workerSizing.cpuCount)
+            ? encodeWhileCapturing(encodeInput, totalFrames, {
+                workerCount: capturePlan.workerCount,
+                cpuCount: workerSizing.cpuCount,
+              })
+            : null;
         const captureFrameStart = Date.now();
-        const captureRes = await observeRenderStage(
-          observability,
-          "capture_disk",
-          captureStageObservationData({ needsAlpha: diskPlan.needsAlpha }),
-          () =>
-            runCaptureStage({
-              fileServer: activeFileServer,
-              workDir,
-              framesDir,
-              job,
-              totalFrames,
-              cfg,
-              plan: diskPlan,
-              log,
-              probeSession,
-              captureAttempts,
-              dedupPerfs,
-              buildCaptureOptions,
-              createRenderVideoFrameInjector,
-              abortSignal: executionSignal,
-              assertNotAborted,
-              onProgress,
-            }),
-        );
+        const invokeDiskCapture = (diskPlan: SdrDiskCapturePlan) =>
+          observeRenderStage(
+            observability,
+            "capture_disk",
+            captureStageObservationData({ needsAlpha: diskPlan.needsAlpha }),
+            (openAttempt) =>
+              runCaptureStage({
+                fileServer: activeFileServer,
+                workDir,
+                framesDir,
+                job,
+                totalFrames,
+                cfg,
+                plan: diskPlan,
+                log,
+                probeSession,
+                captureAttempts,
+                dedupPerfs,
+                buildCaptureOptions: buildWorkerCaptureOptions,
+                createRenderVideoFrameInjector,
+                abortSignal: executionSignal,
+                assertNotAborted,
+                onProgress,
+                onFrameLanded: (frame) => overlap?.onFrameLanded(frame),
+                interleaveFrames: overlap !== null,
+                openAttempt,
+              }),
+            { stall: frameStallRule(job, totalFrames, perfStages.browserProbeMs) },
+          );
+        let captureRes;
+        try {
+          captureRes = await invokeDiskCapture(capturePlan);
+        } catch (err) {
+          await overlap?.abort();
+          // Disk-path drawElement verification or capture failed. A canvas
+          // or paint-record failure cannot use the injected page as ground truth.
+          // Same recovery contract as the streaming drain: re-render on the
+          // screenshot baseline. Anything else keeps its existing semantics.
+          if (
+            (!isDrawElementVerificationError(err) && !isDrawElementCaptureError(err)) ||
+            err instanceof RenderCancelledError ||
+            executionSignal.aborted === true
+          ) {
+            throw err;
+          }
+          deSelfVerifyFallback = isDrawElementVerificationError(err);
+          const t = deVerifyFallbackTelemetry(err);
+          deFallbackReason = deSelfVerifyFallback ? t.reason : "capture_error";
+          deFallbackFailedDb = t.failedDb;
+          deFallbackFrameIndex = t.frameIndex;
+          deFallbackThresholdDb = t.thresholdDb;
+          log.warn(
+            "[Render] drawElement capture failed on the parallel disk path; " +
+              "re-rendering via screenshot",
+            { error: err instanceof Error ? err.message : String(err) },
+          );
+          observability.checkpoint(
+            "capture_disk",
+            "drawElement capture failed; retrying with a fresh screenshot session",
+          );
+          // The failed attempt's frames are untrusted BUT satisfy the
+          // completeness check — wipe them so the retry re-captures everything
+          // instead of silently keeping damaged files.
+          rmSync(framesDir, { recursive: true, force: true });
+          mkdirSync(framesDir, { recursive: true });
+          resetCaptureAttemptProgress(job);
+          dedupPerfs.length = 0;
+          cfg.useDrawElement = false;
+          // Same shape as the streaming retry above: `runCaptureStage` was
+          // passed the probe and threw before it could close it, so we must
+          // release the Chrome process ourselves before starting the
+          // screenshot-baseline retry — otherwise it orphans until render
+          // exit. See closeOrphanedProbeForRetry.
+          if (probeSession) {
+            lastBrowserConsole = probeSession.browserConsoleBuffer;
+            const orphaned = probeSession;
+            probeSession = null;
+            await closeOrphanedProbeForRetry(orphaned, closeCaptureSession, log, "disk verify");
+          }
+          capturePlan = replanAfterFailure(capturePlan, {
+            kind: deSelfVerifyFallback ? "draw_element_verification" : "draw_element_capture",
+          });
+          syncCapturePlan();
+          updateCaptureObservability({
+            forceScreenshot: capturePlan.forceScreenshot,
+            deSelfVerifyFallback,
+            deFallbackReason,
+            deFallbackFailedDb,
+            deFallbackFrameIndex,
+            deFallbackThresholdDb,
+          });
+          if (capturePlan.kind !== "sdr_disk") {
+            throw new Error(`Disk verify retry requires sdr_disk plan; got ${capturePlan.kind}`);
+          }
+          captureRes = await invokeDiskCapture(capturePlan);
+          // The first attempt's error marked the phase failed; the retry
+          // recovered it — don't brand the render as failed in telemetry.
+          observability.clearFailure("capture_disk");
+        }
         const captureFrameMs = Date.now() - captureFrameStart;
         workerCount = captureRes.workerCount;
         updateCaptureObservability({ workerCount });
@@ -3187,6 +5730,7 @@ async function executeRenderPipeline(input: {
         perfStages.captureFrameMs = captureFrameMs;
         perfStages.captureSetupMs = Math.max(0, perfStages.captureMs - captureFrameMs);
 
+        const { hasAudio, audioOutputPath } = await mixedAudio();
         const encodeRes = await observeRenderStage(
           observability,
           "encode",
@@ -3197,29 +5741,9 @@ async function executeRenderPipeline(input: {
             chunkedEncode: enableChunkedEncode,
           }),
           () =>
-            runEncodeStage({
-              job,
-              log,
-              outputPath: stagedOutputPath,
-              framesDir,
-              videoOnlyPath,
-              width,
-              height,
-              needsAlpha,
-              hasAudio,
-              audioOutputPath,
-              isPngSequence,
-              isGif,
-              preset,
-              effectiveQuality,
-              effectiveBitrate,
-              enableChunkedEncode,
-              chunkedEncodeSize,
-              engineConfig: cfg,
-              abortSignal: executionSignal,
-              assertNotAborted,
-              onProgress,
-            }),
+            overlap
+              ? overlap.finish()
+              : runEncodeStage({ ...encodeInput, hasAudio, audioOutputPath }),
         );
         perfStages.encodeMs = encodeRes.encodeMs;
       }
@@ -3258,7 +5782,9 @@ async function executeRenderPipeline(input: {
     // ── Stage 6: Assemble ───────────────────────────────────────────────
     // Skipped for formats with no mux/faststart step. png-sequence is a
     // directory deliverable, and gif is written directly to outputPath by the
-    // two-pass palette encoder.
+    // two-pass palette encoder. hls is a directory deliverable but still runs
+    // this stage — the HLS packaging IS its assemble step.
+    const { audioOutputPath, deliverySourcePath, hasAudio } = await mixedAudio();
     if (!isPngSequence && !isGif) {
       const assembleRes = await observeRenderStage(
         observability,
@@ -3269,8 +5795,12 @@ async function executeRenderPipeline(input: {
             job,
             videoOnlyPath,
             audioOutputPath,
+            audioPcmPath: deliverySourcePath,
             outputPath: stagedOutputPath,
             hasAudio,
+            format: outputFormat,
+            hlsSegmentSeconds,
+            ffmpegProcessTimeout: cfg.ffmpegProcessTimeout,
             abortSignal: executionSignal,
             assertNotAborted,
             onProgress,
@@ -3281,7 +5811,16 @@ async function executeRenderPipeline(input: {
       observability.checkpoint("assemble", `skipped for ${outputFormat}`);
     }
 
-    artifactTransaction.validate();
+    await artifactTransaction.validate(
+      buildArtifactExpectation({
+        outputFormat,
+        durationSeconds: job.duration,
+        fps: fpsToNumber(job.config.fps),
+        expectedFrames: captureTotalFrames,
+        width: outputWidth,
+        height: outputHeight,
+      }),
+    );
 
     const totalElapsed = Date.now() - pipelineStart;
 
@@ -3292,7 +5831,8 @@ async function executeRenderPipeline(input: {
     observability.checkpoint("pipeline", "artifact validated", { totalElapsedMs: totalElapsed });
     const observabilitySummary = observability.summary({
       lastBrowserConsole,
-      capture: captureObservability,
+      capture: withCapturedBeyondViewport(captureObservability, dedupPerfs),
+      initFallback: mergeWorkerInitObservability(dedupPerfs),
       extraction: extractionObservability,
       compositionHash,
     });
@@ -3319,8 +5859,27 @@ async function executeRenderPipeline(input: {
       drawElement: {
         compileGate: deCompileGate,
         clampReason: deClampReason,
+        probeGateReason: deProbeGateReason,
         workerInversion: deWorkerInversion,
         preInversionWorkers: deWorkerInversion ? preRoutingWorkerCount : undefined,
+        compositionElementCount,
+        compositionElementCountSource,
+        compositionElementTags,
+        arollVideoCount,
+        heygenVideoCount,
+        adaptersUsed,
+        audioCount,
+        imageCount,
+        subCompositionCount,
+        audioGroupCount,
+        colorGradingCount,
+        hasLut,
+        rootBodyMismatch,
+        rootBodyDeltaPxBucket,
+        vfxHostCount,
+        vfxCapture,
+        vfxTypes,
+        shortBand: deShortBand,
         parallelRouter: deParallelRouter,
         preRouterWorkers: deParallelRouter ? preRoutingWorkerCount : undefined,
         selfVerifyFallback: deSelfVerifyFallback,
@@ -3335,6 +5894,7 @@ async function executeRenderPipeline(input: {
       observability: observabilitySummary,
       peakRssBytes: memSampler.peakRssBytes(),
       peakHeapUsedBytes: memSampler.peakHeapUsedBytes(),
+      gpuDisabled: cfg.disableGpu,
     });
     job.perfSummary = perfSummary;
     if (job.config.debug) {
@@ -3350,27 +5910,51 @@ async function executeRenderPipeline(input: {
 
     if (job.config.debug) {
       // Copy output MP4 (or single-file alpha output) into the debug dir for
-      // easy access. Skipped for png-sequence: outputPath is a directory, not
-      // a single file — the captured frames already live in `framesDir` under
-      // workDir during a debug run anyway.
-      if (!isPngSequence && existsSync(stagedOutputPath)) {
+      // easy access. Skipped for the directory formats: outputPath is a
+      // directory, not a single file — the captured frames already live in
+      // `framesDir` under workDir during a debug run anyway, and an HLS
+      // render's pre-segmentation `video-only.mp4` is already in workDir.
+      if (!isPngSequence && !isHls && existsSync(stagedOutputPath)) {
         const debugOutput = join(workDir, `output${videoExt}`);
         copyFileSync(stagedOutputPath, debugOutput);
       }
     }
 
-    artifactTransaction.commit();
+    await commitArtifactTransaction(artifactTransaction, () => {
+      assertRenderActive?.();
+      assertNotAborted();
+    });
     job.outputPath = outputPath;
     updateJobStatus(job, "complete", "Render complete", 100, onProgress);
     await eventPublisher.flush();
-  } catch (error) {
-    if (error instanceof RenderCancelledError || executionSignal?.aborted) {
+  } catch (caught) {
+    await pendingAudio;
+    const pageNeverReady = checkPageNeverReady({
+      calibrationEvaluateTimedOut,
+      framesRendered: job.framesRendered ?? 0,
+      error: caught,
+    });
+    const error = surfaceScriptFailure(
+      tooSlowError ?? audioFailure ?? pageNeverReady ?? caught,
+      job,
+    );
+    if (
+      !tooSlowError &&
+      !audioFailure &&
+      (error instanceof RenderCancelledError || executionSignal.aborted)
+    ) {
       job.error = error instanceof Error ? error.message : "render_cancelled";
       updateJobStatus(job, "cancelled", "Render cancelled", job.progress, onProgress);
       await eventPublisher.flush();
       throw error instanceof RenderCancelledError
         ? error
         : new RenderCancelledError("render_cancelled");
+    }
+    if (error instanceof EncoderInterruptedError) {
+      log.warn("[Render] encoder process interrupted by host lifecycle", {
+        code: error.code,
+        diagnostic: error.diagnosticMessage.slice(-2_000),
+      });
     }
     const memoryGuidance = describeMemoryExhaustion(error, {
       width: captureCompositionWidth,
@@ -3448,10 +6032,11 @@ async function executeRenderPipeline(input: {
       );
     }
 
-    const failedStage = job.currentStage || "pipeline";
+    const failedStage = audioFailure === undefined ? job.currentStage || "pipeline" : AUDIO_STAGE;
     const observabilitySummary = observability.summary({
       lastBrowserConsole,
-      capture: captureObservability,
+      capture: withCapturedBeyondViewport(captureObservability, dedupPerfs),
+      initFallback: mergeWorkerInitObservability(dedupPerfs),
       extraction: extractionObservability,
       compositionHash,
     });
@@ -3463,6 +6048,7 @@ async function executeRenderPipeline(input: {
       hdrDiagnostics,
       observability: observabilitySummary,
       subTimelineWait: worstSubTimelineWaitOutcome(dedupPerfs),
+      missingPath: describeMissingPath(error, { cacheDir: cfg.extractCacheDir, workDir }),
     });
     publishRenderFailure(
       job,

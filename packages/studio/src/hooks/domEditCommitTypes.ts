@@ -1,9 +1,17 @@
 import type { DomEditSelection } from "../components/editor/domEditing";
+import type { ImportedFontAsset } from "../components/editor/fontAssets";
 import type { PatchOperation, PatchTarget } from "../utils/sourcePatcher";
 
 export interface DomEditPatchBatch {
   sourceFile: string;
   patches: Array<{ target: PatchTarget; operations: PatchOperation[] }>;
+}
+
+/** Durable evidence returned by the one Studio DOM persistence actor. */
+export interface DomEditPersistOutcome {
+  sourceFile: string;
+  version: string;
+  changed: boolean;
 }
 
 export type CommitDomEditPatchBatches = (
@@ -46,7 +54,16 @@ export type PersistDomEditOperations = (
     coalesceKey?: string;
     coalesceMs?: number;
     skipRefresh?: boolean;
+    deferRender?: boolean;
+    importedFont?: ImportedFontAsset;
     prepareContent?: (html: string, sourceFile: string) => string;
     shouldSave?: () => boolean;
   },
-) => Promise<void>;
+) => Promise<DomEditPersistOutcome | undefined>;
+
+/** Several data-* and HTML attribute ops on one element as ONE persist and ONE undo entry. */
+export type CommitDomAttributeBatch = (
+  selection: DomEditSelection,
+  operations: PatchOperation[],
+  options: { label: string; prepareContent?: (html: string) => string },
+) => Promise<boolean>;

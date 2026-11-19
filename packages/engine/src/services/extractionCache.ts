@@ -16,8 +16,9 @@
  * - Cache entries live under `<rootDir>/<SCHEMA_PREFIX><key[0..16]>/` so
  *   `ls` output and tracing logs stay short. Truncation to 16 hex chars
  *   leaves 64 bits of entropy — collision risk at cache scale is negligible.
- * - Frames are extracted into a unique `<entry>.partial-<pid>-<uuid>/` dir.
- *   Once all frames are written, the partial dir receives the `.hf-complete`
+ * - Frames are extracted into a `<entry>.partial-<pid>-<random>/` dir that
+ *   `mkdtemp` creates for that one writer. Once all frames are written and
+ *   their count is the writer's own, the partial dir receives the `.hf-complete`
  *   sentinel and is atomically renamed to the final key dir. Concurrent
  *   same-key writers may duplicate ffmpeg work, but readers only ever serve
  *   complete entries.
@@ -32,23 +33,28 @@
  * become inert and can be gc'd by the caller.
  */
 
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import {
+  chmodSync,
+  createReadStream,
   existsSync,
   lstatSync,
   mkdirSync,
   readdirSync,
-  renameSync,
   rmSync,
   statSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { createStagingDir } from "@hyperframes/core/atomic-file";
+import { renameWithRetry } from "@hyperframes/core/rename-retry";
+import { basename, dirname, join } from "node:path";
+import { defaultExtractCacheDir } from "../config.js";
 import type { VideoMetadata } from "../utils/ffprobe.js";
+import { FRAME_FILENAME_PREFIX, framePathsFromDirectory } from "./extractedFrameIndex.js";
 
 /** Filename prefix for extracted frames. Shared with the extractor. */
-export const FRAME_FILENAME_PREFIX = "frame_";
+export { FRAME_FILENAME_PREFIX } from "./extractedFrameIndex.js";
 
 /** Sentinel filename written after a cache entry is fully populated. */
 export const COMPLETE_SENTINEL = ".hf-complete";
@@ -57,13 +63,23 @@ export const COMPLETE_SENTINEL = ".hf-complete";
 export const GC_MARKER = ".hf-last-gc";
 
 /**
- * Current schema version. Bump when the cache-contents invariant changes.
- * v2 -> v3: one-pass VFR extraction (-fps_mode cfr) replaces the two-pass
- * VFR-to-CFR re-encode, changing frame contents for VFR sources under
- * identical key tuples. Without the bump, warm v2 entries (two-pass frames)
- * would keep being served across the deploy boundary.
+ * `root` when it may hold cache entries, else undefined. The default root sits in the shared temp directory, so it
+ * is used only as a real directory this user owns, closed to every other user.
  */
-export const SCHEMA_PREFIX = "hfcache-v3-";
+export function privateCacheRoot(root: string, uid = process.getuid?.()): string | undefined {
+  if (uid === undefined || root !== defaultExtractCacheDir()) return root;
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const stat = lstatSync(root);
+  if (!stat.isDirectory() || stat.uid !== uid) return undefined;
+  if ((stat.mode & 0o077) !== 0) chmodSync(root, 0o700);
+  return root;
+}
+
+/**
+ * Current schema version. Bump it whenever extraction writes different frames for the same key,
+ * or warm entries keep serving the old frames across a deploy. Each bump's commit says why.
+ */
+export const SCHEMA_PREFIX = "hfcache-v10-";
 
 /** Truncated hex chars of SHA-256 used for the entry directory name. */
 const KEY_HEX_CHARS = 16;
@@ -84,12 +100,14 @@ export interface CacheKeyInput {
    *  so callers that pass an unresolved "natural duration" still produce a
    *  stable key across invocations. */
   duration: number;
-  /** Target output frames-per-second. */
-  fps: number;
+  /** Exact target output frame-rate argument (for example `30000/1001`). */
+  fps: string;
   /** Output image format. */
   format: CacheFrameFormat;
   /** Optional source transform applied during extraction. */
   transform?: string;
+  /** SHA-256 of the source bytes, in place of path and mtime (downloaded media gets new ones each render). */
+  contentSha256?: string;
 }
 
 export interface CacheEntry {
@@ -112,6 +130,19 @@ export interface CachePublishResult {
   published: boolean;
 }
 
+export async function readContentSha256(
+  path: string,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  try {
+    const hash = createHash("sha256");
+    for await (const chunk of createReadStream(path, { signal })) hash.update(chunk);
+    return hash.digest("hex");
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Read `(mtimeMs, size)` for a path. Returns `null` if the file is missing —
  * callers should skip the cache path for that entry so the extractor surfaces
@@ -130,18 +161,13 @@ export function readKeyStat(videoPath: string): { mtimeMs: number; size: number 
 
 function canonicalKeyBlob(input: CacheKeyInput): string {
   const durationForKey = Number.isFinite(input.duration) ? input.duration : -1;
-  const blob: {
-    p: string;
-    m: number;
-    s: number;
-    ms: number;
-    d: number;
-    f: number;
-    fmt: CacheFrameFormat;
-    t?: string;
-  } = {
-    p: input.videoPath,
-    m: input.mtimeMs,
+  // Identity first, so keys of path-keyed entries stay byte-identical.
+  const identity: Record<string, string | number> =
+    input.contentSha256 !== undefined
+      ? { c: input.contentSha256 }
+      : { p: input.videoPath, m: input.mtimeMs };
+  const blob: Record<string, string | number> = {
+    ...identity,
     s: input.size,
     ms: input.mediaStart,
     d: durationForKey,
@@ -168,15 +194,37 @@ export function cacheEntryDirName(keyHash: string): string {
 }
 
 /**
+ * Whether a sentineled entry directory still holds at least one frame file.
+ *
+ * The sentinel records that extraction finished, not that the frames survived.
+ * Any per-file cleanup that empties the directory leaves the sentinel behind,
+ * and the entry then rehydrates as a hit with zero frames. Deliberately
+ * format-agnostic: a hit must be usable whatever extension the frames carry.
+ */
+function hasFrameFiles(dir: string): boolean {
+  try {
+    return readdirSync(dir).some((file) => file.startsWith(FRAME_FILENAME_PREFIX));
+  } catch {
+    // Unreadable entry directory: treat as a miss and re-extract.
+    return false;
+  }
+}
+
+/**
  * Look up a cache entry by key input. Returns the resolved entry path plus a
  * `hit` flag. On miss, callers should extract frames into a
  * `partialCacheEntryDir(entry)` directory and publish it with
  * `publishCacheEntry` once extraction succeeds.
+ *
+ * An entry only counts as a hit when it carries the completion sentinel AND
+ * still has frames to serve. Without the second condition an emptied entry
+ * keeps rehydrating with zero frames, so every later render of that project
+ * fails identically at the coverage gate with no user-discoverable fix.
  */
 export function lookupCacheEntry(rootDir: string, input: CacheKeyInput): CacheLookup {
   const keyHash = computeCacheKey(input);
   const dir = join(rootDir, cacheEntryDirName(keyHash));
-  const complete = existsSync(join(dir, COMPLETE_SENTINEL));
+  const complete = existsSync(join(dir, COMPLETE_SENTINEL)) && hasFrameFiles(dir);
   return { entry: { dir, keyHash }, hit: complete };
 }
 
@@ -188,12 +236,23 @@ export function ensureCacheEntryDir(entry: CacheEntry): void {
   mkdirSync(entry.dir, { recursive: true });
 }
 
+/** A new render-owned directory to populate a cache entry in before the atomic publish rename. */
+export function createPartialCacheEntryDir(entry: CacheEntry): string {
+  return createPartialDir(dirname(entry.dir), basename(entry.dir));
+}
+
 /**
- * Unique render-owned directory used to populate a cache entry before the
- * atomic publish rename.
+ * A new, empty `<name>.partial-<pid>-<random>` directory under `parent`, named so the GC's aged-partial
+ * sweep removes it if its writer dies. `mkdtemp` creates it atomically under a name no other writer
+ * can predict or reuse, so only its creator writes to it.
  */
-export function partialCacheEntryDir(entry: CacheEntry): string {
-  return `${entry.dir}.partial-${process.pid}-${randomUUID().slice(0, 8)}`;
+export function createPartialDir(parent: string, name: string): string {
+  mkdirSync(parent, { recursive: true });
+  return createStagingDir(parent, `${name}.partial-${process.pid}-`);
+}
+
+function frameFileCount(dir: string): number {
+  return readdirSync(dir).filter((file) => file.startsWith(FRAME_FILENAME_PREFIX)).length;
 }
 
 function isTargetExistsRenameError(err: unknown): boolean {
@@ -202,33 +261,39 @@ function isTargetExistsRenameError(err: unknown): boolean {
 }
 
 /**
- * Publish an extracted partial directory as the final cache entry.
+ * If a concurrent writer's completed entry is visible, discard our partial
+ * and serve theirs. Identical keys produce identical frames, so adopting the
+ * winner is always correct. Returns null when no winner is present.
+ */
+function adoptPublishedWinner(entry: CacheEntry, partialDir: string): CachePublishResult | null {
+  if (!existsSync(join(entry.dir, COMPLETE_SENTINEL)) || !hasFrameFiles(entry.dir)) return null;
+  removeDir(partialDir);
+  return { dir: entry.dir, published: true };
+}
+
+/**
+ * Publish an extracted partial directory as the final cache entry, only when it
+ * holds exactly the `expectedFrames` its writer put there.
  *
  * Same-filesystem directory rename is atomic: readers either see no entry or
  * a complete sentineled entry. When another writer wins the race, the caller
  * should rehydrate from the final dir. If publish cannot complete safely, the
  * partial remains render-owned and must be cleaned up by the render cleanup.
  */
-/**
- * If a concurrent writer's completed entry is visible, discard our partial
- * and serve theirs. Identical keys produce identical frames, so adopting the
- * winner is always correct. Returns null when no winner is present.
- */
-function adoptPublishedWinner(entry: CacheEntry, partialDir: string): CachePublishResult | null {
-  if (!existsSync(join(entry.dir, COMPLETE_SENTINEL))) return null;
-  removeDir(partialDir);
-  return { dir: entry.dir, published: true };
-}
-
-export function publishCacheEntry(entry: CacheEntry, partialDir: string): CachePublishResult {
+export function publishCacheEntry(
+  entry: CacheEntry,
+  partialDir: string,
+  expectedFrames: number,
+): CachePublishResult {
   try {
+    if (frameFileCount(partialDir) !== expectedFrames) return { dir: partialDir, published: false };
     writeFileSync(join(partialDir, COMPLETE_SENTINEL), "", "utf-8");
   } catch {
     return { dir: partialDir, published: false };
   }
 
   try {
-    renameSync(partialDir, entry.dir);
+    renameWithRetry(partialDir, entry.dir);
     return { dir: entry.dir, published: true };
   } catch (err) {
     if (!isTargetExistsRenameError(err)) return { dir: partialDir, published: false };
@@ -244,7 +309,7 @@ export function publishCacheEntry(entry: CacheEntry, partialDir: string): CacheP
   }
 
   try {
-    renameSync(partialDir, entry.dir);
+    renameWithRetry(partialDir, entry.dir);
     return { dir: entry.dir, published: true };
   } catch {
     // TOCTOU: a concurrent writer can publish between the winner check, the
@@ -255,16 +320,35 @@ export function publishCacheEntry(entry: CacheEntry, partialDir: string): CacheP
 }
 
 /**
- * Update the LRU clock for a complete cache entry. Misses and filesystem
- * races are harmless: the caller can still use the entry it already found.
+ * Update the LRU clock for the cache entry directory at `dir`. Misses and
+ * filesystem races are harmless: the caller can still use the entry it already
+ * found. Takes a directory rather than a `CacheEntry` so a reader holding only
+ * a frame path can renew the clock with `dirname(framePath)`.
+ *
+ * Touches both signals `gcExtractionCache` reads, since which one is
+ * authoritative depends on the entry's state: `collectGcEntry` ages out a
+ * `.partial-*` writer dir by the DIRECTORY's own mtime before the sentinel is
+ * even considered, while a published (complete) entry is read by its
+ * `COMPLETE_SENTINEL` mtime. Touching only the sentinel would silently fail
+ * to renew a still-open partial dir a render depends on.
  */
-export function touchCacheEntry(entry: CacheEntry): void {
+export function touchCacheDir(dir: string): void {
+  const now = new Date();
   try {
-    const now = new Date();
-    utimesSync(join(entry.dir, COMPLETE_SENTINEL), now, now);
+    utimesSync(dir, now, now);
   } catch {
     // Best effort LRU touch.
   }
+  try {
+    utimesSync(join(dir, COMPLETE_SENTINEL), now, now);
+  } catch {
+    // Best effort LRU touch.
+  }
+}
+
+/** Update the LRU clock for a complete cache entry. See `touchCacheDir`. */
+export function touchCacheEntry(entry: CacheEntry): void {
+  touchCacheDir(entry.dir);
 }
 
 /**
@@ -297,7 +381,7 @@ function isPartialChild(name: string): boolean {
   return name.includes(".partial-");
 }
 
-function directorySizeBytes(path: string): number {
+export function directorySizeBytes(path: string): number {
   try {
     const stat = lstatSync(path);
     if (!stat.isDirectory()) return stat.size;
@@ -355,11 +439,12 @@ function collectGcEntry(
   now: number,
   minAgeMs: number,
   stats: GcStats,
+  remove: (dir: string) => void,
 ): GcEntry | null {
   try {
     const dirStat = statSync(dir);
     if (isPartialChild(name) && now - dirStat.mtimeMs >= minAgeMs) {
-      removeDir(dir);
+      remove(dir);
       stats.agedPartialsRemoved += 1;
       return null;
     }
@@ -406,16 +491,21 @@ export function gcSweepDue(rootDir: string, maxAgeMs: number): boolean {
   }
 }
 
-export function gcExtractionCache(
-  rootDir: string,
-  opts: { maxBytes: number; minAgeMs: number },
-): GcStats {
-  const stats: GcStats = { evictedEntries: 0, evictedBytes: 0, agedPartialsRemoved: 0 };
+function markGcSweep(rootDir: string): void {
   try {
     writeFileSync(join(rootDir, GC_MARKER), "", "utf-8");
   } catch {
     // Unwritable root: the sweep below will no-op on the same root anyway.
   }
+}
+
+export function gcExtractionCache(
+  rootDir: string,
+  opts: { maxBytes: number; minAgeMs: number; dryRun?: boolean },
+): GcStats {
+  const stats: GcStats = { evictedEntries: 0, evictedBytes: 0, agedPartialsRemoved: 0 };
+  const remove = opts.dryRun ? () => {} : removeDir;
+  if (!opts.dryRun) markGcSweep(rootDir);
   try {
     const now = Date.now();
     const entries: GcEntry[] = [];
@@ -427,6 +517,7 @@ export function gcExtractionCache(
         now,
         opts.minAgeMs,
         stats,
+        remove,
       );
       if (entry) entries.push(entry);
     }
@@ -438,7 +529,7 @@ export function gcExtractionCache(
     for (const entry of entries) {
       // ponytail: age-based liveness guard, not a lock; a render longer than minAge with a full cache could lose entries mid-read - acceptable, next render re-extracts.
       if (entry.ageMs < opts.minAgeMs) continue;
-      removeDir(entry.dir);
+      remove(entry.dir);
       stats.evictedEntries += 1;
       stats.evictedBytes += entry.size;
       totalBytes -= entry.size;
@@ -483,14 +574,7 @@ export function rehydrateCacheEntry(
   options: RehydrateOptions,
 ): RehydratedFrames {
   const framePattern = `${FRAME_FILENAME_PREFIX}%05d.${options.format}`;
-  const framePaths = new Map<number, string>();
-  const suffix = `.${options.format}`;
-  const files = readdirSync(entry.dir)
-    .filter((f) => f.startsWith(FRAME_FILENAME_PREFIX) && f.endsWith(suffix))
-    .sort();
-  files.forEach((file, idx) => {
-    framePaths.set(idx, join(entry.dir, file));
-  });
+  const framePaths = framePathsFromDirectory(entry.dir, options.format);
   return {
     videoId: options.videoId,
     srcPath: options.srcPath,

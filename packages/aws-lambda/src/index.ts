@@ -31,8 +31,12 @@ export {
   type LambdaResult,
   type PlanEvent,
   type PlanLambdaResult,
+  type PlanV2Event,
+  type PlanV2LambdaResult,
   type RenderChunkEvent,
   type RenderChunkLambdaResult,
+  type RenderChunkV2Event,
+  type AssembleV2Event,
   type SerializableDistributedRenderConfig,
 } from "./events.js";
 // `_setSparticuzChromiumForTests` is intentionally NOT re-exported from
@@ -47,13 +51,19 @@ export {
 } from "./chromium.js";
 export {
   downloadS3ObjectToFile,
+  downloadS3ObjectToFileVerified,
   formatS3Uri,
   parseS3Uri,
   type S3Location,
   tarDirectory,
   untarDirectory,
+  uploadContentAddressedFileToS3,
   uploadFileToS3,
 } from "./s3Transport.js";
+export {
+  S3PlanV2ArtifactPublisher,
+  type S3PlanV2ArtifactPublisherOptions,
+} from "./s3PlanV2Publisher.js";
 
 // ── Client-side SDK ─────────────────────────────────────────────────────────
 export { deploySite, type DeploySiteOptions, type SiteHandle } from "./sdk/deploySite.js";

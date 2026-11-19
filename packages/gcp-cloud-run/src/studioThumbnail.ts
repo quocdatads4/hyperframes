@@ -1,4 +1,5 @@
 import type { Browser, Page } from "puppeteer-core";
+import { grantCaptureLoads, thumbnailDeviceScaleFactor } from "@hyperframes/studio-server";
 import { resolveChromeExecutablePath } from "./chromium.js";
 
 export interface StudioThumbnailOptions {
@@ -6,9 +7,12 @@ export interface StudioThumbnailOptions {
   seekTime: number;
   width: number;
   height: number;
+  outputWidth?: number;
+  outputHeight?: number;
   format: "jpeg" | "png";
   selector?: string;
   selectorIndex?: number;
+  signal?: AbortSignal;
 }
 
 export interface StudioThumbnailConfig {
@@ -62,12 +66,41 @@ async function seekPreview(page: Page, seekTime: number): Promise<void> {
   }, seekTime);
 }
 
+export function resolveThumbnailViewport(options: {
+  width: number;
+  height: number;
+  outputWidth?: number;
+  outputHeight?: number;
+}): { width: number; height: number; deviceScaleFactor: number } {
+  const width = Math.max(1, Math.floor(options.width));
+  const height = Math.max(1, Math.floor(options.height));
+  let deviceScaleFactor = 1;
+  if (
+    typeof options.outputWidth === "number" &&
+    typeof options.outputHeight === "number" &&
+    Number.isFinite(options.outputWidth) &&
+    Number.isFinite(options.outputHeight) &&
+    options.outputWidth > 0 &&
+    options.outputHeight > 0
+  ) {
+    deviceScaleFactor = thumbnailDeviceScaleFactor({
+      width,
+      height,
+      outputWidth: options.outputWidth,
+      outputHeight: options.outputHeight,
+    });
+  }
+  return { width, height, deviceScaleFactor };
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new DOMException("Thumbnail generation aborted", "AbortError");
+  }
+}
+
 async function preparePage(page: Page, options: StudioThumbnailOptions): Promise<void> {
-  await page.setViewport({
-    width: Math.max(1, Math.floor(options.width)),
-    height: Math.max(1, Math.floor(options.height)),
-    deviceScaleFactor: 1,
-  });
+  await page.setViewport(resolveThumbnailViewport(options));
 }
 
 export class StudioThumbnailGenerator {
@@ -106,14 +139,22 @@ export class StudioThumbnailGenerator {
   }
 
   async generate(options: StudioThumbnailOptions): Promise<Buffer> {
+    throwIfAborted(options.signal);
+    const targetUrl = internalStudioPreviewUrl(options.previewUrl, this.config.internalOrigin);
+    const targetOrigin = new URL(targetUrl).origin;
     const browser = await this.getBrowser();
+    throwIfAborted(options.signal);
     const page = await browser.newPage();
     try {
       await preparePage(page, options);
-      await page.goto(internalStudioPreviewUrl(options.previewUrl, this.config.internalOrigin), {
+      await page.setExtraHTTPHeaders({ referer: `${targetOrigin}/` });
+      const cdp = await page.createCDPSession();
+      await grantCaptureLoads(cdp as unknown as Parameters<typeof grantCaptureLoads>[0], targetUrl);
+      await page.goto(targetUrl, {
         waitUntil: "domcontentloaded",
         timeout: this.config.navigationTimeoutMs,
       });
+      throwIfAborted(options.signal);
       await page
         .waitForFunction(
           () => {
@@ -125,6 +166,7 @@ export class StudioThumbnailGenerator {
           { timeout: this.config.timelineTimeoutMs },
         )
         .catch(() => undefined);
+      throwIfAborted(options.signal);
       await seekPreview(page, options.seekTime);
       await page.evaluate(async () => {
         document.documentElement.style.background = "#1c2028";
@@ -134,6 +176,7 @@ export class StudioThumbnailGenerator {
         await document.fonts?.ready;
       });
       await new Promise((resolve) => setTimeout(resolve, this.config.settleMs));
+      throwIfAborted(options.signal);
 
       if (options.selector) {
         const elements = await page.$$(options.selector);

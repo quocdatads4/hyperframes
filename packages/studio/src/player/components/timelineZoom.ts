@@ -1,7 +1,10 @@
 import type { ZoomMode } from "../store/playerStore";
+import { STUDIO_PREVIEW_FPS } from "../lib/time";
 
 export const MIN_TIMELINE_ZOOM_PERCENT = 10;
-export const MAX_TIMELINE_ZOOM_PERCENT = 2000;
+/** Inset so a range zoom does not sit on the viewport edge. Shared with the range box. */
+export const TIMELINE_RANGE_MARGIN_PX = 24;
+const MAX_TIMELINE_FRAME_WIDTH_PX = 48;
 // CapCut-strength steps: one button press / pinch gesture moves the zoom
 // meaningfully (user feedback, twice-doubled: 1.25×/0.8× + 0.0035 felt like
 // "zooming several times to get anywhere", then 1.5× + 0.007 still too soft).
@@ -10,16 +13,24 @@ const ZOOM_OUT_FACTOR = 0.5;
 const ZOOM_IN_FACTOR = 2;
 const PINCH_ZOOM_SENSITIVITY = 0.014;
 
-export function clampTimelineZoomPercent(percent: number): number {
-  if (!Number.isFinite(percent)) return 100;
-  return Math.max(
-    MIN_TIMELINE_ZOOM_PERCENT,
-    Math.min(MAX_TIMELINE_ZOOM_PERCENT, Math.round(percent)),
-  );
+export function getMaxTimelineZoomPercent(fitPixelsPerSecond: number): number {
+  if (!Number.isFinite(fitPixelsPerSecond) || fitPixelsPerSecond <= 0) return 100;
+  const frameLevelPixelsPerSecond = STUDIO_PREVIEW_FPS * MAX_TIMELINE_FRAME_WIDTH_PX;
+  return Math.max(100, Math.round((frameLevelPixelsPerSecond / fitPixelsPerSecond) * 100));
 }
 
-export function getTimelineZoomPercent(zoomMode: ZoomMode, manualZoomPercent: number): number {
-  return zoomMode === "fit" ? 100 : clampTimelineZoomPercent(manualZoomPercent);
+export function clampTimelineZoomPercent(percent: number, fitPixelsPerSecond: number): number {
+  if (!Number.isFinite(percent)) return 100;
+  const maxZoomPercent = getMaxTimelineZoomPercent(fitPixelsPerSecond);
+  return Math.max(MIN_TIMELINE_ZOOM_PERCENT, Math.min(maxZoomPercent, Math.round(percent)));
+}
+
+export function getTimelineZoomPercent(
+  zoomMode: ZoomMode,
+  manualZoomPercent: number,
+  fitPixelsPerSecond: number,
+): number {
+  return zoomMode === "fit" ? 100 : clampTimelineZoomPercent(manualZoomPercent, fitPixelsPerSecond);
 }
 
 /**
@@ -47,7 +58,10 @@ export function computePinnedZoomPercent(
   ) {
     return 100;
   }
-  return clampTimelineZoomPercent((currentPixelsPerSecond / fitPixelsPerSecond) * 100);
+  return clampTimelineZoomPercent(
+    (currentPixelsPerSecond / fitPixelsPerSecond) * 100,
+    fitPixelsPerSecond,
+  );
 }
 
 export function getTimelinePixelsPerSecond(
@@ -56,7 +70,7 @@ export function getTimelinePixelsPerSecond(
   manualZoomPercent: number,
 ): number {
   if (!Number.isFinite(fitPixelsPerSecond) || fitPixelsPerSecond <= 0) return 100;
-  const zoomPercent = getTimelineZoomPercent(zoomMode, manualZoomPercent);
+  const zoomPercent = getTimelineZoomPercent(zoomMode, manualZoomPercent, fitPixelsPerSecond);
   return zoomMode === "fit" ? fitPixelsPerSecond : fitPixelsPerSecond * (zoomPercent / 100);
 }
 
@@ -64,41 +78,99 @@ export function getNextTimelineZoomPercent(
   direction: "in" | "out",
   zoomMode: ZoomMode,
   manualZoomPercent: number,
+  fitPixelsPerSecond: number,
 ): number {
-  const current = getTimelineZoomPercent(zoomMode, manualZoomPercent);
+  const current = getTimelineZoomPercent(zoomMode, manualZoomPercent, fitPixelsPerSecond);
   const next = direction === "in" ? current * ZOOM_IN_FACTOR : current * ZOOM_OUT_FACTOR;
-  return clampTimelineZoomPercent(next);
+  return clampTimelineZoomPercent(next, fitPixelsPerSecond);
 }
 
 export function getPinchTimelineZoomPercent(
   deltaY: number,
   zoomMode: ZoomMode,
   manualZoomPercent: number,
+  fitPixelsPerSecond: number,
 ): number {
-  const current = getTimelineZoomPercent(zoomMode, manualZoomPercent);
+  const current = getTimelineZoomPercent(zoomMode, manualZoomPercent, fitPixelsPerSecond);
   if (!Number.isFinite(deltaY) || deltaY === 0) return current;
-  return clampTimelineZoomPercent(current * Math.exp(-deltaY * PINCH_ZOOM_SENSITIVITY));
+  return clampTimelineZoomPercent(
+    current * Math.exp(-deltaY * PINCH_ZOOM_SENSITIVITY),
+    fitPixelsPerSecond,
+  );
 }
 
 const LOG_MIN = Math.log(MIN_TIMELINE_ZOOM_PERCENT);
-const LOG_MAX = Math.log(MAX_TIMELINE_ZOOM_PERCENT);
 
 /**
- * Maps a zoom percent (10–2000) to a slider position (0–100) using a log scale.
- * Log scale is used because the range spans 200×; linear would compress the
- * low end (10–100%) into a tiny sliver of the slider.
+ * Maps the frame-level zoom range to a slider position (0–100) using a log scale.
+ * Linear would compress the useful low end into a tiny sliver of the slider.
  */
-export function timelineZoomPercentToSlider(percent: number): number {
-  const clamped = clampTimelineZoomPercent(percent);
-  return ((Math.log(clamped) - LOG_MIN) / (LOG_MAX - LOG_MIN)) * 100;
+export function timelineZoomPercentToSlider(percent: number, fitPixelsPerSecond: number): number {
+  const clamped = clampTimelineZoomPercent(percent, fitPixelsPerSecond);
+  const logMax = Math.log(getMaxTimelineZoomPercent(fitPixelsPerSecond));
+  return ((Math.log(clamped) - LOG_MIN) / (logMax - LOG_MIN)) * 100;
 }
 
 /**
- * Maps a slider position (0–100) to a zoom percent (10–2000) using a log scale.
+ * Maps a slider position (0–100) to the frame-level zoom range using a log scale.
  * Inverse of `timelineZoomPercentToSlider`.
  */
-export function timelineSliderToZoomPercent(slider: number): number {
+export function timelineSliderToZoomPercent(slider: number, fitPixelsPerSecond: number): number {
   const clampedSlider = Math.max(0, Math.min(100, slider));
-  const logValue = LOG_MIN + (clampedSlider / 100) * (LOG_MAX - LOG_MIN);
-  return clampTimelineZoomPercent(Math.exp(logValue));
+  const logMax = Math.log(getMaxTimelineZoomPercent(fitPixelsPerSecond));
+  const logValue = LOG_MIN + (clampedSlider / 100) * (logMax - LOG_MIN);
+  return clampTimelineZoomPercent(Math.exp(logValue), fitPixelsPerSecond);
+}
+
+export interface ClipTimeSpan {
+  start: number;
+  end: number;
+}
+
+export interface SelectedClipsZoom {
+  start: number;
+  end: number;
+  zoomPercent: number;
+}
+
+/** Union of clips with a positive duration. Zero-length entries are not a range. */
+export function positiveClipSpan(
+  clips: readonly ClipTimeSpan[],
+): { start: number; end: number } | null {
+  let start = Number.POSITIVE_INFINITY;
+  let end = Number.NEGATIVE_INFINITY;
+  for (const clip of clips) {
+    if (!Number.isFinite(clip.start) || !Number.isFinite(clip.end) || !(clip.end > clip.start)) {
+      continue;
+    }
+    if (clip.start < start) start = clip.start;
+    if (clip.end > end) end = clip.end;
+  }
+  if (!Number.isFinite(start) || !(end > start)) return null;
+  return { start, end };
+}
+
+export function zoomToSelectedClips(input: {
+  clips: readonly ClipTimeSpan[];
+  viewportWidth: number;
+  contentOrigin: number;
+  fitPixelsPerSecond: number;
+  marginPx?: number;
+}): SelectedClipsZoom | null {
+  const margin = input.marginPx ?? TIMELINE_RANGE_MARGIN_PX;
+  const span = positiveClipSpan(input.clips);
+  const fitPps = input.fitPixelsPerSecond;
+  const viewport = input.viewportWidth;
+  const origin = input.contentOrigin;
+  if (!span) return null;
+  if (!Number.isFinite(fitPps) || !(fitPps > 0)) return null;
+  // A collapsed timeline is no wider than its headers, so there is no track to fit.
+  if (!Number.isFinite(viewport) || !Number.isFinite(origin) || !(viewport > origin)) return null;
+
+  const usable = Math.max(1, viewport - origin - margin * 2);
+  const zoomPercent = clampTimelineZoomPercent(
+    (usable / (span.end - span.start) / fitPps) * 100,
+    fitPps,
+  );
+  return { start: span.start, end: span.end, zoomPercent };
 }

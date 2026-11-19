@@ -1,5 +1,9 @@
-import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import { replaceFileAtomically } from "@hyperframes/core/atomic-file";
+import { readJsonFileText } from "../utils/jsonFlag.js";
 import { extname, join } from "node:path";
+import { parseExpressionAt, tokenizer } from "acorn";
+import { parseHTML } from "linkedom";
 
 export interface Word {
   /** Stable identifier for referencing this word in overrides and compositions.
@@ -38,7 +42,7 @@ export function detectFormat(filePath: string): TranscriptFormat {
   const ext = extname(filePath).toLowerCase();
   if (ext === ".srt") return "srt";
   if (ext === ".vtt") return "vtt";
-  if (ext === ".json") return detectJsonFormat(JSON.parse(readFileSync(filePath, "utf-8")));
+  if (ext === ".json") return detectJsonFormat(parseWhisperJson(readJsonFileText(filePath)));
   throw new Error(`Unsupported transcript file extension: ${ext}. Use .json, .srt, or .vtt`);
 }
 
@@ -48,7 +52,10 @@ function detectJsonFormat(raw: unknown): TranscriptFormat {
     if (obj.transcription && Array.isArray(obj.transcription)) return "whisper-cpp";
     if (obj.words && Array.isArray(obj.words)) return "openai";
   }
-  if (Array.isArray(raw) && raw[0]?.text !== undefined && raw[0]?.start !== undefined) {
+  if (
+    Array.isArray(raw) &&
+    raw.slice(0, 1).every((w) => w?.text !== undefined && w?.start !== undefined)
+  ) {
     return "words-json";
   }
   throw new Error(
@@ -122,6 +129,26 @@ function interpolateZeroDuration(words: Word[]): void {
   }
 }
 
+const TRAILING_PUNCTUATION = /^[.,!?;:'")\]}>…–—¡¿\-，。！？、；：」』）】》〉]+$/;
+
+function crossesCjkBoundary(left: string, right: string): boolean {
+  return CJK_CHAR.test(left.at(-1) ?? "") || CJK_CHAR.test(right[0] ?? "");
+}
+
+/**
+ * Whether a token extends the previous word: a sub-word continuation, trailing
+ * punctuation, or a contraction suffix. Whisper marks word boundaries with a
+ * leading space, except in CJK, where no token has one: there each token is
+ * its own word.
+ */
+function continuesWord(previous: string, rawText: string, text: string): boolean {
+  return (
+    TRAILING_PUNCTUATION.test(text) ||
+    /^'(t|m|s|ve|re|ll|d)$/i.test(text) ||
+    (!rawText.startsWith(" ") && !crossesCjkBoundary(previous, text))
+  );
+}
+
 function parseWhisperCpp(data: Record<string, unknown>): Word[] {
   const words: Word[] = [];
   const transcription = data.transcription as Array<{
@@ -138,16 +165,7 @@ function parseWhisperCpp(data: Record<string, unknown>): Word[] {
       if (!text || text.startsWith("[_") || text.startsWith("[BLANK")) continue;
 
       const lastWord = words[words.length - 1];
-
-      // Merge into previous word when the token is a sub-word continuation,
-      // trailing punctuation, or a contraction suffix.
-      // Whisper uses leading spaces to mark word boundaries in all languages.
-      const shouldMerge =
-        lastWord &&
-        (!rawText.startsWith(" ") ||
-          /^[.,!?;:'")\]}>…–—¡¿-]+$/.test(text) ||
-          /^'(t|m|s|ve|re|ll|d)$/i.test(text));
-      if (shouldMerge) {
+      if (lastWord && continuesWord(lastWord.text, rawText, text)) {
         lastWord.text += text;
         lastWord.end = round3((token.offsets?.to ?? 0) / 1000);
         continue;
@@ -186,7 +204,7 @@ function parseOpenAI(data: Record<string, unknown>): Word[] {
 function parseSrt(content: string): Word[] {
   // SRT doesn't have word-level timestamps — parse as phrase-level entries.
   // Each cue becomes one "word" entry (the full phrase).
-  const blocks = content.trim().split(/\n\n+/);
+  const blocks = content.replace(/\r\n?/g, "\n").trim().split(/\n\n+/);
   const words: Word[] = [];
 
   for (const block of blocks) {
@@ -214,9 +232,16 @@ function parseSrt(content: string): Word[] {
   return words;
 }
 
+function decodeVttText(text: string): string {
+  if (!text.includes("&")) return text;
+  const { document } = parseHTML("<html><body></body></html>");
+  const element = document.createElement("span");
+  element.innerHTML = text.replace(/</g, "&lt;");
+  return element.textContent ?? "";
+}
+
 function parseVtt(content: string): Word[] {
-  // Strip the WEBVTT header and any metadata blocks
-  const body = content.replace(/^WEBVTT[^\n]*\n/, "").replace(/^[A-Z-]+:.*\n/gm, "");
+  const body = content.replace(/\r\n?/g, "\n").replace(/^WEBVTT[^\n]*\n/, "");
   // VTT is structurally similar to SRT (without numeric indices)
   const blocks = body.trim().split(/\n\n+/);
   const words: Word[] = [];
@@ -237,7 +262,7 @@ function parseVtt(content: string): Word[] {
     if (!text) continue;
 
     words.push({
-      text,
+      text: decodeVttText(text),
       start: parseVttTimestamp(startStr),
       end: parseVttTimestamp(endStr),
     });
@@ -263,8 +288,9 @@ function parseSrtTimestamp(ts: string): number {
 
 /** Parse VTT timestamp: 00:01:23.456 or 01:23.456 → seconds */
 function parseVttTimestamp(ts: string): number {
-  const parts = ts.split(":");
-  if (parts.length === 3) return parseSrtTimestamp(ts);
+  const timestamp = ts.split(/[ \t]+/, 1)[0] ?? "";
+  const parts = timestamp.split(":");
+  if (parts.length === 3) return parseSrtTimestamp(timestamp);
   // MM:SS.mmm
   if (parts.length === 2) {
     const [min, secMs] = parts;
@@ -318,7 +344,7 @@ function pad3(n: number): string {
 }
 
 function endsSentence(text: string): boolean {
-  return /[.!?][)"'\]}]*$/.test(text);
+  return /[.!?。！？][)"'\]}」』）]*$/.test(text);
 }
 
 function pushCue(cues: Cue[], cue: Cue | undefined): void {
@@ -356,21 +382,59 @@ function entriesToCues(words: Word[]): Cue[] {
 // inter-word spaces.
 const CJK_CHAR = /[　-〿぀-ヿ㐀-䶿一-鿿豈-﫿＀-￯]/;
 
+// Scripts written without inter-word spaces: the CJK ranges above plus Thai,
+// Lao, Myanmar and Khmer. Used only to decide whether entries are already
+// phrase-level — the whitespace test below cannot answer that for these
+// scripts. Hangul is excluded for the same reason as in CJK_CHAR.
+const SPACELESS_SCRIPT_CHAR = /[฀-๿຀-໿က-႟ក-៿　-〿぀-ヿ㐀-䶿一-鿿豈-﫿＀-￯]/;
+
+// Whisper emits word-level tokens for spaceless scripts one or two characters
+// at a time, while a phrase-level cue runs to several times that. Four is
+// comfortably above the token case and below any real caption.
+const SPACELESS_PHRASE_MIN_CHARS = 4;
+
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length === 0) return 0;
+  if (sorted.length % 2 === 1) return sorted[mid] ?? 0;
+  return ((sorted[mid - 1] ?? 0) + (sorted[mid] ?? 0)) / 2;
+}
+
+/**
+ * Whether the entries are already grouped into phrases.
+ *
+ * Any entry containing internal whitespace is a multi-word phrase, which
+ * settles it for space-separated scripts. Chinese, Japanese, Thai and the
+ * other spaceless scripts never satisfy that test, so their phrase-level
+ * transcripts used to be re-grouped into a single cue covering the whole
+ * clip. For those, fall back to entry length instead.
+ *
+ * The median, rather than `some` or `every`, keeps one long token from
+ * declaring word-level input pre-grouped and a couple of short cues (a bare
+ * yes or no) from declaring a real transcript word-level.
+ */
+function inferPreGrouped(words: Word[]): boolean {
+  if (words.some((w) => /\s/.test(w.text.trim()))) return true;
+
+  const spaceless = words.filter((w) => SPACELESS_SCRIPT_CHAR.test(w.text));
+  if (spaceless.length === 0) return false;
+
+  return median(spaceless.map((w) => w.text.trim().length)) >= SPACELESS_PHRASE_MIN_CHARS;
+}
+
 /** Join two adjacent tokens, omitting the space across a CJK boundary. */
 function joinTokens(left: string, right: string): string {
-  const a = left.at(-1) ?? "";
-  const b = right[0] ?? "";
-  const sep = CJK_CHAR.test(a) || CJK_CHAR.test(b) ? "" : " ";
-  return `${left}${sep}${right}`;
+  return `${left}${crossesCjkBoundary(left, right) ? "" : " "}${right}`;
 }
 
 export function wordsToCues(words: Word[], opts: WordsToCuesOptions = {}): Cue[] {
   // Phrase-level transcripts (imported .srt/.vtt cues) must keep their existing
   // cue boundaries — re-grouping would merge distinct captions and lose timing.
-  // The caller can force this via `preGrouped`; otherwise infer it from the data
-  // (any entry containing internal whitespace is a multi-word phrase, so the
-  // whole transcript is phrase-level rather than word-level whisper output).
-  const preGrouped = opts.preGrouped ?? words.some((w) => /\s/.test(w.text.trim()));
+  // The caller can force this via `preGrouped`; otherwise infer it from the
+  // data — internal whitespace for space-separated scripts, entry length for
+  // the scripts that have no inter-word spaces to look for.
+  const preGrouped = opts.preGrouped ?? inferPreGrouped(words);
   if (preGrouped) return entriesToCues(words);
 
   const maxChars = opts.maxChars ?? 42;
@@ -424,7 +488,8 @@ export function formatVtt(words: Word[], opts?: WordsToCuesOptions): string {
     "WEBVTT\n\n" +
     cues
       .map(
-        (cue) => `${formatVttTimestamp(cue.start)} --> ${formatVttTimestamp(cue.end)}\n${cue.text}`,
+        (cue) =>
+          `${formatVttTimestamp(cue.start)} --> ${formatVttTimestamp(cue.end)}\n${cue.text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}`,
       )
       .join("\n\n") +
     "\n"
@@ -434,6 +499,15 @@ export function formatVtt(words: Word[], opts?: WordsToCuesOptions): string {
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+const BARE_NAN_OR_INF_OUTSIDE_STRINGS =
+  /"(?:[^"\\]|\\.)*"|-?\b(?:nan(?:\([^)]*\))?|inf(?:inity)?)(?!\w)/gi;
+
+export function parseWhisperJson(text: string): any {
+  return JSON.parse(
+    text.replace(BARE_NAN_OR_INF_OUTSIDE_STRINGS, (m) => (m.startsWith('"') ? m : "null")),
+  );
+}
 
 /**
  * Load and normalize a transcript file to a standard word array.
@@ -447,7 +521,7 @@ export function formatVtt(words: Word[], opts?: WordsToCuesOptions): string {
  */
 export function loadTranscript(filePath: string): { words: Word[]; format: TranscriptFormat } {
   const ext = extname(filePath).toLowerCase();
-  const content = readFileSync(filePath, "utf-8");
+  const content = readJsonFileText(filePath);
 
   if (ext === ".srt") {
     const words = parseSrt(content).map((w, i) => ({ ...w, id: w.id ?? `w${i}` }));
@@ -459,39 +533,51 @@ export function loadTranscript(filePath: string): { words: Word[]; format: Trans
   }
 
   // JSON formats — parse once, detect, then extract words
-  const parsed = JSON.parse(content);
+  const parsed = parseWhisperJson(content);
   const format = detectJsonFormat(parsed);
 
-  const words =
+  // JSON parsers never set id — assign w{index} like the srt/vtt branches above
+  // so caption overrides always have a stable key. `||` (not `??`) also repairs
+  // the empty-string ids older CLIs wrote to words-json transcript files.
+  const words = (
     format === "whisper-cpp"
       ? parseWhisperCpp(parsed)
       : format === "openai"
         ? parseOpenAI(parsed)
         : (parsed as Word[]).map((w) => ({
-            id: w.id ?? "",
+            id: w.id,
             text: w.text.trim(),
             start: round3(w.start),
             end: round3(w.end),
-          }));
+          }))
+  ).map((w, i) => ({ ...w, id: w.id || `w${i}` }));
 
   return { words, format };
 }
 
-/**
- * Remove words that fall before the detected speech onset.
- * Whisper can hallucinate words over non-speech sections at the start of audio.
- */
-export function stripBeforeOnset(words: Word[], onsetSeconds: number): Word[] {
-  // 0.5s tolerance: keep words whose timestamps straddle the onset boundary,
-  // since whisper may assign a slightly early start to the first spoken word.
-  return words.filter((w) => w.start >= onsetSeconds - 0.5);
+function findCaptionArray(source: string, name: "script" | "TRANSCRIPT"): string | undefined {
+  const prefix = `const ${name} = `;
+  const start = source.indexOf(`${prefix}[`);
+  if (start < 0) return undefined;
+
+  try {
+    const array = parseExpressionAt(source, start + prefix.length, { ecmaVersion: "latest" });
+    if (array.type !== "ArrayExpression") return undefined;
+    const terminator = tokenizer(source.slice(array.end), { ecmaVersion: "latest" }).getToken();
+    if (terminator.type.label !== ";") return undefined;
+    return source.slice(start, array.end + terminator.end);
+  } catch {
+    return undefined;
+  }
 }
 
 export function patchCaptionHtml(dir: string, words: Word[]): void {
   if (words.length === 0) return;
 
   // Indent to 10 spaces to match typical composition script indentation
-  const wordsJson = JSON.stringify(words, null, 2).replace(/\n/g, "\n          ");
+  const wordsJson = JSON.stringify(words, null, 2)
+    .replace(/</g, "\\u003c")
+    .replace(/\n/g, "\n          ");
 
   let htmlFiles: string[];
   try {
@@ -505,17 +591,17 @@ export function patchCaptionHtml(dir: string, words: Word[]): void {
   for (const file of htmlFiles) {
     let content = readFileSync(file, "utf-8");
     const scriptBlocks = content.match(/<script>[\s\S]*?<\/script>/g) ?? [];
-    let scriptMatch: RegExpMatchArray | null = null;
-    let transcriptMatch: RegExpMatchArray | null = null;
+    let scriptMatch: string | undefined;
+    let transcriptMatch: string | undefined;
     for (const block of scriptBlocks) {
-      scriptMatch = scriptMatch ?? block.match(/const script = \[[\s\S]*?\];/);
-      transcriptMatch = transcriptMatch ?? block.match(/const TRANSCRIPT = \[[\s\S]*?\];/);
+      scriptMatch = scriptMatch ?? findCaptionArray(block, "script");
+      transcriptMatch = transcriptMatch ?? findCaptionArray(block, "TRANSCRIPT");
     }
     const match = scriptMatch ?? transcriptMatch;
     if (match) {
       const varName = scriptMatch ? "script" : "TRANSCRIPT";
-      content = content.replace(match[0], `const ${varName} = ${wordsJson};`);
-      writeFileSync(file, content, "utf-8");
+      content = content.replace(match, () => `const ${varName} = ${wordsJson};`);
+      replaceFileAtomically(file, content);
     }
   }
 }

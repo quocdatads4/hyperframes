@@ -16,21 +16,52 @@
 // submodule so Windows builds don't emit backslash-separated paths (or worse,
 // drive-letter-prefixed artifacts from `resolve("/", ...)`).
 import { posix } from "path";
+import { cssUrlMatches, replaceMatches } from "./cssUrlScans.js";
+import { rewriteSrcsetUrls } from "./srcset.js";
 const { join, resolve, dirname } = posix;
 
-import { CSS_URL_RE, PATH_ATTRS, isNonRelativeUrl } from "./assetPaths.js";
+import {
+  PATH_ATTRS,
+  isNonRelativeUrl,
+  splitUrlSuffix,
+  decodeWellFormedEscapes,
+  encodeUrlPath,
+} from "./assetPaths.js";
 
 const isAbsoluteOrSpecial = isNonRelativeUrl;
 
+/** Gets the length a rebased path added over the authored one. */
+export type ChargeRebase = (addedBytes: number) => void;
+
 /**
  * Returns true only for paths that traverse up with `../`.
- * Plain relative paths like `assets/foo.svg` are already correct from the
- * root perspective — the browser resolves them against the served root, which
- * is the project root, so they don't need rewriting.
+ * Plain relative paths like `assets/foo.svg` are ambiguous: two conventions are
+ * in the wild, and only the filesystem can tell them apart — see `AssetExists`.
  */
 function needsRewrite(val: string): boolean {
   return val.startsWith("../") || val === "..";
 }
+
+/**
+ * Probe for "does this project-root-relative path exist?", supplied by callers
+ * that can see the filesystem (the studio preview builder, the bundler, the
+ * producer). Keeps this module free of `node:fs` so it stays browser-safe.
+ *
+ * It disambiguates the two conventions for a plain relative path authored in a
+ * sub-composition that lives in a subdirectory:
+ *
+ *   1. A SIBLING file — `<link href="_shared.css">` next to the composition.
+ *      This is what a browser resolves when the file is opened directly, and
+ *      what an author means. Once the content moves into the project-root
+ *      document it must become `design/styleframes/_shared.css` or it 404s.
+ *   2. A PROJECT-ROOT asset — registry blocks are installed into a
+ *      subdirectory but reference `assets/logo.png` at the root. Already
+ *      correct in the root document; rewriting would break it.
+ *
+ * A sibling that exists on disk means (1); anything else is left as authored.
+ * Without a probe the behavior is unchanged — plain relative paths pass through.
+ */
+export type AssetExists = (projectRelativePath: string) => boolean;
 
 /**
  * Rewrite a single relative path from a sub-composition's context to the
@@ -38,17 +69,28 @@ function needsRewrite(val: string): boolean {
  *
  * @param compSrcPath - The `data-composition-src` value (e.g. "compositions/scene.html")
  * @param relativePath - The asset path to rewrite (e.g. "../icon.svg")
+ * @param assetExists - Optional filesystem probe; see `AssetExists`.
  * @returns The rewritten path relative to project root (e.g. "icon.svg"), or
  *          the original path if no rewriting is needed.
  */
-export function rewriteAssetPath(compSrcPath: string, relativePath: string): string {
+export function rewriteAssetPath(
+  compSrcPath: string,
+  relativePath: string,
+  assetExists?: AssetExists,
+  charge?: ChargeRebase,
+): string {
   if (isAbsoluteOrSpecial(relativePath)) return relativePath;
-  if (!needsRewrite(relativePath)) return relativePath;
   const compDir = dirname(compSrcPath);
   if (!compDir || compDir === ".") return relativePath;
-  const resolved = join(compDir, relativePath);
-  const normalized = resolve("/", resolved).slice(1);
-  return normalized;
+  const { basePath, suffix } = splitUrlSuffix(relativePath);
+  const slashed = basePath.replace(/\\/g, "/");
+  if (!slashed || slashed.startsWith("/")) return relativePath;
+  const filePath = decodeWellFormedEscapes(slashed);
+  const sibling = resolve("/", join(compDir, filePath)).slice(1);
+  if (!needsRewrite(filePath) && (!assetExists || !assetExists(sibling))) return relativePath;
+  const rebased = encodeUrlPath(sibling) + suffix;
+  charge?.(rebased.length - relativePath.length);
+  return rebased;
 }
 
 /**
@@ -66,15 +108,23 @@ export function rewriteAssetPaths<T>(
   compSrcPath: string,
   getAttr: (el: T, attr: string) => string | null | undefined,
   setAttr: (el: T, attr: string, value: string) => void,
+  assetExists?: AssetExists,
+  charge?: ChargeRebase,
 ): void {
   for (const el of elements) {
     for (const attr of PATH_ATTRS) {
       const val = (getAttr(el, attr) || "").trim();
-      const rewritten = rewriteAssetPath(compSrcPath, val);
+      const rewritten = rewriteAssetPath(compSrcPath, val, assetExists, charge);
       if (rewritten !== val) {
         setAttr(el, attr, rewritten);
       }
     }
+    const srcset = getAttr(el, "srcset");
+    if (!srcset) continue;
+    const rewritten = rewriteSrcsetUrls(srcset, (url) =>
+      rewriteAssetPath(compSrcPath, url, assetExists, charge),
+    );
+    if (rewritten !== srcset) setAttr(el, "srcset", rewritten);
   }
 }
 
@@ -86,6 +136,8 @@ export function rewriteInlineStyleAssetUrls<T>(
   compSrcPath: string,
   getStyle: (el: T) => string | null | undefined,
   setStyle: (el: T, value: string) => void,
+  assetExists?: AssetExists,
+  charge?: ChargeRebase,
 ): void {
   const compDir = dirname(compSrcPath);
   if (!compDir || compDir === ".") return;
@@ -93,7 +145,7 @@ export function rewriteInlineStyleAssetUrls<T>(
   for (const el of elements) {
     const style = getStyle(el);
     if (!style) continue;
-    const rewritten = rewriteCssAssetUrls(style, compSrcPath);
+    const rewritten = rewriteCssAssetUrls(style, compSrcPath, assetExists, charge);
     if (rewritten !== style) {
       setStyle(el, rewritten);
     }
@@ -104,11 +156,16 @@ export function rewriteInlineStyleAssetUrls<T>(
  * Rewrite CSS url(...) references in a sub-composition's inline styles so
  * ../foo.woff2 remains valid after the CSS is hoisted into the root document.
  */
-export function rewriteCssAssetUrls(cssText: string, compSrcPath: string): string {
+export function rewriteCssAssetUrls(
+  cssText: string,
+  compSrcPath: string,
+  assetExists?: AssetExists,
+  charge?: ChargeRebase,
+): string {
   if (!cssText) return cssText;
-  return cssText.replace(CSS_URL_RE, (full, quote: string, rawUrl: string) => {
+  return replaceMatches(cssText, cssUrlMatches(cssText), (full, quote, rawUrl) => {
     const urlValue = (rawUrl || "").trim();
-    const rewritten = rewriteAssetPath(compSrcPath, urlValue);
+    const rewritten = rewriteAssetPath(compSrcPath, urlValue, assetExists, charge);
     if (rewritten === urlValue) return full;
     return `url(${quote || ""}${rewritten}${quote || ""})`;
   });

@@ -20,7 +20,16 @@ import type { GsapProvenance } from "./gsapSerialize.js";
 type Node = any;
 
 /** Node keys that are metadata, not child AST to traverse/substitute. */
-const SKIP_KEYS = new Set(["type", "start", "end", "loc", "range", "__hfProvenance", "__hfOrder"]);
+const SKIP_KEYS = new Set([
+  "type",
+  "start",
+  "end",
+  "loc",
+  "range",
+  "__hfProvenance",
+  "__hfOrder",
+  "__hfSiteStart",
+]);
 
 const FUNCTION_TYPES = new Set([
   "ArrowFunctionExpression",
@@ -32,8 +41,12 @@ const GSAP_METHODS = new Set(["set", "to", "from", "fromTo"]);
 // Bounds on synthetic expansion (recursion + iteration runaway guards).
 const MAX_DEPTH = 8;
 const MAX_ITERS = 512;
+// ponytail: clone budget per script; >10x the measured max of 21,000 (registry, examples, skills, docs, producer tests).
+const MAX_EXPANDED_NODES = 250_000;
 
-function isFunctionNode(node: Node): boolean {
+class ExpansionBudgetExceeded extends Error {}
+
+export function isFunctionNode(node: Node): boolean {
   return !!node && FUNCTION_TYPES.has(node.type);
 }
 
@@ -161,6 +174,9 @@ interface ExpandCtx {
   site: { n: number };
   /** Mutable counter stamping expansion order onto tweens (clones share source loc). */
   order: { n: number };
+  /** Source offset of the top-level statement being expanded; tweens inherit it as their sort site. */
+  rootStart: number;
+  budget: { left: number };
 }
 
 function walkNodes(node: Node, fn: (n: Node) => void): void {
@@ -181,11 +197,18 @@ function timelineRootName(call: Node): string | null {
   return obj?.type === "Identifier" ? obj.name : null;
 }
 
-function isTimelineRooted(call: Node, timelineVar: string): boolean {
+export function isTimelineRooted(call: Node, timelineVar: string): boolean {
   if (timelineRootName(call) !== timelineVar) return false;
   return (
     call.callee?.property?.type === "Identifier" && GSAP_METHODS.has(call.callee.property.name)
   );
+}
+
+/** True for `tl.addLabel(...)`: not a tween, but its position must sort in the same coordinate
+ *  space as tween calls, or a label defined inside an inlined helper resolves at its declaration
+ *  offset instead of its call site. */
+function isAddLabelCall(call: Node, timelineVar: string): boolean {
+  return timelineRootName(call) === timelineVar && call.callee?.property?.name === "addLabel";
 }
 
 function containsTimelineCall(node: Node, timelineVar: string): boolean {
@@ -202,13 +225,102 @@ function rangeOf(node: Node): [number, number] | undefined {
     : undefined;
 }
 
-/** Plain identifier params + block body (shape we can inline). Timeline content checked separately. */
+interface SupportedParam {
+  name: string;
+  defaultExpression?: Node;
+}
+
+const SAFE_DEFAULT_NODES = new Set([
+  "ArrayExpression",
+  "BinaryExpression",
+  "ChainExpression",
+  "ConditionalExpression",
+  "Identifier",
+  "Literal",
+  "LogicalExpression",
+  "MemberExpression",
+  "ObjectExpression",
+  "Property",
+  "SpreadElement",
+  "TemplateElement",
+  "TemplateLiteral",
+  "UnaryExpression",
+]);
+
+// ponytail: This allowlist is intentionally load-bearing. Defaults are evaluated
+// while deciding whether a helper declaration can be erased, so admitting calls,
+// assignments, updates, or constructors here could execute author code at a
+// different time (or more than once). Add syntax only with negative-path tests.
+
+/**
+ * A default expression is safe only when evaluating it cannot execute author
+ * code and every value identifier refers to an earlier parameter. This mirrors
+ * JavaScript's left-to-right default binding while keeping the static parser
+ * deliberately narrower than a JavaScript interpreter.
+ */
+function isSafeDefaultExpression(node: Node, earlierParams: ReadonlySet<string>): boolean {
+  let safe = true;
+  // fallow-ignore-next-line complexity
+  const visit = (current: Node, parent?: Node, key?: string): void => {
+    if (!isNode(current) || !safe) return;
+    if (!SAFE_DEFAULT_NODES.has(current.type)) {
+      safe = false;
+      return;
+    }
+    if (current.type === "UnaryExpression" && current.operator === "delete") {
+      safe = false;
+      return;
+    }
+    if (current.type === "Identifier") {
+      const nonValue = parent && key ? isNonValueIdentifierSlot(parent, key) : false;
+      if (!nonValue && current.name !== "undefined" && !earlierParams.has(current.name)) {
+        safe = false;
+      }
+      return;
+    }
+    for (const childKey of Object.keys(current)) {
+      if (SKIP_KEYS.has(childKey)) continue;
+      const child = current[childKey];
+      if (Array.isArray(child)) {
+        for (const item of child) visit(item, current, childKey);
+      } else {
+        visit(child, current, childKey);
+      }
+    }
+  };
+  visit(node);
+  return safe;
+}
+
+const SUPPORTED_PARAMS_CACHE = new WeakMap<object, SupportedParam[] | null>();
+
+function supportedParam(param: Node, earlier: ReadonlySet<string>): SupportedParam | null {
+  if (param.type === "Identifier") return { name: param.name };
+  if (param.type !== "AssignmentPattern" || param.left?.type !== "Identifier") return null;
+  if (!isSafeDefaultExpression(param.right, earlier)) return null;
+  return { name: param.left.name, defaultExpression: param.right };
+}
+
+function supportedParams(fn: Node): SupportedParam[] | null {
+  if (SUPPORTED_PARAMS_CACHE.has(fn)) return SUPPORTED_PARAMS_CACHE.get(fn) ?? null;
+  const params: SupportedParam[] = [];
+  const earlier = new Set<string>();
+  for (const param of fn.params ?? []) {
+    const parsed = supportedParam(param, earlier);
+    if (!parsed) {
+      SUPPORTED_PARAMS_CACHE.set(fn, null);
+      return null;
+    }
+    params.push(parsed);
+    earlier.add(parsed.name);
+  }
+  SUPPORTED_PARAMS_CACHE.set(fn, params);
+  return params;
+}
+
+/** Identifier/default params + block body (shape we can inline). Timeline content checked separately. */
 function isShapeEligible(fn: Node): boolean {
-  return (
-    isFunctionNode(fn) &&
-    fn.body?.type === "BlockStatement" &&
-    !(fn.params ?? []).some((p: Node) => p.type !== "Identifier")
-  );
+  return isFunctionNode(fn) && fn.body?.type === "BlockStatement" && supportedParams(fn) !== null;
 }
 
 /** True if the subtree calls any function named in `names`. */
@@ -274,6 +386,60 @@ function bump(counts: Map<string, number>, key: string): void {
   counts.set(key, (counts.get(key) ?? 0) + 1);
 }
 
+function undefinedIdentifier(): Node {
+  return { type: "Identifier", name: "undefined" };
+}
+
+function isExplicitUndefined(node: Node | undefined): boolean {
+  return (
+    (node?.type === "Identifier" && node.name === "undefined") ||
+    (node?.type === "UnaryExpression" &&
+      node.operator === "void" &&
+      node.argument?.type === "Literal" &&
+      node.argument.value === 0)
+  );
+}
+
+function hasSpreadArgument(call: Node): boolean {
+  return !!call.arguments?.some((arg: Node) => arg?.type === "SpreadElement");
+}
+
+/** Resolve one call exactly as JavaScript binds identifier/default parameters. */
+function resolveHelperBindings(
+  call: Node,
+  params: SupportedParam[],
+  ctx: ExpandCtx,
+): Map<string, Node> | null {
+  if (hasSpreadArgument(call)) return null;
+
+  const bindings = new Map<string, Node>();
+  for (let i = 0; i < params.length; i++) {
+    const param = params[i]!;
+    const arg = call.arguments?.[i];
+    if (arg && !isExplicitUndefined(arg)) {
+      bindings.set(param.name, arg);
+    } else if (param.defaultExpression) {
+      chargeBudget([param.defaultExpression], bindings, ctx);
+      bindings.set(param.name, substituteParams(cloneNode(param.defaultExpression), bindings));
+    } else {
+      // Omitted required parameters are still bound by JavaScript. Keeping an
+      // explicit undefined node prevents a dropped helper declaration from
+      // leaving its parameter identifier dangling in the synthetic AST.
+      bindings.set(param.name, undefinedIdentifier());
+    }
+  }
+  return bindings;
+}
+
+function statementHelperCall(node: Node, names: ReadonlySet<string>): Node | undefined {
+  if (node.type !== "ExpressionStatement") return undefined;
+  const expression = node.expression;
+  if (expression?.type !== "CallExpression" || expression.callee?.type !== "Identifier") {
+    return undefined;
+  }
+  return names.has(expression.callee.name) ? expression : undefined;
+}
+
 /**
  * Keep only candidates safe to drop: every reference to the name is its
  * declaration or a statement-level call. (1 decl id + 1 callee id per
@@ -283,20 +449,21 @@ function safelyDroppable(program: Node, candidates: Map<string, Node>): Map<stri
   const names = new Set(candidates.keys());
   const totalIds = new Map<string, number>();
   const stmtCalls = new Map<string, number>();
+  const unbindable = new Set<string>();
   walkNodes(program, (n) => {
     if (n.type === "Identifier" && names.has(n.name)) bump(totalIds, n.name);
-    const e = n.type === "ExpressionStatement" ? n.expression : undefined;
-    if (
-      e?.type === "CallExpression" &&
-      e.callee?.type === "Identifier" &&
-      names.has(e.callee.name)
-    ) {
-      bump(stmtCalls, e.callee.name);
-    }
+    const call = statementHelperCall(n, names);
+    if (!call) return;
+    bump(stmtCalls, call.callee.name);
+    const fn = candidates.get(call.callee.name);
+    const params = fn && supportedParams(fn);
+    if (!params || hasSpreadArgument(call)) unbindable.add(call.callee.name);
   });
   const safe = new Map<string, Node>();
   for (const [name, fn] of candidates) {
-    if ((totalIds.get(name) ?? 0) === 1 + (stmtCalls.get(name) ?? 0)) safe.set(name, fn);
+    if (!unbindable.has(name) && (totalIds.get(name) ?? 0) === 1 + (stmtCalls.get(name) ?? 0)) {
+      safe.set(name, fn);
+    }
   }
   return safe;
 }
@@ -328,13 +495,48 @@ function bodyStatements(node: Node): Node[] {
 /** Tag this body's direct timeline tweens with provenance + a monotonic expansion-order stamp. */
 function tagTimelineCalls(stmts: Node[], prov: GsapProvenance, ctx: ExpandCtx): void {
   for (const stmt of stmts) {
+    const calls: Node[] = [];
     walkNodes(stmt, (n) => {
-      if (n.type === "CallExpression" && isTimelineRooted(n, ctx.timelineVar)) {
-        tagProvenance(n, { ...prov });
-        n.__hfOrder = ctx.order.n++;
-      }
+      if (
+        n.type === "CallExpression" &&
+        (isTimelineRooted(n, ctx.timelineVar) || isAddLabelCall(n, ctx.timelineVar))
+      )
+        calls.push(n);
+    });
+    // A chain's outer call is visited first but runs last; stamp in source order.
+    calls.sort((a, b) => a.callee.property.start - b.callee.property.start);
+    for (const n of calls) {
+      tagProvenance(n, { ...prov });
+      n.__hfOrder = ctx.order.n++;
+      n.__hfSiteStart = ctx.rootStart;
+    }
+  }
+}
+
+function nodeCount(root: Node): number {
+  let n = 0;
+  walkNodes(root, () => n++);
+  return n;
+}
+
+/** Charge the nodes about to be cloned (and a fixed cost), plus each bound argument's size per use; abort past the budget. */
+function chargeBudget(
+  stmts: Node[],
+  bindings: Map<string, Node>,
+  ctx: ExpandCtx,
+  fixedCost = 0,
+): void {
+  const bindingSize = new Map<string, number>();
+  ctx.budget.left -= fixedCost;
+  for (const stmt of stmts) {
+    walkNodes(stmt, (n) => {
+      ctx.budget.left--;
+      if (n.type !== "Identifier" || !bindings.has(n.name)) return;
+      if (!bindingSize.has(n.name)) bindingSize.set(n.name, nodeCount(bindings.get(n.name)));
+      ctx.budget.left -= bindingSize.get(n.name)!;
     });
   }
+  if (ctx.budget.left < 0) throw new ExpansionBudgetExceeded();
 }
 
 /** Clone a body as one scope, substitute the bindings, tag provenance, recurse. */
@@ -344,6 +546,7 @@ function expandBody(
   prov: GsapProvenance,
   ctx: ExpandCtx,
 ): Node[] {
+  chargeBudget(bodyStmts, bindings, ctx, 1 + bindings.size);
   const block = substituteParams(cloneNode({ type: "BlockStatement", body: bodyStmts }), bindings);
   tagProvenance(block, prov);
   tagTimelineCalls(block.body, prov, ctx);
@@ -354,13 +557,13 @@ function expandBody(
   return [block];
 }
 
-function inlineHelper(call: Node, ctx: ExpandCtx): Node[] {
+function inlineHelper(call: Node, ctx: ExpandCtx): Node[] | null {
   const fn = ctx.helpers.get(call.callee.name);
-  const bindings = new Map<string, Node>();
-  (fn.params ?? []).forEach((p: Node, i: number) => {
-    const arg = call.arguments?.[i];
-    if (arg) bindings.set(p.name, arg);
-  });
+  if (!fn) return null;
+  const params = supportedParams(fn);
+  if (!params) return null;
+  const bindings = resolveHelperBindings(call, params, ctx);
+  if (!bindings) return null;
   const prov: GsapProvenance = {
     kind: "helper",
     fn: call.callee.name,
@@ -440,10 +643,13 @@ function unrollFor(stmt: Node, ctx: ExpandCtx): Node[] | null {
   if (!h) return null;
   const body = bodyStatements(stmt.body);
   const out: Node[] = [];
+  let count = 0;
+  for (let x = h.start; loopSatisfied(h.op, x, h.end); x += h.step) {
+    if (++count > MAX_ITERS) return null;
+  }
   const site = ++ctx.site.n;
   let iteration = 0;
   for (let x = h.start; loopSatisfied(h.op, x, h.end); x += h.step) {
-    if (iteration >= MAX_ITERS) return null;
     const prov: GsapProvenance = {
       kind: "loop",
       callSite: site,
@@ -472,7 +678,8 @@ function unrollOverArray(
   idxName: string | null,
   range: [number, number] | undefined,
   ctx: ExpandCtx,
-): Node[] {
+): Node[] | null {
+  if (elements.length > MAX_ITERS) return null;
   const out: Node[] = [];
   const site = ++ctx.site.n;
   elements.forEach((el, i) => {
@@ -575,6 +782,8 @@ function expandStatements(stmts: Node[], ctx: ExpandCtx): Node[] {
  * statements, each tagged with provenance. Mutates `ast` in place (caller owns
  * the freshly-parsed tree). Constructs it can't statically resolve are left
  * untouched, so the parser falls back to current behavior for them.
+ *
+ * An overrun leaves `ast` as received: `ast.body` is assigned only after every statement expanded.
  */
 export function inlineComputedTimelines(
   ast: Node,
@@ -589,7 +798,16 @@ export function inlineComputedTimelines(
     depth: 0,
     site: { n: 0 },
     order: { n: 0 },
+    rootStart: 0,
+    budget: { left: MAX_EXPANDED_NODES },
   };
   const body = (ast.body ?? []).filter((stmt: Node) => !isHelperDecl(stmt, helpers));
-  ast.body = expandStatements(body, ctx);
+  try {
+    ast.body = body.flatMap((stmt: Node) => {
+      ctx.rootStart = stmt.start;
+      return expandStatements([stmt], ctx);
+    });
+  } catch (error) {
+    if (!(error instanceof ExpansionBudgetExceeded)) throw error;
+  }
 }

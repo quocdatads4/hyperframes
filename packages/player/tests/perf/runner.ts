@@ -3,15 +3,6 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import puppeteer, { type Browser, type LaunchOptions, type Page } from "puppeteer-core";
 
-/**
- * Puppeteer browser + page helpers shared across all perf scenarios.
- *
- * Browser launch args mirror packages/producer/src/parity-harness.ts so we get
- * the same SwiftShader-backed WebGL output and font hinting between perf runs
- * and visual parity runs. That parity matters for P0-1c (live-playback parity)
- * and is harmless for the load/scrub/drift scenarios.
- */
-
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PLAYER_PKG = resolve(HERE, "../..");
 
@@ -41,9 +32,11 @@ declare global {
   interface Window {
     __playerReady?: boolean;
     __playerReadyAt?: number;
+    __playerAssetsReady?: boolean;
     __playerNavStart?: number;
     __playerDuration?: number;
     __playerError?: string;
+    __sandboxProbeResults?: boolean[];
   }
 }
 
@@ -123,6 +116,23 @@ export async function loadHostPage(
   const loadMs = performance.now() - t0;
   const duration = (await page.evaluate(() => window.__playerDuration ?? 0)) ?? 0;
   return { loadMs, duration };
+}
+
+/**
+ * Wait for the player's own `assetsready` signal. `play()` queues until it fires, so a
+ * scenario that plays right after `ready` and waits a fixed window for `isPlaying` races the gate.
+ */
+export async function waitForPlayerAssetsReady(
+  page: Pick<Page, "waitForFunction">,
+  timeoutMs = 30_000,
+): Promise<void> {
+  try {
+    await page.waitForFunction(() => window.__playerAssetsReady === true, { timeout: timeoutMs });
+  } catch (e) {
+    throw new Error(
+      `[player-perf] player never emitted assetsready within ${timeoutMs}ms; play() stays queued behind the asset gate (${e instanceof Error ? e.message : String(e)})`,
+    );
+  }
 }
 
 export function percentile(samples: number[], pct: number): number {

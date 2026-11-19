@@ -1,7 +1,28 @@
-export { createStudioApi } from "./createStudioApi.js";
-export { createProjectSignature } from "./helpers/projectSignature.js";
+export { createStudioApi, type StudioApiOptions } from "./createStudioApi.js";
+export {
+  refuseServiceWorkerScripts,
+  serviceWorkerScriptFetch,
+} from "./helpers/serviceWorkerScripts.js";
+export {
+  PREVIEW_ALLOWED_HOSTS_ENV,
+  previewAllowedHostsFromEnv,
+} from "./helpers/requestIdentity.js";
+export { MAX_UPLOAD_BYTES } from "./routes/files.js";
+export {
+  createProjectSignature,
+  createProjectSignatureAsync,
+  affectsProjectSignature,
+  STUDIO_SIGNATURE_MANIFEST_PATHS,
+} from "./helpers/projectSignature.js";
+export { compositionsAffectedBy } from "./helpers/compositionInputs.js";
+export { affectsPreview } from "./helpers/previewReads.js";
+export * from "./history/index.js";
+export { cleanupProxyCache } from "./helpers/proxyCache.js";
+export { CACHE_DIR_NAME as PROXY_CACHE_DIR_NAME } from "./helpers/proxyTranscoder.js";
 export type {
   StudioApiAdapter,
+  StudioRefusal,
+  StudioRefusalWhy,
   ResolvedProject,
   RenderJobState,
   MediaProcessingJobState,
@@ -11,15 +32,49 @@ export type {
   StudioSelectionTextField,
 } from "./types.js";
 export { isSafePath, walkDir } from "./helpers/safePath.js";
+export { stampProjectHfIds, stampProjectHfIdsAsync } from "./helpers/hfIdPersist.js";
+export {
+  patchElementInHtml,
+  splitElementInHtml,
+  removeElementFromHtml,
+  findTargetElement,
+  parseSourceDocument,
+  dedupeClonedCompositionId,
+  type PatchOperation,
+  type SourceMutationTarget,
+} from "./helpers/sourceMutation.js";
+export { duplicateElementInHtml, type DuplicateElementResult } from "./helpers/duplicateElement.js";
+export {
+  applyFileMutations,
+  type AppliedFileMutation,
+  type FileMutationInput,
+} from "./helpers/applyFileMutations.js";
 export type { PreviewApiAdapter } from "./helpers/mediaProxyPreview.js";
+export { PREVIEW_BUNDLE_OPTIONS } from "./routes/preview.js";
+export { createPreviewDocumentStore } from "./helpers/previewDocumentStore.js";
 export { getMimeType, MIME_TYPES } from "./helpers/mime.js";
+export { decodeWellFormedEscapes, requestSubPath } from "./helpers/requestSubPath.js";
+export { originForListeningAddress } from "./helpers/serverOrigin.js";
+export { MAX_OPEN_MEDIA_RANGE_BYTES, openRangeEnd } from "./helpers/mediaRange.js";
 export {
   consumeFileWriteReceipt,
+  identifyFileWrite,
   fileContentVersion,
+  DELETED_VERSION,
+  settledFileTag,
   type FileWriteReceipt,
 } from "./helpers/fileVersion.js";
 export { buildSubCompositionHtml } from "./helpers/subComposition.js";
-export { getElementScreenshotClip, type ScreenshotClip } from "./helpers/screenshotClip.js";
+export { captureLoadGrant, grantCaptureLoads } from "./helpers/captureLoads.js";
+export {
+  clearElementScreenshotIsolation,
+  getElementScreenshotClip,
+  type ScreenshotClip,
+} from "./helpers/screenshotClip.js";
+export {
+  thumbnailDeviceScaleFactor,
+  type ThumbnailOutputDimensions,
+} from "./helpers/thumbnailOutput.js";
 export {
   createBackgroundRemovalJob,
   type BackgroundRemovalRender,
@@ -35,3 +90,12 @@ export {
   createStudioMotionRenderBodyScript,
   type StudioMotionRenderScriptOptions,
 } from "./helpers/studioMotionRenderScript.js";
+export type {
+  LocalShareAudience,
+  LocalShareSpace,
+  LocalShareState,
+  LocalShareJob,
+  LocalShareSnapshot,
+  LocalShareAction,
+  LocalShareInteraction,
+} from "./localShare.js";

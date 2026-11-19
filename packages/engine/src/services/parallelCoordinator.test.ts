@@ -1,19 +1,56 @@
-import { describe, it, expect } from "vitest";
+import { availableParallelism, totalmem } from "os";
+import { getHeapStatistics } from "v8";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import {
   calculateOptimalWorkers,
   computeWorkerSizing,
+  createPoolFailureHandler,
   distributeFrames,
   expectedFramesForTask,
   flagSilentWorkerExits,
+  formatPoolFailure,
   formatWorkerFailure,
+  isFfmpegInfrastructureFailure,
+  isPoolFatalWorkerFailure,
+  selectVerifySampleIndicesForTask,
   selectWorkerDiagnostics,
   shouldDisableBrowserPoolForParallelWorker,
   shouldVerifyWorkerGpu,
   synthesizeSilentWorkerExitError,
+  withParallelWorkerDeadline,
   resolveParallelDeVerifySamples,
   type WorkerResult,
 } from "./parallelCoordinator.js";
 import type { EngineConfig } from "../config.js";
+import { CaptureFailure } from "./captureFailure.js";
+
+describe("parallel worker phase deadline", () => {
+  it("fails a wedged operation with phase and browser diagnostics before the aggregate watchdog", async () => {
+    vi.useFakeTimers();
+    try {
+      const raced = withParallelWorkerDeadline(
+        new Promise<void>(() => {}),
+        {
+          workerId: 2,
+          phase: "frame_capture",
+          frameIndex: 0,
+          browserExecutable: "C:/Chrome/chrome.exe",
+          browserVersion: "Chrome/152.0.7977.30",
+          canvasDrawElement: true,
+          gpuBackend: "d3d11/nvidia",
+        },
+        30_000,
+      );
+      const assertion = expect(raced).rejects.toThrow(
+        /worker=2.*phase=frame_capture.*frame=0.*Chrome\/152.*CanvasDrawElement=true.*gpu=d3d11\/nvidia/,
+      );
+      await vi.advanceTimersByTimeAsync(30_000);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe("distributeFrames", () => {
   it("distributes frames evenly across workers", () => {
@@ -94,7 +131,87 @@ describe("calculateOptimalWorkers", () => {
   });
 });
 
+vi.mock("os", async (importOriginal) => {
+  const os = await importOriginal<typeof import("os")>();
+  return {
+    ...os,
+    default: os,
+    availableParallelism: vi.fn(os.availableParallelism),
+    totalmem: vi.fn(os.totalmem),
+  };
+});
+vi.mock("v8", async (importOriginal) => {
+  const v8 = await importOriginal<typeof import("v8")>();
+  return { ...v8, default: v8, getHeapStatistics: vi.fn(v8.getHeapStatistics) };
+});
+
 describe("computeWorkerSizing", () => {
+  afterEach(() => {
+    vi.mocked(availableParallelism).mockRestore();
+    vi.mocked(totalmem).mockRestore();
+    vi.mocked(getHeapStatistics).mockRestore();
+  });
+
+  // The field case: a 24GB 14-core Mac, Node's default ~4GB heap, a long 1080x1920 project.
+  it("never auto-picks more workers than the V8 heap can feed", () => {
+    vi.mocked(availableParallelism).mockReturnValue(14);
+    vi.mocked(totalmem).mockReturnValue(24 * 1024 ** 3);
+    vi.mocked(getHeapStatistics).mockReturnValue({
+      heap_size_limit: 2096 * 1024 ** 2,
+    } as ReturnType<typeof getHeapStatistics>);
+    const sizing = computeWorkerSizing(1300, undefined, { concurrency: "auto" });
+    expect(sizing.heapBasedWorkers).toBe(3);
+    expect(sizing.workers).toBe(3);
+    expect(sizing.boundBy).toBe("heap");
+    expect(sizing.exceedsHeapAdvisory).toBe(false);
+    expect(computeWorkerSizing(1300, 6, { concurrency: "auto" }).workers).toBe(6);
+    vi.mocked(getHeapStatistics).mockReturnValue({
+      heap_size_limit: 8192 * 1024 ** 2,
+    } as ReturnType<typeof getHeapStatistics>);
+    expect(computeWorkerSizing(1300, undefined, { concurrency: "auto" }).workers).toBe(5);
+  });
+
+  it("keeps the desktop app's 4,192 MB heap at the old per-worker figure (#5149)", () => {
+    vi.mocked(availableParallelism).mockReturnValue(14);
+    vi.mocked(totalmem).mockReturnValue(24 * 1024 ** 3);
+    vi.mocked(getHeapStatistics).mockReturnValue({
+      heap_size_limit: 4192 * 1024 ** 2,
+    } as ReturnType<typeof getHeapStatistics>);
+    expect(computeWorkerSizing(1300, undefined, { concurrency: "auto" }).heapBasedWorkers).toBe(9);
+    Object.defineProperty(process.versions, "electron", { value: "44.2.0", configurable: true });
+    try {
+      const sizing = computeWorkerSizing(1300, undefined, { concurrency: "auto" });
+      expect(sizing.heapBasedWorkers).toBe(4);
+      expect(sizing.workers).toBe(4);
+      expect(sizing.boundBy).toBe("heap");
+    } finally {
+      delete (process.versions as Record<string, string | undefined>).electron;
+    }
+    // A packaged app runs the CLI on its own plain Node, tagged as the desktop client.
+    vi.stubEnv("HYPERFRAMES_CLIENT", "desktop/1.4.0/stable");
+    try {
+      expect(computeWorkerSizing(1300, undefined, { concurrency: "auto" }).heapBasedWorkers).toBe(
+        4,
+      );
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("sizes Apple-GPU disk capture by its own heap and core budget", () => {
+    vi.mocked(availableParallelism).mockReturnValue(14);
+    vi.mocked(totalmem).mockReturnValue(24 * 1024 ** 3);
+    vi.mocked(getHeapStatistics).mockReturnValue({
+      heap_size_limit: 4192 * 1024 ** 2,
+    } as ReturnType<typeof getHeapStatistics>);
+    const apple = { concurrency: "auto" as const, appleGpuDiskCapture: true };
+    const sizing = computeWorkerSizing(1300, undefined, apple);
+    expect(sizing.workers).toBe(8);
+    expect(sizing.boundBy).toBe("memory");
+    expect(sizing.exceedsHeapAdvisory).toBe(false);
+    expect(computeWorkerSizing(1300, undefined, { ...apple, coresPerWorker: 4 }).workers).toBe(3);
+  });
+
   it("matches calculateOptimalWorkers and reports every constraint", () => {
     const config = { concurrency: "auto" as const };
     const sizing = computeWorkerSizing(900, undefined, config);
@@ -139,40 +256,15 @@ describe("computeWorkerSizing", () => {
 });
 
 describe("shouldDisableBrowserPoolForParallelWorker", () => {
-  const linuxHeadlessWorker = {
-    parallel: true,
-    platform: "linux" as NodeJS.Platform,
-    deviceScaleFactor: 1,
-    headlessShellPath: "/tmp/chrome-headless-shell",
-  };
+  // heygen-com/hyperframes#5548: pages sharing one browser share its
+  // connections to the file server, so every platform isolates workers.
+  it("gives every parallel worker its own browser", () => {
+    expect(shouldDisableBrowserPoolForParallelWorker({ parallel: true })).toBe(true);
+  });
 
-  it.each([
-    ["BeginFrame", false],
-    ["forced screenshot", true],
-  ])(
-    "disables the browser pool for parallel Linux/headless %s workers",
-    (_mode, forceScreenshot) => {
-      expect(
-        shouldDisableBrowserPoolForParallelWorker({
-          ...linuxHeadlessWorker,
-          forceScreenshot,
-        }),
-      ).toBe(true);
-    },
-  );
-
-  it.each([
-    ["non-parallel", { parallel: false, forceScreenshot: true }],
-    ["non-linux", { platform: "darwin" as NodeJS.Platform, forceScreenshot: true }],
-    ["no headless shell", { headlessShellPath: undefined, forceScreenshot: true }],
-    ["supersampled", { deviceScaleFactor: 2, forceScreenshot: false }],
-  ])("keeps the shared pool for %s workers", (_case, overrides) => {
-    expect(
-      shouldDisableBrowserPoolForParallelWorker({
-        ...linuxHeadlessWorker,
-        ...overrides,
-      }),
-    ).toBe(false);
+  it("keeps the shared pool for a single worker", () => {
+    expect(shouldDisableBrowserPoolForParallelWorker({ parallel: false })).toBe(false);
+    expect(shouldDisableBrowserPoolForParallelWorker({})).toBe(false);
   });
 });
 
@@ -193,6 +285,35 @@ describe("worker failure diagnostics", () => {
       "[Browser:HTTP404] GET https://cdn.example.com/missing.png resource=image Not Found",
       "[FrameCapture:ERROR] page.goto failed mode=screenshot timeoutMs=60000 elapsedMs=60001 url=http://127.0.0.1:4173/index.html error=timeout",
     ]);
+  });
+
+  it("names the worker that failed and counts the peers it stopped", () => {
+    const worker = (workerId: number, failure: CaptureFailure): WorkerResult => ({
+      workerId,
+      framesCaptured: 0,
+      startFrame: 0,
+      endFrame: 30,
+      durationMs: 10,
+      error: failure.message,
+      failure,
+    });
+    const stopped = (workerId: number) =>
+      worker(
+        workerId,
+        new CaptureFailure({ kind: "cancelled", message: "Parallel worker cancelled" }),
+      );
+    const cause = worker(3, new CaptureFailure({ kind: "io", message: "disk is full" }));
+
+    expect(formatPoolFailure([stopped(0), stopped(1), cause, stopped(4)])).toBe(
+      "Worker 3: disk is full (3 other workers were stopped after this failure)",
+    );
+    expect(formatPoolFailure([cause, stopped(4)])).toBe(
+      "Worker 3: disk is full (1 other worker was stopped after this failure)",
+    );
+    expect(formatPoolFailure([cause])).toBe("Worker 3: disk is full");
+    expect(formatPoolFailure([stopped(0), stopped(1)])).toBe(
+      "Worker 0: Parallel worker cancelled; Worker 1: Parallel worker cancelled",
+    );
   });
 
   it("adds compact diagnostics to the worker failure message", () => {
@@ -349,6 +470,35 @@ describe("flagSilentWorkerExits", () => {
   });
 });
 
+describe("selectVerifySampleIndicesForTask", () => {
+  it("keeps only samples inside the task's contiguous range, sorted", () => {
+    // 2-worker split of 3032 frames: worker 1 owns [1516, 3032).
+    expect(
+      selectVerifySampleIndicesForTask([2274, 758, 1516, 3031, 3032], {
+        startFrame: 1516,
+        endFrame: 3032,
+      }),
+    ).toEqual([1516, 2274, 3031]);
+  });
+
+  it("respects the stride lattice for interleaved tasks", () => {
+    // Worker 1 of a 3-way interleave over [1, 30): captures 1, 4, 7, ...
+    expect(
+      selectVerifySampleIndicesForTask([1, 2, 4, 6, 7, 28, 29], {
+        startFrame: 1,
+        endFrame: 30,
+        frameStride: 3,
+      }),
+    ).toEqual([1, 4, 7, 28]);
+  });
+
+  it("returns empty when no samples fall in the range", () => {
+    expect(
+      selectVerifySampleIndicesForTask([0, 10, 20], { startFrame: 100, endFrame: 200 }),
+    ).toEqual([]);
+  });
+});
+
 describe("shouldVerifyWorkerGpu", () => {
   const softwareConfig: Partial<EngineConfig> = { browserGpuMode: "software" };
 
@@ -393,5 +543,156 @@ describe("resolveParallelDeVerifySamples", () => {
 
   it("passes a caller-set value through untouched", () => {
     expect(resolveParallelDeVerifySamples(2, 3)).toBe(2);
+  });
+});
+
+describe("isFfmpegInfrastructureFailure", () => {
+  it("matches an execFile ENOENT (missing ffmpeg binary)", () => {
+    const err = Object.assign(new Error("spawn ffmpeg ENOENT"), { code: "ENOENT" });
+    expect(isFfmpegInfrastructureFailure(err)).toBe(true);
+  });
+
+  it('matches ffmpeg\'s "No such filter" stderr (libpostproc-less build)', () => {
+    const err = Object.assign(new Error("Command failed"), {
+      stderr:
+        "Error initializing filter 'psnr' with args ''\n" +
+        "  No such filter: 'psnr'\n" +
+        "Error opening filters!",
+    });
+    expect(isFfmpegInfrastructureFailure(err)).toBe(true);
+  });
+
+  it("matches the older `Unknown filter 'psnr'` wording (ffmpeg <=5)", () => {
+    const err = Object.assign(new Error("Command failed"), {
+      stderr: "Unknown filter 'psnr'",
+    });
+    expect(isFfmpegInfrastructureFailure(err)).toBe(true);
+  });
+
+  it("does not match per-sample noise (readFile race, transient EPERM)", () => {
+    const eperm = Object.assign(new Error("EACCES: permission denied, open '/tmp/…'"), {
+      code: "EACCES",
+    });
+    expect(isFfmpegInfrastructureFailure(eperm)).toBe(false);
+
+    const parseErr = new Error("psnr parse failed: average=<truncated>");
+    expect(isFfmpegInfrastructureFailure(parseErr)).toBe(false);
+
+    const enoentFile = Object.assign(
+      new Error("ENOENT: no such file or directory, open '/tmp/frame_000042.jpg'"),
+      {
+        code: "ENOENT",
+      },
+    );
+    // ⚠ known aliasing edge: an execFile ENOENT and an fs ENOENT reading the
+    // sample frame share the same code. The discriminator errs toward the
+    // infrastructure classification — a spurious per-sample fs ENOENT
+    // (impossible for a frame that was just written by the worker before this
+    // verify call) would abort the render, which is acceptable given how
+    // rarely that shape appears vs. how important the infra-fail signal is.
+    // Documented here so a future maintainer sees why the assertion below
+    // reads "true": this is the deliberate false-positive on collision.
+    expect(isFfmpegInfrastructureFailure(enoentFile)).toBe(true);
+  });
+
+  it("returns false for null / non-object errors", () => {
+    expect(isFfmpegInfrastructureFailure(null)).toBe(false);
+    expect(isFfmpegInfrastructureFailure(undefined)).toBe(false);
+    expect(isFfmpegInfrastructureFailure("psnr broken")).toBe(false);
+    expect(isFfmpegInfrastructureFailure(42)).toBe(false);
+  });
+});
+
+describe("isPoolFatalWorkerFailure", () => {
+  const failure = (kind: CaptureFailure["kind"]) => new CaptureFailure({ kind, message: kind });
+
+  it("keeps the disk path's tolerance: transient deaths are retried per worker, not pool-fatal", () => {
+    expect(isPoolFatalWorkerFailure(failure("transient_browser"), false)).toBe(false);
+    expect(isPoolFatalWorkerFailure(failure("protocol_timeout"), false)).toBe(false);
+    expect(isPoolFatalWorkerFailure(failure("cancelled"), false)).toBe(false);
+    expect(isPoolFatalWorkerFailure(failure("authoring"), false)).toBe(true);
+    expect(isPoolFatalWorkerFailure(failure("io"), false)).toBe(true);
+  });
+
+  it("makes every non-cancelled failure pool-fatal on the streaming path", () => {
+    // No per-worker retry exists there; the dead worker's frames are gone and
+    // its peers would otherwise park until the watchdog relabels the death.
+    expect(isPoolFatalWorkerFailure(failure("transient_browser"), true)).toBe(true);
+    expect(isPoolFatalWorkerFailure(failure("protocol_timeout"), true)).toBe(true);
+    expect(isPoolFatalWorkerFailure(failure("authoring"), true)).toBe(true);
+    // Cancelled means the pool is already aborting: nothing to propagate.
+    expect(isPoolFatalWorkerFailure(failure("cancelled"), true)).toBe(false);
+  });
+});
+
+describe("createPoolFailureHandler", () => {
+  const fatal = () => new CaptureFailure({ kind: "transient_browser", message: "Target closed" });
+
+  it("delivers the original failure to the hook before the peers are aborted", () => {
+    const peerController = new AbortController();
+    const seen: Array<{ failure: CaptureFailure; abortedYet: boolean }> = [];
+    const handler = createPoolFailureHandler({
+      streaming: true,
+      peerController,
+      hooks: {
+        onWorkerFailure: (failure) =>
+          seen.push({ failure, abortedYet: peerController.signal.aborted }),
+      },
+    });
+    const failure = fatal();
+    handler.onFailure(failure);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.failure).toBe(failure);
+    expect(seen[0]?.abortedYet).toBe(false);
+    expect(peerController.signal.aborted).toBe(true);
+    expect(peerController.signal.reason).toBe(failure);
+    expect(handler.firstFatalFailure()).toBe(failure);
+  });
+
+  it("still aborts the peers when the hook throws, and keeps the classified failure", () => {
+    const peerController = new AbortController();
+    const handler = createPoolFailureHandler({
+      streaming: true,
+      peerController,
+      hooks: {
+        onWorkerFailure: () => {
+          throw new Error("hook exploded");
+        },
+      },
+    });
+    const failure = fatal();
+    expect(() => handler.onFailure(failure)).not.toThrow();
+    expect(peerController.signal.aborted).toBe(true);
+    expect(peerController.signal.reason).toBe(failure);
+    expect(handler.firstFatalFailure()).toBe(failure);
+  });
+
+  it("ignores every failure after the first, which owns the abort reason", () => {
+    const peerController = new AbortController();
+    const hook = vi.fn();
+    const handler = createPoolFailureHandler({
+      streaming: true,
+      peerController,
+      hooks: { onWorkerFailure: hook },
+    });
+    const first = fatal();
+    handler.onFailure(first);
+    handler.onFailure(fatal());
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(peerController.signal.reason).toBe(first);
+  });
+
+  it("leaves the peers running for a cancellation on the streaming path", () => {
+    const peerController = new AbortController();
+    const hook = vi.fn();
+    const handler = createPoolFailureHandler({
+      streaming: true,
+      peerController,
+      hooks: { onWorkerFailure: hook },
+    });
+    handler.onFailure(new CaptureFailure({ kind: "cancelled", message: "aborted" }));
+    expect(hook).not.toHaveBeenCalled();
+    expect(peerController.signal.aborted).toBe(false);
+    expect(handler.firstFatalFailure()).toBeUndefined();
   });
 });

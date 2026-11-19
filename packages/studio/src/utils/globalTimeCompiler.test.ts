@@ -31,6 +31,12 @@ describe("absoluteToPercentage", () => {
     expect(absoluteToPercentage(1.0, 0.5, 1)).toBe(50);
   });
 
+  test("preserves playhead timing beyond tenths of a percent", () => {
+    const percentage = absoluteToPercentage(17, 12.17, 20);
+    expect(percentage).toBe(24.15);
+    expect(percentageToAbsolute(percentage, 12.17, 20)).toBe(17);
+  });
+
   test("clamps below tween start to 0%", () => {
     expect(absoluteToPercentage(-1, 0, 2)).toBe(0);
   });

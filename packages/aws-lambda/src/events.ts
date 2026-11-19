@@ -5,7 +5,7 @@
  * dispatches on the `Action` field. Each action maps 1:1 onto one of the
  * three OSS distributed primitives:
  *
- *   "plan"        → `plan(projectDir, config, planDir)`        (Activity A)
+ *   "plan"        → `planV2WithPublisher(...)`                (Activity A)
  *   "renderChunk" → `renderChunk(planDir, chunkIndex, output)` (Activity B)
  *   "assemble"    → `assemble(planDir, chunkPaths, audio, out)` (Activity C)
  *
@@ -24,8 +24,18 @@ import type {
 export type { SerializableDistributedRenderConfig } from "@hyperframes/producer/distributed";
 
 /** Discriminator for the three roles the one Lambda image fulfills. */
-export type LambdaAction = "plan" | "renderChunk" | "assemble";
-
+export type LambdaAction = "plan" | "audio" | "renderChunk" | "assemble";
+export interface WarmEvent {
+  Action: "warm";
+}
+/** Assemble hands a helper part of the final mp4's multipart upload: each part's S3 ranges, in order. */
+export interface StitchPartsEvent {
+  Action: "stitchParts";
+  Bucket: string;
+  Key: string;
+  UploadId: string;
+  Parts: { partNumber: number; ranges: { uri: string; start: number; end: number }[] }[];
+}
 /**
  * Top-level shape of any event the handler may receive.
  *
@@ -36,8 +46,11 @@ export type LambdaAction = "plan" | "renderChunk" | "assemble";
  */
 export type LambdaEvent =
   | PlanEvent
+  | AudioEvent
   | RenderChunkEvent
   | AssembleEvent
+  | WarmEvent
+  | StitchPartsEvent
   | { Payload: LambdaEvent }
   | { Input: LambdaEvent };
 
@@ -50,19 +63,26 @@ export interface PlanEvent {
   PlanOutputS3Prefix: string;
   /** `DistributedRenderConfig` minus runtime-only fields (logger, abortSignal). */
   Config: SerializableDistributedRenderConfig;
+  /** Optional for direct handler callers; the SDK and orchestrator send it explicitly. */
+  PlanProtocol?: "v2";
+}
+
+/** Compatibility alias for the only supported plan event. */
+export type PlanV2Event = PlanEvent;
+
+/** Makes a v2 plan's audio beside its chunks, from the same project and config as the plan. */
+export interface AudioEvent extends Omit<PlanEvent, "Action" | "PlanProtocol"> {
+  Action: "audio";
 }
 
 /** Activity B: fetch planDir, render one chunk, upload result. */
 export interface RenderChunkEvent {
   Action: "renderChunk";
-  /** S3 URI of the plan tar produced by a PlanEvent invocation. */
-  PlanS3Uri: string;
   /**
-   * `PlanResult.planHash` from the Plan invocation. The handler verifies
-   * this against the untarred planDir's `plan.json` before invoking the
-   * producer, throwing a typed `PLAN_HASH_MISMATCH` on divergence so the
-   * state machine routes it as non-retryable. Defense-in-depth — the
-   * producer also re-checks internally.
+   * `PlanResult.planHash` from the Plan invocation. The handler verifies it
+   * against the content-addressed manifest before invoking the producer.
+   * Divergence throws a typed `PLAN_HASH_MISMATCH` so the state machine routes
+   * it as non-retryable.
    */
   PlanHash: string;
   /** 0-based chunk index this invocation should render. */
@@ -71,16 +91,20 @@ export interface RenderChunkEvent {
   ChunkOutputS3Prefix: string;
   /** Output container format from the plan's encoder.json; drives file vs frame-dir handling. */
   Format: DistributedFormat;
+  PlanProtocol?: "v2";
+  PlanV2ManifestS3Uri: string;
+  PlanV2ArtifactS3Prefix: string;
 }
+
+/** Compatibility alias for the only supported chunk event. */
+export type RenderChunkV2Event = RenderChunkEvent;
 
 /** Activity C: fetch planDir + all chunks + audio, assemble, upload final. */
 export interface AssembleEvent {
   Action: "assemble";
-  /** S3 URI of the plan tar produced by a PlanEvent invocation. */
-  PlanS3Uri: string;
   /** S3 URIs of every chunk, ordered by chunk index. Length must equal `chunkCount`. */
   ChunkS3Uris: string[];
-  /** S3 URI of the planDir's `audio.aac` if the composition has audio; `null` otherwise. */
+  /** S3 URI of the planDir's audio artifact if the composition has audio; `null` otherwise. */
   AudioS3Uri: string | null;
   /** Final output S3 URI (`s3://bucket/key.mp4`). */
   OutputS3Uri: string;
@@ -96,18 +120,25 @@ export interface AssembleEvent {
    * unset preserves current `-c copy` behavior.
    */
   Cfr?: boolean;
+  PlanProtocol?: "v2";
+  PlanV2ManifestS3Uri: string;
+  PlanV2ArtifactS3Prefix: string;
+  PlanHash: string;
 }
+
+/** Compatibility alias for the only supported assemble event. */
+export type AssembleV2Event = AssembleEvent;
 
 // ── Result types — kept small to fit Step Functions history budgets ─────────
 
 /** Result of a `plan` invocation. Carries enough to size the Map(N) state. */
 export interface PlanLambdaResult {
   Action: "plan";
-  PlanS3Uri: string;
   PlanHash: string;
   ChunkCount: number;
+  MaxChunkConcurrency: number;
   TotalFrames: number;
-  Fps: 24 | 30 | 60;
+  Fps: SerializableDistributedRenderConfig["fps"];
   Width: number;
   Height: number;
   Format: DistributedFormat;
@@ -115,6 +146,22 @@ export interface PlanLambdaResult {
   AudioS3Uri: string | null;
   FfmpegVersion: string;
   ProducerVersion: string;
+  DurationMs: number;
+  PlanProtocol: "v2";
+  PlanV2ManifestS3Uri: string;
+  PlanV2ArtifactS3Prefix: string;
+  /** The plan left its audio to the audio task, which has a worker kept free for it. */
+  SeparateAudio: boolean;
+}
+
+/** Compatibility alias for the only supported plan result. */
+export type PlanV2LambdaResult = PlanLambdaResult;
+
+export interface AudioLambdaResult {
+  Action: "audio";
+  HasAudio: boolean;
+  /** The track for the assembler to stitch in; `null` without audio or when the plan mixed it. */
+  AudioS3Uri: string | null;
   DurationMs: number;
 }
 
@@ -125,6 +172,8 @@ export interface RenderChunkLambdaResult {
   ChunkIndex: number;
   Sha256: string;
   FramesEncoded: number;
+  /** Effective engine mode after browser probing. Emitted by current handlers. */
+  CaptureMode?: "beginframe" | "screenshot" | "drawelement";
   DurationMs: number;
 }
 
@@ -137,4 +186,19 @@ export interface AssembleLambdaResult {
   DurationMs: number;
 }
 
-export type LambdaResult = PlanLambdaResult | RenderChunkLambdaResult | AssembleLambdaResult;
+export interface WarmLambdaResult {
+  Action: "warm";
+}
+
+export interface StitchPartsLambdaResult {
+  Action: "stitchParts";
+  ETags: string[];
+}
+
+export type LambdaResult =
+  | WarmLambdaResult
+  | StitchPartsLambdaResult
+  | PlanLambdaResult
+  | AudioLambdaResult
+  | RenderChunkLambdaResult
+  | AssembleLambdaResult;

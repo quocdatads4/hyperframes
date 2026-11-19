@@ -1,17 +1,32 @@
 // fallow-ignore-file complexity
-import { defineCommand } from "citty";
-import { execFileSync, execSync } from "node:child_process";
+import { defineCommand } from "../utils/defineCommand.js";
+import { execFileSync, type ExecFileSyncOptions } from "node:child_process";
+import * as fs from "node:fs";
 import { existsSync } from "node:fs";
 import { platform } from "node:os";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { resolveExtractCacheDir } from "@hyperframes/engine";
+import { findTrustedExecutable } from "@hyperframes/parsers/ff-binaries";
 import type { Example } from "./_examples.js";
+import { CONFIG_PATH } from "../telemetry/config.js";
+import { withFileLock } from "../media-use/lib/config-lock.mjs";
+import { normalizeErrorMessage } from "../utils/errorMessage.js";
 import { c } from "../ui/colors.js";
 import { parseToolVersion, runEnvironmentChecks } from "../browser/preflight.js";
 import { KOKORO_MODULES, KOKORO_PIP, MUSICGEN_MODULES, MUSICGEN_PIP } from "../audio/providers.js";
-import { hasPythonModules } from "../tts/python.js";
+import { hasPythonModules, describeRejectedPythonOverride } from "../tts/python.js";
 import { VERSION } from "../version.js";
 import { getUpdateMeta, withMeta } from "../utils/updateCheck.js";
+import {
+  installChannelLabel,
+  runningInstall,
+  updateCommandFor,
+} from "../utils/installerDetection.js";
+import {
+  OPTIONAL_PACKAGES,
+  installedOptionalPackageVersion,
+  type OptionalPackage,
+} from "../utils/optionalPackages.js";
 import {
   getSystemMeta,
   getShmSizeMb,
@@ -37,22 +52,54 @@ interface CheckResult {
 
 export { parseToolVersion };
 
-function checkDocker(): CheckResult {
+export const TESTED_FFMPEG_VERSION = "8.0.1";
+
+export function ffmpegDoctorDetail(detail: string): string {
+  return new RegExp(`^ffmpeg n?${TESTED_FFMPEG_VERSION.replaceAll(".", "\\.")}(?![.\\d])`).test(
+    detail,
+  )
+    ? `${detail} (tested build)`
+    : `${detail}; loudness numbers are only comparable on ${TESTED_FFMPEG_VERSION}`;
+}
+
+const DOCKER_INSTALL_HINT = "https://docs.docker.com/get-docker/";
+
+type RunFile = (file: string, args: string[], options: ExecFileSyncOptions) => string | Buffer;
+
+const findDocker = (): string | undefined => findTrustedExecutable("docker");
+
+function dockerInsideProject(cwd = process.cwd()): string | undefined {
+  const names = process.platform === "win32" ? ["docker.exe", "docker.cmd"] : ["docker"];
+  return names.map((name) => join(cwd, "node_modules", ".bin", name)).find(existsSync);
+}
+
+function dockerNotFound(): CheckResult {
+  const skipped = dockerInsideProject();
+  return {
+    ok: false,
+    detail: "Not found",
+    hint: skipped
+      ? `Skipped ${skipped}: the CLI only runs helper programs from folders outside the project. ${DOCKER_INSTALL_HINT}`
+      : DOCKER_INSTALL_HINT,
+  };
+}
+
+export function checkDocker(find = findDocker, run: RunFile = execFileSync): CheckResult {
+  const docker = find();
+  if (!docker) return dockerNotFound();
   try {
-    const version = execSync("docker --version", { encoding: "utf-8", timeout: 5000 }).trim();
-    return { ok: true, detail: version };
+    const version = run(docker, ["--version"], { encoding: "utf-8", timeout: 5000 });
+    return { ok: true, detail: version.toString().trim() };
   } catch {
-    return {
-      ok: false,
-      detail: "Not found",
-      hint: "https://docs.docker.com/get-docker/",
-    };
+    return dockerNotFound();
   }
 }
 
-function checkDockerRunning(): CheckResult {
+export function checkDockerRunning(find = findDocker, run: RunFile = execFileSync): CheckResult {
   try {
-    execSync("docker info", { stdio: "pipe", timeout: 5000 });
+    const docker = find();
+    if (!docker) throw new Error("docker not found");
+    run(docker, ["info"], { stdio: "pipe", timeout: 5000 });
     return { ok: true, detail: "Running" };
   } catch {
     return {
@@ -63,16 +110,24 @@ function checkDockerRunning(): CheckResult {
   }
 }
 
-function checkVersion(): CheckResult {
+export function checkVersion(): CheckResult {
   const meta = getUpdateMeta();
   if (meta.updateAvailable && meta.latestVersion) {
     return {
       ok: false,
       detail: `${VERSION} \u2192 ${meta.latestVersion} available`,
-      hint: "Run: hyperframes upgrade",
+      hint: `Run: ${updateCommandFor(runningInstall(), meta.latestVersion)}`,
     };
   }
+  if (!meta.latestVersion) return { ok: true, detail: `${VERSION} (not checked yet)` };
   return { ok: true, detail: `${VERSION} (latest)` };
+}
+
+/** Which binary is running and from where: a global install per manager, project-local, npx or a plugin. */
+export function checkInstall(): CheckResult {
+  const install = runningInstall();
+  const where = install.path ?? "entry path unknown";
+  return { ok: true, detail: `${installChannelLabel(install.channel)} \u00B7 ${where}` };
 }
 
 function checkNode(): CheckResult {
@@ -201,12 +256,7 @@ function sourceLabel(source: "env" | "default"): string {
 }
 
 function commandExists(command: string): boolean {
-  try {
-    execFileSync("which", [command], { stdio: "ignore", timeout: 5000 });
-    return true;
-  } catch {
-    return false;
-  }
+  return findTrustedExecutable(command) !== undefined;
 }
 
 /**
@@ -229,6 +279,17 @@ export function checkArchiveExtractor(
     detail: "Not found",
     hint: "Install unzip so HyperFrames can extract its managed Chrome download.",
   };
+}
+
+/** A lock left by a hyperframes process that stopped mid-write blocks settings writes until a person removes it. */
+export function checkSettingsLock(lockPath = `${CONFIG_PATH}.lock`): CheckResult {
+  if (!existsSync(lockPath)) return { ok: true, detail: "Not locked" };
+  try {
+    withFileLock(lockPath, fs, () => undefined);
+    return { ok: true, detail: "Not locked" };
+  } catch (error) {
+    return { ok: false, detail: "Locked", hint: normalizeErrorMessage(error) };
+  }
 }
 
 function checkEnvironment(): CheckResult {
@@ -258,11 +319,16 @@ async function checkWhisper(): Promise<CheckResult> {
   };
 }
 
+function notInstalledDetail(base: string): string {
+  const overrideRejection = describeRejectedPythonOverride();
+  return overrideRejection ? `${base}. ${overrideRejection}` : base;
+}
+
 function checkLocalVoice(): CheckResult {
   if (hasPythonModules(KOKORO_MODULES)) return { ok: true, detail: "Kokoro deps installed" };
   return {
     ok: false,
-    detail: "Not installed (optional \u2014 local voice fallback)",
+    detail: notInstalledDetail("Not installed (optional \u2014 local voice fallback)"),
     hint: KOKORO_PIP,
   };
 }
@@ -271,8 +337,21 @@ function checkLocalMusic(): CheckResult {
   if (hasPythonModules(MUSICGEN_MODULES)) return { ok: true, detail: "MusicGen deps installed" };
   return {
     ok: false,
-    detail: "Not installed (optional \u2014 local music fallback)",
+    detail: notInstalledDetail("Not installed (optional \u2014 local music fallback)"),
     hint: MUSICGEN_PIP,
+  };
+}
+
+/** Not a failure when missing: the package installs itself the first time a feature needs it. */
+export function checkOptionalPackage(
+  name: OptionalPackage,
+  cacheDir?: string,
+  cliUrl?: string,
+): CheckResult {
+  const version = installedOptionalPackageVersion(name, cacheDir, cliUrl);
+  return {
+    ok: true,
+    detail: version ? `${version} installed` : "Not installed (installs on first use)",
   };
 }
 
@@ -332,12 +411,14 @@ export default defineCommand({
     const environment = await runEnvironmentChecks({ includeBrowser: true });
     const checks: Check[] = [
       { name: "Version", run: checkVersion },
+      { name: "CLI binary", run: checkInstall },
       { name: "Node.js", run: checkNode },
       { name: "CPU", run: checkCPU },
       { name: "Memory", run: checkMemory },
       { name: "Disk", run: checkDisk },
       { name: "Frames cache", run: () => checkFramesCache() },
       { name: "Archive extractor", run: checkArchiveExtractor },
+      { name: "Settings lock", run: () => checkSettingsLock() },
     ];
 
     // /dev/shm is only relevant on Linux (especially Docker)
@@ -349,6 +430,9 @@ export default defineCommand({
     checks.push({ name: "whisper-cpp", run: checkWhisper });
     checks.push({ name: "TTS (Kokoro)", run: checkLocalVoice });
     checks.push({ name: "BGM (MusicGen)", run: checkLocalMusic });
+    for (const name of Object.keys(OPTIONAL_PACKAGES) as OptionalPackage[]) {
+      checks.push({ name, run: () => checkOptionalPackage(name) });
+    }
 
     const outcomes: CheckOutcome[] = [];
     for (const check of checks) {
@@ -364,13 +448,14 @@ export default defineCommand({
       outcomes.push({
         name: result.name,
         ok: result.ok,
-        detail: result.detail,
+        detail:
+          result.name === "FFmpeg" && result.ok ? ffmpegDoctorDetail(result.detail) : result.detail,
         ...(result.hint ? { hint: result.hint } : {}),
       });
     }
     for (const check of [
-      { name: "Docker", run: checkDocker },
-      { name: "Docker running", run: checkDockerRunning },
+      { name: "Docker", run: () => checkDocker() },
+      { name: "Docker running", run: () => checkDockerRunning() },
     ]) {
       const result = await check.run();
       outcomes.push({

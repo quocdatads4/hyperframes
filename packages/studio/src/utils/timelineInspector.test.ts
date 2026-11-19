@@ -1,13 +1,45 @@
+// @vitest-environment happy-dom
 import { describe, expect, it } from "vitest";
-import { isAudioTimelineElement, isMusicTrack, resolveBeatSourceTrack } from "./timelineInspector";
+import {
+  canHideSelections,
+  isAudioDomElement,
+  isAudioTimelineElement,
+  isMusicSourceElement,
+  fitsBeatAnalysis,
+  isMusicTrack,
+  MAX_BEAT_SOURCE_SECONDS,
+  resolveBeatSourceTrack,
+} from "./timelineInspector";
 import type { TimelineElement } from "../player";
 
 // Minimal element factory for tests
 function el(
   overrides: Partial<
-    Pick<TimelineElement, "tag" | "src" | "id" | "domId" | "timelineRole" | "duration">
+    Pick<
+      TimelineElement,
+      | "tag"
+      | "src"
+      | "id"
+      | "domId"
+      | "timelineRole"
+      | "duration"
+      | "sourceDuration"
+      | "hasAudio"
+      | "muted"
+    >
   >,
-): Pick<TimelineElement, "tag" | "src" | "id" | "domId" | "timelineRole" | "duration"> {
+): Pick<
+  TimelineElement,
+  | "tag"
+  | "src"
+  | "id"
+  | "domId"
+  | "timelineRole"
+  | "duration"
+  | "sourceDuration"
+  | "hasAudio"
+  | "muted"
+> {
   return {
     tag: "audio",
     src: "assets/track.mp3",
@@ -15,6 +47,7 @@ function el(
     domId: "el-1",
     timelineRole: undefined,
     duration: 10,
+    sourceDuration: 120,
     ...overrides,
   };
 }
@@ -113,9 +146,88 @@ describe("resolveBeatSourceTrack", () => {
     expect(resolveBeatSourceTrack([sfx, vo])).toBeNull();
   });
 
+  it("falls back to a song over a longer clip whose file's length is not known yet", () => {
+    const unread = el({ id: "unread", domId: "unread", duration: 300, sourceDuration: undefined });
+    const song = el({ id: "song", domId: "song", duration: 180, sourceDuration: 180 });
+    expect(resolveBeatSourceTrack([unread, song])!.element).toBe(song);
+    const looped = el({ id: "loop", domId: "loop", duration: 1200, sourceDuration: 180 });
+    expect(resolveBeatSourceTrack([looped])!.element).toBe(looped);
+  });
+
+  it("never falls back to a clip, or a clip's file, longer than a song", () => {
+    const talk = el({ id: "talk", domId: "talk", duration: 3720, sourceDuration: 3720 });
+    const excerpt = el({ id: "cut", domId: "cut", duration: 180, sourceDuration: 3720 });
+    expect(resolveBeatSourceTrack([talk, excerpt])).toBeNull();
+    const song = el({ id: "song", domId: "song", duration: 200, sourceDuration: 200 });
+    expect(resolveBeatSourceTrack([talk, song])!.element).toBe(song);
+  });
+
   it("returns isFallback=true for an untagged clip with a non-music id", () => {
     const clip = el({ id: "my_audio_file", domId: "my_audio_file", timelineRole: undefined });
     const result = resolveBeatSourceTrack([clip]);
     expect(result!.isFallback).toBe(true);
+  });
+});
+
+describe("isAudioDomElement / canHideSelections", () => {
+  const el = (tag: string, src?: string): Element => {
+    const node = document.createElement(tag);
+    if (src) node.setAttribute("src", src);
+    return node;
+  };
+
+  it("agrees with isAudioTimelineElement about tags and source extensions", () => {
+    expect(isAudioDomElement(el("audio"))).toBe(true);
+    expect(isAudioDomElement(el("div", "narration.mp3"))).toBe(true);
+    expect(isAudioDomElement(el("div"))).toBe(false);
+    expect(isAudioDomElement(null)).toBe(false);
+  });
+
+  it("counts a group bus as audio, the way the single-selection panel does", () => {
+    expect(isAudioDomElement(el("hf-audio-group"))).toBe(true);
+  });
+
+  // `data-hidden` on audio is what mutes it — preview silences it and the render
+  // drops it from the mix. A control labelled "Hide all" must not reach that.
+  it("refuses to hide a selection holding any audio, and allows a layout one", () => {
+    expect(canHideSelections([{ element: el("div") }, { element: el("span") }])).toBe(true);
+    expect(canHideSelections([{ element: el("div") }, { element: el("audio") }])).toBe(false);
+    expect(canHideSelections([{ element: el("hf-audio-group") }])).toBe(false);
+  });
+});
+
+describe("beat source from a video with sound", () => {
+  const talk = { tag: "video", src: "assets/clip.mp4", hasAudio: true };
+
+  it("counts an audible video as a music source but never a muted or silent one", () => {
+    expect(isMusicSourceElement(el(talk))).toBe(true);
+    expect(isMusicSourceElement(el({ ...talk, muted: true }))).toBe(false);
+    expect(isMusicSourceElement(el({ ...talk, hasAudio: false }))).toBe(false);
+    expect(isAudioTimelineElement(el(talk))).toBe(false);
+  });
+
+  it("takes a video tagged as music as the beat source", () => {
+    const video = el({ ...talk, timelineRole: "music" });
+    expect(isMusicTrack(video)).toBe(true);
+    expect(resolveBeatSourceTrack([video])).toEqual({ element: video, isFallback: false });
+  });
+
+  it("falls back to the longest audible video when there is no audio", () => {
+    const short = el({ ...talk, id: "a", duration: 3 });
+    const long = el({ ...talk, id: "b", duration: 9 });
+    const muted = el({ ...talk, id: "c", duration: 20, muted: true });
+    expect(resolveBeatSourceTrack([short, long, muted])?.element).toBe(long);
+  });
+});
+
+describe("fitsBeatAnalysis", () => {
+  it("fits a file whose length is known and no longer than a song, however long its clip runs", () => {
+    expect(fitsBeatAnalysis({ sourceDuration: 180 })).toBe(true);
+    expect(fitsBeatAnalysis({ sourceDuration: MAX_BEAT_SOURCE_SECONDS })).toBe(true);
+  });
+
+  it("refuses a file past the cap and a file whose length is unknown", () => {
+    expect(fitsBeatAnalysis({ sourceDuration: 3720 })).toBe(false);
+    expect(fitsBeatAnalysis({})).toBe(false);
   });
 });

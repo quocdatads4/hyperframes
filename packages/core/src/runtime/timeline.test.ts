@@ -1,13 +1,44 @@
+import { DEFAULT_IMAGE_TIMELINE_DURATION_SECONDS } from "@hyperframes/parsers/media-duration";
 import { describe, it, expect, afterEach } from "vitest";
-import { collectRuntimeTimelinePayload } from "./timeline";
+import {
+  collectRuntimeTimelinePayload,
+  isRuntimeElementVisibleAt,
+  runtimeElementWindow,
+} from "./timeline";
+import { createRuntimeStartTimeResolver } from "./startResolver";
+
+type TimelineTestWindow = Window & {
+  __timelines?: Record<string, { duration: () => number }>;
+};
 
 describe("collectRuntimeTimelinePayload", () => {
   afterEach(() => {
     document.body.innerHTML = "";
-    delete (window as any).__timelines;
+    delete (window as TimelineTestWindow).__timelines;
   });
 
   const defaultParams = { canonicalFps: 30 };
+
+  function appendTimedCompositionClip(
+    id: string,
+    duration: string,
+    authoredDuration?: string,
+  ): HTMLDivElement {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "main");
+    root.setAttribute("data-duration", "10");
+    document.body.appendChild(root);
+    const clip = document.createElement("div");
+    clip.id = id;
+    clip.setAttribute("data-composition-id", id);
+    clip.setAttribute("data-start", "0");
+    clip.setAttribute("data-duration", duration);
+    if (authoredDuration != null) {
+      clip.setAttribute("data-hf-authored-duration", authoredDuration);
+    }
+    root.appendChild(clip);
+    return clip;
+  }
 
   it("returns minimal payload for empty document", () => {
     const result = collectRuntimeTimelinePayload(defaultParams);
@@ -103,6 +134,31 @@ describe("collectRuntimeTimelinePayload", () => {
     expect(result.clips[0].duration).toBe(3);
     expect(result.clips[0].track).toBe(0);
     expect(result.clips[0].kind).toBe("element");
+  });
+
+  it("sends a plain text layer's words and look, capped, and no text for any other layer", () => {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "main");
+    root.setAttribute("data-duration", "10");
+    document.body.appendChild(root);
+    const title = document.createElement("h1");
+    title.id = "title";
+    title.setAttribute("data-start", "0");
+    title.setAttribute("data-duration", "5");
+    title.style.color = "rgb(255, 255, 255)";
+    title.textContent = `  Hello\n   ${"x".repeat(500)} `;
+    const card = document.createElement("div");
+    card.id = "card";
+    card.setAttribute("data-start", "0");
+    card.setAttribute("data-duration", "5");
+    card.innerHTML = "<img src='a.png'> Caption";
+    root.append(title, card);
+
+    const [titleClip, cardClip] = collectRuntimeTimelinePayload(defaultParams).clips;
+
+    expect(titleClip.text?.value).toBe(`Hello ${"x".repeat(194)}`);
+    expect(titleClip.text?.color).toBe("rgb(255, 255, 255)");
+    expect(cardClip.text).toBeNull();
   });
 
   it("parses inline z-index for timeline clips", () => {
@@ -301,6 +357,41 @@ describe("collectRuntimeTimelinePayload", () => {
     expect(result.clips[0].kind).toBe("image");
   });
 
+  it("gives a timed image with no data-duration the dropped-image default, not the composition remainder", () => {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "main");
+    root.setAttribute("data-duration", "10");
+    document.body.appendChild(root);
+
+    const timed = document.createElement("img");
+    timed.id = "timed";
+    timed.setAttribute("data-start", "2");
+    root.appendChild(timed);
+
+    const timedClip = collectRuntimeTimelinePayload(defaultParams).clips.find(
+      (c) => c.id === "timed",
+    );
+    expect([timedClip?.start, timedClip?.duration]).toEqual([
+      2,
+      DEFAULT_IMAGE_TIMELINE_DURATION_SECONDS,
+    ]);
+  });
+
+  it("trims a timed image with data-end and no data-duration to end minus start", () => {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "main");
+    root.setAttribute("data-duration", "10");
+    document.body.appendChild(root);
+    const img = document.createElement("img");
+    img.id = "trimmed";
+    img.setAttribute("data-start", "2");
+    img.setAttribute("data-end", "6");
+    root.appendChild(img);
+
+    const clip = collectRuntimeTimelinePayload(defaultParams).clips.find((c) => c.id === "trimmed");
+    expect([clip?.start, clip?.duration]).toEqual([2, 4]);
+  });
+
   it("identifies composition clips", () => {
     const root = document.createElement("div");
     root.setAttribute("data-composition-id", "main");
@@ -338,6 +429,46 @@ describe("collectRuntimeTimelinePayload", () => {
     const clip = collectRuntimeTimelinePayload(defaultParams).clips[0];
     expect(clip.playbackStart).toBe(0);
     expect(clip.playbackRate).toBe(1);
+  });
+
+  it.each([
+    [0, 2, 5],
+    [2, 2, 4],
+    [2, 0.01, 80],
+    [2, 20, 0.8],
+    [0, "2x", 5],
+    [0, "0x2", 10],
+  ])("rate-scales natural media duration (start=%s rate=%s)", (mediaStart, rate, expected) => {
+    document.body.innerHTML = '<div data-composition-id="main" data-duration="100"></div>';
+    const root = document.body.firstElementChild!;
+    const video = document.createElement("video");
+    video.id = "natural";
+    video.setAttribute("data-start", "0");
+    video.setAttribute("data-media-start", String(mediaStart));
+    video.setAttribute("data-playback-rate", String(rate));
+    Object.defineProperty(video, "duration", { value: 10, configurable: true });
+    root.appendChild(video);
+    expect(collectRuntimeTimelinePayload(defaultParams).clips[0].duration).toBeCloseTo(expected);
+  });
+
+  it.each([10, 11])(
+    "does not replace a known zero media span with root duration (start=%s)",
+    (start) => {
+      document.body.innerHTML = '<div data-composition-id="main" data-duration="100"></div>';
+      const video = document.createElement("video");
+      video.id = "at-eof";
+      video.setAttribute("data-start", "0");
+      video.setAttribute("data-media-start", String(start));
+      Object.defineProperty(video, "duration", { value: 10, configurable: true });
+      document.body.firstElementChild!.appendChild(video);
+      expect(collectRuntimeTimelinePayload(defaultParams).clips).toEqual([]);
+    },
+  );
+
+  it("keeps explicit media duration ahead of natural rate scaling", () => {
+    document.body.innerHTML =
+      '<div data-composition-id="main" data-duration="100"><video id="v" data-start="0" data-duration="7" data-playback-rate="2"></video></div>';
+    expect(collectRuntimeTimelinePayload(defaultParams).clips[0].duration).toBe(7);
   });
 
   it("collects scenes from composition nodes", () => {
@@ -394,6 +525,45 @@ describe("collectRuntimeTimelinePayload", () => {
     const result = collectRuntimeTimelinePayload(defaultParams);
     expect(result.compositionWidth).toBe(3840);
     expect(result.compositionHeight).toBe(2160);
+  });
+
+  it("reads a px-suffixed composition size the way the runtime lays it out", () => {
+    const root = document.createElement("div");
+    root.setAttribute("data-composition-id", "main");
+    root.setAttribute("data-width", "1080px");
+    root.setAttribute("data-height", "1920px");
+    root.setAttribute("data-duration", "5");
+    document.body.appendChild(root);
+
+    const result = collectRuntimeTimelinePayload(defaultParams);
+    expect(result.compositionWidth).toBe(1080);
+    expect(result.compositionHeight).toBe(1920);
+  });
+
+  it("reads the size and duration of the explicit root when another composition comes first", () => {
+    document.body.innerHTML = `<div data-composition-id="card" data-duration="3" data-width="800" data-height="600"></div><div data-composition-id="main" data-root="true" data-width="1920" data-height="1080"></div>`;
+    (window as TimelineTestWindow).__timelines = { main: { duration: () => 7 } };
+
+    const result = collectRuntimeTimelinePayload(defaultParams);
+    expect(result.compositionWidth).toBe(1920);
+    expect(result.compositionHeight).toBe(1080);
+    expect(result.durationInFrames).toBe(210);
+  });
+
+  it("reports the real length of a film shorter than one second", () => {
+    document.body.innerHTML = `<div data-composition-id="main" data-duration="0.2"><div id="clip" data-start="0" data-duration="0.2"></div></div>`;
+    (window as TimelineTestWindow).__timelines = { main: { duration: () => 0.2 } };
+
+    const result = collectRuntimeTimelinePayload(defaultParams);
+    expect(result.durationSeconds).toBe(0.2);
+    expect(result.durationInFrames).toBe(6);
+  });
+
+  it("reports the real length of a sub-second root with no timed clips", () => {
+    document.body.innerHTML = `<div data-composition-id="main" data-duration="0.2"></div>`;
+
+    const result = collectRuntimeTimelinePayload(defaultParams);
+    expect(result.durationSeconds).toBe(0.2);
   });
 
   it("defaults composition dimensions to 1920x1080", () => {
@@ -534,6 +704,19 @@ describe("collectRuntimeTimelinePayload", () => {
     expect(result.clips[0].label).toBe("Hero Card");
   });
 
+  it("names each instance of a repeated scene by its authored id, not the id the loader gave it", () => {
+    document.body.innerHTML = `<div data-composition-id="main" data-duration="10">
+      <div class="clip" data-composition-id="benefit-fresh__hf1" data-hf-original-composition-id="benefit-fresh"
+        data-start="0" data-duration="3"></div>
+      <div class="clip" data-composition-id="benefit-fresh__hf2" data-hf-original-composition-id="benefit-fresh"
+        data-start="3" data-duration="3"></div>
+    </div>`;
+
+    const result = collectRuntimeTimelinePayload(defaultParams);
+    expect(result.clips.map((clip) => clip.label)).toEqual(["Benefit Fresh", "Benefit Fresh"]);
+    expect(result.scenes.map((scene) => scene.label)).toEqual(["benefit-fresh", "benefit-fresh"]);
+  });
+
   it("falls back to a readable ordinal label instead of a node index id", () => {
     const root = document.createElement("div");
     root.setAttribute("data-composition-id", "main");
@@ -623,6 +806,26 @@ describe("collectRuntimeTimelinePayload", () => {
     expect(starts["slide-3"]).toBe(26);
     expect(result.durationInFrames).toBe(42 * 30);
   });
+
+  it("uses preserved duration when a normalized timeline clip retains public zero", () => {
+    const clip = appendTimedCompositionClip("normalized-zero", "0", "3.5");
+
+    const result = collectRuntimeTimelinePayload(defaultParams);
+    expect(result.clips.find((candidate) => candidate.id === clip.id)?.duration).toBe(3.5);
+  });
+
+  it.each(["0", "-2"])(
+    "drops an explicit nonpositive duration %s before timeline fallback",
+    (duration) => {
+      const clip = appendTimedCompositionClip("invalid-window", duration);
+      (window as TimelineTestWindow).__timelines = {
+        "invalid-window": { duration: () => 5 },
+      };
+
+      const result = collectRuntimeTimelinePayload(defaultParams);
+      expect(result.clips.find((candidate) => candidate.id === clip.id)).toBeUndefined();
+    },
+  );
 
   it("discovers GSAP-animated scene elements via timeline introspection", () => {
     const root = document.createElement("div");
@@ -904,5 +1107,86 @@ describe("collectRuntimeTimelinePayload", () => {
 
     const result = collectRuntimeTimelinePayload(defaultParams);
     expect(result.clips.find((c) => c.id === "my-script")).toBeUndefined();
+  });
+
+  describe("root duration with no data-duration and a GSAP timeline past the voiceover", () => {
+    function appendVoicedRoot(timelineSeconds: number) {
+      const root = document.createElement("div");
+      root.setAttribute("data-composition-id", "main");
+      document.body.appendChild(root);
+      const voiceover = document.createElement("audio");
+      voiceover.id = "voiceover";
+      voiceover.setAttribute("data-start", "0");
+      voiceover.setAttribute("data-duration", "154.8");
+      root.appendChild(voiceover);
+      (window as TimelineTestWindow).__timelines = { main: { duration: () => timelineSeconds } };
+    }
+
+    it("reports the timeline when its animations simply end after the voiceover", () => {
+      appendVoicedRoot(156);
+
+      const result = collectRuntimeTimelinePayload(defaultParams);
+
+      expect(result.durationSeconds).toBe(156);
+      expect(result.durationInFrames).toBe(156 * 30);
+    });
+
+    it("reports the voiceover's window for an endless loop (GSAP repeat: -1), never Infinity", () => {
+      appendVoicedRoot(1e10);
+
+      const result = collectRuntimeTimelinePayload(defaultParams);
+
+      expect(result.durationSeconds).toBe(154.8);
+      expect(result.durationInFrames).toBe(Math.ceil(154.8 * 30));
+    });
+  });
+});
+
+describe("runtimeElementWindow", () => {
+  afterEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  // A root with no data-duration and a 2 s timeline under a 6 s video went black from 2 s.
+  it("ends a nested scene with its timeline, but never the root", () => {
+    document.body.innerHTML = `<div id="main" data-composition-id="main" data-start="0">
+      <div id="scene" data-composition-id="scene" data-start="0"></div></div>`;
+    const timelineRegistry = { main: { duration: () => 2 }, scene: { duration: () => 2 } };
+    const options = { timelineRegistry, resolver: createRuntimeStartTimeResolver({}) };
+    expect(runtimeElementWindow(document.getElementById("main")!, options)).toEqual({
+      start: 0,
+      end: Number.POSITIVE_INFINITY,
+    });
+    expect(runtimeElementWindow(document.getElementById("scene")!, options)).toEqual({
+      start: 0,
+      end: 2,
+    });
+  });
+});
+
+describe("isRuntimeElementVisibleAt", () => {
+  afterEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  // fails without the fix: snapshot and preview read the authored seconds, so a title held across two clips whose
+  // second start sits a hair past 100 s went blank at exactly 100 s, the frame render shows it on.
+  it("puts a clip edge a hair off a frame on that frame for preview and snapshot, as render does", () => {
+    document.body.innerHTML = `<div id="main" data-composition-id="main" data-start="0" data-duration="110">
+      <div id="held" data-start="90" data-duration="10"></div>
+      <div id="rest" data-start="100.00002" data-duration="10"></div></div>`;
+    const shownAt = (currentTime: number) =>
+      ["held", "rest"].filter((id) =>
+        isRuntimeElementVisibleAt(document.getElementById(id)!, {
+          currentTime,
+          compositionDuration: 110,
+          canonicalFps: 30,
+          timelineRegistry: {},
+          resolver: createRuntimeStartTimeResolver({}),
+        }),
+      );
+    expect(shownAt(99.875)).toEqual(["held"]);
+    expect(shownAt(100)).toEqual(["rest"]);
+    expect(shownAt(100.125)).toEqual(["rest"]);
   });
 });

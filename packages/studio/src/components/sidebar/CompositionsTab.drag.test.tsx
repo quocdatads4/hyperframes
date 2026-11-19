@@ -1,62 +1,45 @@
 // @vitest-environment happy-dom
 
 import { act } from "react";
-import { createRoot, type Root } from "react-dom/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { TIMELINE_COMPOSITION_MIME } from "../../utils/timelineCompositionDrop";
-import { CompositionsTab } from "./CompositionsTab";
-
-Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
-(
-  window as unknown as { happyDOM: { settings: { disableIframePageLoading: boolean } } }
-).happyDOM.settings.disableIframePageLoading = true;
-
-let root: Root | null = null;
-
-afterEach(() => {
-  vi.useRealTimers();
-  if (root) act(() => root?.unmount());
-  root = null;
-  document.body.innerHTML = "";
-});
+import {
+  mountCompositionsTab,
+  settleFrameToken,
+  stubFrameTokenFetch,
+} from "./compositionsTabTestUtils";
 
 function mount(onSelect = vi.fn(), onAddToTimeline = vi.fn()) {
-  const host = document.createElement("div");
-  document.body.append(host);
-  root = createRoot(host);
-  act(() => {
-    root?.render(
-      <CompositionsTab
-        projectId="demo"
-        compositions={["compositions/headline.html"]}
-        activeComposition={null}
-        onSelect={onSelect}
-        onAddToTimeline={onAddToTimeline}
-      />,
-    );
-  });
+  const host = mountCompositionsTab({ onSelect, onAddToTimeline });
   const card = host.querySelector<HTMLElement>('[draggable="true"]');
   if (!card) throw new Error("composition card did not render");
   return { host, card, onSelect, onAddToTimeline };
 }
 
 describe("composition card drag", () => {
-  it("defers the live preview iframe until the card is hovered", () => {
+  it("mounts one live preview only after sustained hover and removes it on leave", async () => {
     vi.useFakeTimers();
-    const { host, card } = mount();
-    expect(host.querySelector("iframe")).toBeNull();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const tokenFetch = stubFrameTokenFetch();
+    try {
+      const { host, card } = mount();
+      act(() => {
+        card.dispatchEvent(new Event("pointerover", { bubbles: true }));
+        vi.advanceTimersByTime(300);
+      });
+      await settleFrameToken();
+      expect(host.querySelectorAll("iframe")).toHaveLength(1);
 
-    act(() => {
-      card.dispatchEvent(new PointerEvent("pointerover", { bubbles: true }));
-      vi.advanceTimersByTime(299);
-    });
-    expect(host.querySelector("iframe")).toBeNull();
-
-    act(() => vi.advanceTimersByTime(1));
-    expect(host.querySelector("iframe")).not.toBeNull();
-
-    act(() => card.dispatchEvent(new PointerEvent("pointerout", { bubbles: true })));
-    expect(host.querySelector("iframe")).toBeNull();
+      act(() => {
+        card.dispatchEvent(new Event("pointerout", { bubbles: true }));
+      });
+      expect(host.querySelector("iframe")).toBeNull();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      tokenFetch.mockRestore();
+      consoleError.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("keeps ordinary click navigation", () => {

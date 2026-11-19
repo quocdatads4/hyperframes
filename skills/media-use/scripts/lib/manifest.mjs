@@ -1,16 +1,21 @@
 import {
   readFileSync,
-  appendFileSync,
   mkdirSync,
   existsSync,
   readdirSync,
   openSync,
   closeSync,
   writeFileSync,
+  writeSync,
   rmSync,
+  renameSync,
   statSync,
+  lstatSync,
+  realpathSync,
+  constants,
 } from "node:fs";
-import { join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { basename, join } from "node:path";
 
 const MANIFEST_FILE = "manifest.jsonl";
 const INDEX_FILE = "index.md";
@@ -68,15 +73,97 @@ export function readManifest(projectDir) {
   return records;
 }
 
-export function appendRecord(projectDir, record) {
+/**
+ * The project's `.media` folder, made if missing. Throws when it is a link or resolves outside the project, since
+ * a project from someone else could carry such a link to send manifest and index writes elsewhere.
+ */
+export function ownMediaDir(projectDir) {
   const dir = mediaDir(projectDir);
   mkdirSync(dir, { recursive: true });
+  if (
+    lstatSync(dir).isSymbolicLink() ||
+    realpathSync(dir) !== join(realpathSync(projectDir), ".media")
+  ) {
+    throw new Error(`${dir} leads outside the project folder; nothing was written there`);
+  }
+  return dir;
+}
+
+function refuseLink(path) {
+  if (lstatSync(path, { throwIfNoEntry: false })?.isSymbolicLink()) {
+    throw new Error(`${path} is a link; nothing was written through it`);
+  }
+}
+
+/** Replaces the file at `path` with `content` by writing a temp file beside it and renaming it over, so a link there is replaced, never followed. */
+export function replaceFile(path, content) {
+  // Same shape as core atomicTempPath, which Studio's project history skips.
+  const temp = `${path}.hf${randomBytes(3).toString("hex")}.tmp`;
+  writeFileSync(temp, content, { flag: "wx" });
+  try {
+    renameSync(temp, path);
+  } catch (error) {
+    rmSync(temp, { force: true });
+    throw error;
+  }
+}
+
+export function appendRecord(projectDir, record) {
+  ownMediaDir(projectDir);
   const typeDir = typeDirPath(projectDir, record.type);
   mkdirSync(typeDir, { recursive: true });
 
   const p = manifestPath(projectDir);
-  const line = JSON.stringify(record) + "\n";
-  appendFileSync(p, line);
+  refuseLink(p);
+  const fd = openSync(
+    p,
+    constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0),
+    0o666,
+  );
+  try {
+    writeSync(fd, JSON.stringify(record) + "\n");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Sources that mean the agent made or fetched the file; any other file is the person's own. */
+export const AGENT_SOURCES = ["generated", "search", "bundled"];
+
+/** The record a path has now: the manifest only appends, so the last one for a path wins. */
+export function latestRecordFor(projectDir, path) {
+  return readManifest(projectDir).findLast((record) => record.path === path);
+}
+
+/** Records with every older record for the same path dropped, since the last one for a path is its record. */
+export function currentRecords(projectDir) {
+  const records = readManifest(projectDir);
+  const last = new Map(records.map((record, index) => [record.path, index]));
+  return records.filter((record, index) => !record.path || last.get(record.path) === index);
+}
+
+/** Records a file already in the project where it is, unless its current record already says the same thing. */
+export function recordInPlace(
+  projectDir,
+  { type, path, source, description, duration, provenance },
+) {
+  const fields = {
+    type,
+    path,
+    source,
+    description: description || basename(path),
+    ...(duration != null && { duration: Math.round(duration * 10) / 10 }),
+  };
+  return withMediaLock(projectDir, () => {
+    const latest = latestRecordFor(projectDir, path);
+    const same = ["source", "description", "duration"].every(
+      (key) => latest?.[key] === fields[key],
+    );
+    if (latest && same) return latest;
+    const record = { id: nextFreeId(projectDir, type), ...fields, provenance };
+    appendRecord(projectDir, record);
+    return record;
+  });
 }
 
 // Match prompts forgivingly. Agents rarely re-emit a byte-identical intent, so
@@ -93,7 +180,7 @@ export function normalizePrompt(prompt) {
 export function findByPrompt(projectDir, prompt, type) {
   const key = normalizePrompt(prompt);
   if (!key) return null;
-  const records = readManifest(projectDir);
+  const records = currentRecords(projectDir);
   return (
     records.find(
       (r) => normalizePrompt(r.provenance?.prompt) === key && (type == null || r.type === type),
@@ -103,7 +190,7 @@ export function findByPrompt(projectDir, prompt, type) {
 
 export function findByEntity(projectDir, entity) {
   const lower = entity.toLowerCase();
-  const records = readManifest(projectDir);
+  const records = currentRecords(projectDir);
   return records.find((r) => r.entity && r.entity.toLowerCase() === lower) || null;
 }
 
@@ -162,33 +249,45 @@ function withLock(dir, fn) {
   }
 }
 
-// Atomically allocate the next free id for `type` AND reserve its file, so a
+/** Runs `fn` holding the project's `.media/.lock`, so concurrent resolves take turns on what it guards. */
+export function withMediaLock(projectDir, fn) {
+  mkdirSync(mediaDir(projectDir), { recursive: true });
+  return withLock(mediaDir(projectDir), fn);
+}
+
+// Atomically allocate the next free id for `type` AND reserve it on disk, so a
 // slow download/copy between allocation and appendRecord can't let a concurrent
 // caller grab the same id (the MU-23 clobber). Under the lock we take the max id
 // across BOTH the manifest and any already-reserved files in the type dir, then
-// O_EXCL-create an empty placeholder at the target path; freeze/copy overwrites
-// it. Returns { id, localPath }.
+// O_EXCL-create an empty marker under core's atomic temp name, which Studio's
+// project history skips. Returns { id, localPath, markerPath }.
 export function allocateId(projectDir, type, ext) {
-  mkdirSync(mediaDir(projectDir), { recursive: true });
-  const typeDir = typeDirPath(projectDir, type);
-  mkdirSync(typeDir, { recursive: true });
-  return withLock(mediaDir(projectDir), () => {
-    const re = new RegExp(`^${type}_(\\d+)`);
-    let max = 0;
-    for (const r of readManifest(projectDir)) {
-      if (r.type !== type) continue;
-      const m = r.id?.match(re);
-      if (m) max = Math.max(max, parseInt(m[1], 10));
-    }
-    for (const f of readdirSync(typeDir)) {
-      const m = f.match(re);
-      if (m) max = Math.max(max, parseInt(m[1], 10)); // skip ids reserved but not yet appended
-    }
-    const id = `${type}_${String(max + 1).padStart(3, "0")}`;
+  mkdirSync(typeDirPath(projectDir, type), { recursive: true });
+  return withMediaLock(projectDir, () => {
+    const id = nextFreeId(projectDir, type);
     const localPath = `.media/${typeSubdir(type)}/${id}${ext}`;
-    writeFileSync(join(projectDir, localPath), "", { flag: "wx" }); // durable reservation
-    return { id, localPath };
+    // Same shape as core atomicTempPath: an empty file at the final name would be committed.
+    const markerPath = `${join(projectDir, localPath)}.hf${randomBytes(3).toString("hex")}.tmp`;
+    writeFileSync(markerPath, "", { flag: "wx" }); // durable reservation
+    return { id, localPath, markerPath };
   });
+}
+
+// Call under the lock: counts recorded ids and ids reserved by a file not yet recorded.
+function nextFreeId(projectDir, type) {
+  const re = new RegExp(`^${type}_(\\d+)`);
+  let max = 0;
+  for (const r of readManifest(projectDir)) {
+    if (r.type !== type) continue;
+    const m = r.id?.match(re);
+    if (m) max = Math.max(max, parseInt(m[1], 10));
+  }
+  const typeDir = typeDirPath(projectDir, type);
+  for (const f of existsSync(typeDir) ? readdirSync(typeDir) : []) {
+    const m = f.match(re);
+    if (m) max = Math.max(max, parseInt(m[1], 10));
+  }
+  return `${type}_${String(max + 1).padStart(3, "0")}`;
 }
 
 function reservedFile(projectDir, type, ext) {
@@ -196,22 +295,23 @@ function reservedFile(projectDir, type, ext) {
   return { ...allocation, fullPath: join(projectDir, allocation.localPath) };
 }
 
-function rollbackReservation(reservation) {
-  rmSync(reservation.fullPath, { force: true });
+function releaseReservation(reservation, committed) {
+  if (!committed) rmSync(reservation.fullPath, { force: true });
+  rmSync(reservation.markerPath, { force: true });
 }
 
 // A reservation is committed only when populate returns a non-null value.
 // Throwing/rejecting or returning null means no usable asset was produced, so
-// the placeholder must be released. Keeping this transaction beside allocateId
-// prevents individual provider/cache/LUT paths from forgetting the rollback.
+// the reservation and any partial asset are released. Keeping this transaction
+// beside allocateId prevents provider/cache/LUT paths from forgetting the rollback.
 export function withReservedFileSync(projectDir, type, ext, populate) {
   const reservation = reservedFile(projectDir, type, ext);
   try {
     const result = populate(reservation);
-    if (result == null) rollbackReservation(reservation);
+    releaseReservation(reservation, result != null);
     return result;
   } catch (error) {
-    rollbackReservation(reservation);
+    releaseReservation(reservation, false);
     throw error;
   }
 }
@@ -220,10 +320,10 @@ export async function withReservedFile(projectDir, type, ext, populate) {
   const reservation = reservedFile(projectDir, type, ext);
   try {
     const result = await populate(reservation);
-    if (result == null) rollbackReservation(reservation);
+    releaseReservation(reservation, result != null);
     return result;
   } catch (error) {
-    rollbackReservation(reservation);
+    releaseReservation(reservation, false);
     throw error;
   }
 }

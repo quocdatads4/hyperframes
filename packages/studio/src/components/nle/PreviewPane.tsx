@@ -6,6 +6,9 @@ import { CompositionBreadcrumb } from "./CompositionBreadcrumb";
 import { usePreviewBlockDrop } from "./usePreviewBlockDrop";
 import { useNLEContext } from "./NLEContext";
 import { AssetPreviewOverlay } from "./AssetPreviewOverlay";
+import { PreviewGuides } from "../editor/PreviewGuides";
+import { PreviewOverlayProvider } from "../editor/PreviewOverlayProvider";
+import { STUDIO_OPAQUE_PREVIEW_ENABLED } from "../editor/manualEditingAvailability";
 
 function subscribeFullscreen(cb: () => void) {
   document.addEventListener("fullscreenchange", cb);
@@ -59,6 +62,12 @@ export function PreviewPane({
     togglePlay,
     seek,
     onIframeLoad,
+    previewSlots,
+    onShadowIframeLoad,
+    onShadowReadyChange,
+    onShadowError,
+    setShadowIframeNode,
+    resetPreviewSlots,
     compositionStack,
     handleNavigateComposition,
     setCompositionLoading,
@@ -107,10 +116,10 @@ export function PreviewPane({
   return (
     <div
       ref={containerRef}
-      // Panel chrome (rounded border) is dropped in fullscreen so the preview
-      // fills the screen edge-to-edge.
-      className={`flex-1 min-h-0 flex flex-col overflow-hidden bg-neutral-950 ${
-        isFullscreen ? "" : "rounded-lg border border-neutral-800/50"
+      // A recessed well inset in its dock card; dropped in fullscreen so the
+      // preview fills the screen edge-to-edge. The player stays dark in both themes.
+      className={`scheme-dark flex-1 min-h-0 flex flex-col overflow-hidden bg-[var(--studio-preview-bg,var(--color-neutral-950))] ${
+        isFullscreen ? "" : "m-3 rounded-md border border-border"
       }`}
       data-studio-fullscreen-target=""
     >
@@ -130,23 +139,33 @@ export function PreviewPane({
             projectId={projectId}
             iframeRef={iframeRef}
             onIframeLoad={onIframeLoad}
+            previewSlots={previewSlots}
+            onShadowIframeLoad={onShadowIframeLoad}
+            onShadowReadyChange={onShadowReadyChange}
+            onShadowError={onShadowError}
+            setShadowIframeNode={setShadowIframeNode}
+            resetPreviewSlots={resetPreviewSlots}
             onCompositionLoadingChange={setCompositionLoading}
             portrait={portrait}
             directUrl={directUrl}
             suppressLoadingOverlay={hasLoadedOnceRef.current}
             onStageRef={handleStageRef}
             onCompositionSizeChange={setPreviewCompositionSize}
+            sandboxOrigin={STUDIO_OPAQUE_PREVIEW_ENABLED ? "opaque" : undefined}
           />
           {previewDragOver && (
-            <div className="absolute inset-2 z-40 rounded-lg border-2 border-dashed border-studio-accent/50 bg-studio-accent/[0.04] pointer-events-none" />
+            <div className="absolute inset-2 z-40 rounded-lg border-2 border-dashed border-studio-accent/50 bg-studio-accent/4 pointer-events-none" />
           )}
           <AssetPreviewOverlay />
         </div>
-        {!isFullscreen && previewOverlay}
+        <PreviewOverlayProvider>
+          <PreviewGuides />
+          {!isFullscreen && previewOverlay}
+        </PreviewOverlayProvider>
       </div>
       {/* Transport row: no own background or border — the controls sit flat on
           the preview panel's surface (CapCut-style). */}
-      <div className="flex-shrink-0">
+      <div className="shrink-0">
         {!isFullscreen && compositionStack.length > 1 && (
           <CompositionBreadcrumb stack={compositionStack} onNavigate={handleNavigateComposition} />
         )}

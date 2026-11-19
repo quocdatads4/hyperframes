@@ -3,7 +3,10 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readStore, writeStore } from "../../auth/store.js";
 import { setupTempAuthEnv, type EnvFixture } from "../../auth/_test-utils.js";
-import { CliRuntimeError } from "../../utils/commandResult.js";
+import { CliRuntimeError, registerRootExitRequester } from "../../utils/commandResult.js";
+
+// heygenUserId("alice"): the sha256-derived UUID the web app and Desktop also use.
+const ALICE_USER_ID = "2bd806c9-7f0e-50af-9a1f-c3328fa763a9";
 
 // Mock only AuthClient — keep the real store/resolver so the test
 // exercises the actual on-disk rollback / persistence behavior.
@@ -18,20 +21,6 @@ const verifyState = vi.hoisted(
     },
 );
 
-vi.mock("../../auth/index.js", async (orig) => {
-  const actual = await orig<typeof import("../../auth/index.js")>();
-  class MockAuthClient {
-    async getCurrentUser(): Promise<Record<string, unknown>> {
-      if (verifyState.reject) {
-        const { ErrUnauthenticated: rej } = await import("../../auth/errors.js");
-        throw rej("invalid key");
-      }
-      return verifyState.user;
-    }
-  }
-  return { ...actual, AuthClient: MockAuthClient };
-});
-
 // Spy on the telemetry the login flow emits, so we can assert the identity is
 // attributed on success. login.ts imports these via a dynamic import of
 // telemetry/index.js; the mock intercepts it.
@@ -43,16 +32,108 @@ const telemetry = vi.hoisted(() => ({
 }));
 vi.mock("../../telemetry/index.js", () => telemetry);
 
-describe("auth login --api-key rollback", () => {
+const deviceChallenge = vi.hoisted(() => ({
+  verificationUriComplete: undefined as string | undefined,
+}));
+
+const deviceAuth = vi.hoisted(() => ({
+  start: vi.fn(async (options?: { onChallenge?: (value: unknown) => void }) => {
+    options?.onChallenge?.({
+      verificationUri: "https://app.heygen.com/oauth/device",
+      ...(deviceChallenge.verificationUriComplete
+        ? { verificationUriComplete: deviceChallenge.verificationUriComplete }
+        : {}),
+      userCode: "ABCD-2345",
+    });
+    return {
+      access_token: "device-at",
+      refresh_token: "device-rt",
+      token_type: "Bearer",
+    };
+  }),
+  persist: vi.fn(async () => {}),
+  revoke: vi.fn(async () => {}),
+}));
+
+const usersByToken = vi.hoisted((): Record<string, Record<string, unknown>> => ({}));
+
+const browserAuth = vi.hoisted(() => ({
+  start: vi.fn(async () => {
+    const tokens = { access_token: "browser-at", token_type: "Bearer" };
+    const { writeStore: write } = await import("../../auth/store.js");
+    await write({ oauth: { access_token: tokens.access_token } });
+    return { tokens };
+  }),
+}));
+
+vi.mock("../../auth/index.js", async (orig) => {
+  const actual = await orig<typeof import("../../auth/index.js")>();
+  class MockAuthClient {
+    async getCurrentUser(credential: { access_token?: string }): Promise<Record<string, unknown>> {
+      if (verifyState.reject) {
+        const { ErrUnauthenticated: rej } = await import("../../auth/errors.js");
+        throw rej("invalid token");
+      }
+      return (credential.access_token && usersByToken[credential.access_token]) || verifyState.user;
+    }
+  }
+  return {
+    ...actual,
+    AuthClient: MockAuthClient,
+    assertOAuthConfiguredOrExit: () => {},
+    startAuthorizationCodeFlow: browserAuth.start,
+    startDeviceAuthorizationFlow: deviceAuth.start,
+    persistVerifiedOAuthSession: deviceAuth.persist,
+    revokeTokens: deviceAuth.revoke,
+  };
+});
+
+describe("auth login", () => {
   let dir: string;
   let envFixture: EnvFixture;
+  let runtimeEnv: Record<string, string | undefined>;
+  let stdinTTYDescriptor: PropertyDescriptor | undefined;
+  let stdoutTTYDescriptor: PropertyDescriptor | undefined;
 
   beforeEach(async () => {
+    runtimeEnv = Object.fromEntries(
+      [
+        "CI",
+        "SSH_CONNECTION",
+        "SSH_CLIENT",
+        "SSH_TTY",
+        "BROWSER",
+        "HF_NO_BROWSER",
+        "CODESPACES",
+        "GITHUB_CODESPACES",
+        "REMOTE_CONTAINERS",
+        "GITPOD_WORKSPACE_ID",
+        "container",
+        "CLAUDECODE",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_ENTRYPOINT",
+      ].map((key) => [key, process.env[key]]),
+    );
+    for (const key of Object.keys(runtimeEnv)) delete process.env[key];
+    stdinTTYDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+    stdoutTTYDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+    Object.defineProperty(process.stdin, "isTTY", {
+      configurable: true,
+      value: true,
+    });
+    Object.defineProperty(process.stdout, "isTTY", {
+      configurable: true,
+      value: true,
+    });
     envFixture = await setupTempAuthEnv("hf-login-");
     dir = envFixture.dir;
     verifyState.reject = false;
     verifyState.user = { email: "alice@example.com" };
+    deviceChallenge.verificationUriComplete = undefined;
+    for (const token of Object.keys(usersByToken)) delete usersByToken[token];
     for (const fn of Object.values(telemetry)) fn.mockClear();
+    for (const fn of Object.values(deviceAuth)) fn.mockClear();
+    for (const fn of Object.values(browserAuth)) fn.mockClear();
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
   });
@@ -60,14 +141,26 @@ describe("auth login --api-key rollback", () => {
   afterEach(async () => {
     vi.restoreAllMocks();
     await envFixture.restore();
+    for (const [key, value] of Object.entries(runtimeEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    if (stdinTTYDescriptor) Object.defineProperty(process.stdin, "isTTY", stdinTTYDescriptor);
+    else delete (process.stdin as { isTTY?: boolean }).isTTY;
+    if (stdoutTTYDescriptor) Object.defineProperty(process.stdout, "isTTY", stdoutTTYDescriptor);
+    else delete (process.stdout as { isTTY?: boolean }).isTTY;
   });
 
-  async function runLogin(apiKey: string): Promise<void> {
+  async function runCommand(args: Record<string, unknown>): Promise<void> {
     const cmd = (await import("./login.js")).default;
     // citty command run only reads `args` here.
     await (cmd.run as (ctx: { args: Record<string, unknown> }) => Promise<void>)({
-      args: { "api-key": apiKey },
+      args,
     });
+  }
+
+  async function runLogin(apiKey: string): Promise<void> {
+    await runCommand({ "api-key": apiKey });
   }
 
   it("removes the rejected key on a failed FIRST login (no prior credential)", async () => {
@@ -128,7 +221,10 @@ describe("auth login --api-key rollback", () => {
   });
 
   it("rollback on a rejected key restores the previous user block too", async () => {
-    await writeStore({ api_key: "hg_prev", user: { email: "prev@example.com" } });
+    await writeStore({
+      api_key: "hg_prev",
+      user: { email: "prev@example.com" },
+    });
     verifyState.reject = true;
     await expect(runLogin("hg_badnewkey")).rejects.toThrow(CliRuntimeError);
 
@@ -156,18 +252,23 @@ describe("auth login --api-key rollback", () => {
     expect(onDisk.future_credential).toEqual({ token: "owned_by_other_cli" });
   });
 
-  it("attributes a successful login to the account email", async () => {
-    verifyState.user = { email: "alice@example.com", username: "alice" };
+  it("attributes a successful login to the username's HyperFrames user id", async () => {
+    verifyState.user = { email: "Alice@Example.com", username: "alice" };
     await runLogin("hg_goodkey456");
-    expect(telemetry.identifyUser).toHaveBeenCalledWith("alice@example.com");
-    expect(telemetry.trackAuthLoginCompleted).toHaveBeenCalledWith("api_key", "alice@example.com");
+    expect(telemetry.identifyUser).toHaveBeenCalledWith(ALICE_USER_ID, {
+      email: "alice@example.com",
+      heygen_username: "alice",
+    });
+    expect(telemetry.trackAuthLoginCompleted).toHaveBeenCalledWith("api_key", ALICE_USER_ID);
   });
 
-  it("falls back to username when the account has no email", async () => {
-    verifyState.user = { username: "alice" };
+  it("falls back to the email when the account has no username", async () => {
+    verifyState.user = { email: "alice@example.com" };
     await runLogin("hg_goodkey456");
-    expect(telemetry.identifyUser).toHaveBeenCalledWith("alice");
-    expect(telemetry.trackAuthLoginCompleted).toHaveBeenCalledWith("api_key", "alice");
+    expect(telemetry.identifyUser).toHaveBeenCalledWith("alice@example.com", {
+      email: "alice@example.com",
+    });
+    expect(telemetry.trackAuthLoginCompleted).toHaveBeenCalledWith("api_key", "alice@example.com");
   });
 
   it("does not identify when the identity probe returns nothing", async () => {
@@ -197,5 +298,166 @@ describe("auth login --api-key rollback", () => {
     expect(onDisk.api_key).toBe("hg_goodkey456");
     expect(onDisk.user).toEqual({ email: "jane@example.com" });
     expect(onDisk.future_field).toEqual({ x: 1 });
+  });
+
+  it("requires the explicit --device flag in a remote terminal", async () => {
+    process.env["SSH_CONNECTION"] = "192.0.2.1 1234 192.0.2.2 22";
+    await expect(runCommand({})).rejects.toThrow(/Invalid command usage/);
+    expect(deviceAuth.start).not.toHaveBeenCalled();
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining("hyperframes auth login --device"),
+    );
+  });
+
+  it.each([
+    "CODESPACES",
+    "GITHUB_CODESPACES",
+    "REMOTE_CONTAINERS",
+    "GITPOD_WORKSPACE_ID",
+    "container",
+  ])("requires --device in the %s remote environment", async (name) => {
+    process.env[name] = "true";
+    await expect(runCommand({})).rejects.toThrow(/Invalid command usage/);
+    expect(deviceAuth.start).not.toHaveBeenCalled();
+  });
+
+  it("lets a coding agent on this machine open the browser sign-in without a terminal", async () => {
+    process.env["CLAUDE_CODE_CHILD_SESSION"] = "1";
+    Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: undefined });
+    await runCommand({});
+    expect(browserAuth.start).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a coding agent in CI off the browser sign-in", async () => {
+    process.env["CLAUDE_CODE_CHILD_SESSION"] = "1";
+    process.env["CI"] = "true";
+    Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: undefined });
+    await expect(runCommand({})).rejects.toThrow(/Invalid command usage/);
+    expect(browserAuth.start).not.toHaveBeenCalled();
+  });
+
+  it("opens verification_uri_complete without asking the user to re-enter the code", async () => {
+    deviceChallenge.verificationUriComplete =
+      "https://app.heygen.com/oauth/device?user_code=ABCD-2345";
+
+    await runCommand({ device: true });
+
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining("https://app.heygen.com/oauth/device?user_code=ABCD-2345"),
+    );
+    expect(console.log).not.toHaveBeenCalledWith(expect.stringContaining("Enter code"));
+  });
+
+  it("verifies the device token before persisting it", async () => {
+    verifyState.user = { email: "device@example.com" };
+    await runCommand({ device: true });
+
+    expect(deviceAuth.start).toHaveBeenCalledOnce();
+    expect(deviceAuth.persist).toHaveBeenCalledWith(
+      expect.objectContaining({ access_token: "device-at" }),
+      expect.objectContaining({ email: "device@example.com" }),
+    );
+    expect(deviceAuth.revoke).not.toHaveBeenCalled();
+    expect(telemetry.trackAuthLoginCompleted).toHaveBeenCalledWith("device", "device@example.com");
+  });
+
+  it("revokes and never persists a device token that identity verification rejects", async () => {
+    verifyState.reject = true;
+    await expect(runCommand({ device: true })).rejects.toThrow(CliRuntimeError);
+
+    expect(deviceAuth.persist).not.toHaveBeenCalled();
+    expect(deviceAuth.revoke).toHaveBeenCalledTimes(2);
+    expect(deviceAuth.revoke).toHaveBeenNthCalledWith(
+      1,
+      "device-at",
+      expect.objectContaining({ token_type_hint: "access_token" }),
+    );
+    expect(deviceAuth.revoke).toHaveBeenNthCalledWith(
+      2,
+      "device-rt",
+      expect.objectContaining({ token_type_hint: "refresh_token" }),
+    );
+    expect(telemetry.trackAuthLoginFailed).toHaveBeenCalledWith("device", "rejected");
+  });
+
+  it("reports the account a browser login just signed in, not a host token in the environment", async () => {
+    process.env["HEYGEN_ACCESS_TOKEN"] = "env-at";
+    usersByToken["env-at"] = { email: "a@example.com" };
+    usersByToken["browser-at"] = { email: "b@example.com" };
+    await runCommand({});
+
+    const { credentials } = await readStore();
+    expect(credentials.oauth?.access_token).toBe("browser-at");
+    expect(credentials.user?.email).toBe("b@example.com");
+    expect(telemetry.trackAuthLoginCompleted).toHaveBeenCalledWith("oauth", "b@example.com");
+  });
+
+  it("tells a timed-out browser login how to recover", async () => {
+    browserAuth.start.mockRejectedValueOnce(new Error("OAuth callback timed out after 60 minutes"));
+    await expect(runCommand({})).rejects.toThrow();
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining("Run `hyperframes auth login` again"),
+    );
+    expect(telemetry.trackAuthLoginFailed).toHaveBeenCalledWith("oauth", "flow_timeout");
+  });
+
+  it("does not offer the recovery line for other browser login failures", async () => {
+    browserAuth.start.mockRejectedValueOnce(
+      new Error("OAuth state mismatch — possible CSRF, aborting."),
+    );
+    await expect(runCommand({})).rejects.toThrow();
+    expect(console.error).not.toHaveBeenCalledWith(
+      expect.stringContaining("hyperframes auth login"),
+    );
+    expect(telemetry.trackAuthLoginFailed).toHaveBeenCalledWith("oauth", "flow_error");
+  });
+
+  it("prints a browser login failure with control characters as visible escapes", async () => {
+    const esc = String.fromCharCode(27);
+    browserAuth.start.mockRejectedValueOnce(new Error(`denied ${esc}]0;x\x07 by\r\nproxy`));
+    await expect(runCommand({})).rejects.toThrow();
+    const printed = vi
+      .mocked(console.error)
+      .mock.calls.map((call) => call.join(" "))
+      .join("\n");
+
+    expect(printed.replace(new RegExp(`${esc}\\[[0-9;]*m`, "g"), "")).not.toContain(esc);
+    expect(printed).toContain("denied \\x1b]0;x\\x07 by\\x0d\nproxy");
+  });
+
+  it("records Ctrl+C during the browser wait as aborted and exits", async () => {
+    const exit = vi.fn();
+    registerRootExitRequester(exit);
+    const before = process.listeners("SIGINT");
+    browserAuth.start.mockImplementationOnce(async () => {
+      const added = process.listeners("SIGINT").filter((listener) => !before.includes(listener));
+      added[0]?.("SIGINT");
+      throw new Error("interrupted");
+    });
+
+    await expect(runCommand({})).rejects.toThrow();
+
+    expect(telemetry.trackAuthLoginFailed).toHaveBeenCalledWith("oauth", "aborted");
+    expect(exit).toHaveBeenCalledWith(130);
+    expect(process.listeners("SIGINT")).toEqual(before);
+  });
+
+  it("refuses device authorization in CI", async () => {
+    process.env["CI"] = "true";
+    await expect(runCommand({ device: true })).rejects.toThrow(/Invalid command usage/);
+    expect(deviceAuth.start).not.toHaveBeenCalled();
+  });
+
+  it("does not treat CI=false as an unattended environment", async () => {
+    process.env["CI"] = "false";
+    await runCommand({ device: true });
+    expect(deviceAuth.start).toHaveBeenCalledOnce();
+  });
+
+  it("runs device authorization without a terminal, where only a URL and code are printed", async () => {
+    Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: undefined });
+    Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: undefined });
+    await runCommand({ device: true });
+    expect(deviceAuth.start).toHaveBeenCalledOnce();
   });
 });

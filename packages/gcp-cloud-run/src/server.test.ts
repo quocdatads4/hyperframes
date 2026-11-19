@@ -15,17 +15,27 @@
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import type { AssembleResult, ChunkResult, PlanResult } from "@hyperframes/producer/distributed";
+import { dirname, join } from "node:path";
+import {
+  PLAN_V2_INTEGRITY_UNRECOVERABLE,
+  type AssembleResult,
+  type ChunkResult,
+  type PlanV2ArtifactPublisher,
+  type PlanV2Manifest,
+  publishPlanV2FromExecutionPlan,
+} from "@hyperframes/producer/distributed";
+import { recomputePlanHashFromPlanDir } from "../../producer/src/services/render/stages/freezePlan.js";
 import { asStorage, FakeGcs } from "./__fixtures__/fakeGcs.js";
-import type { AssembleEvent, CloudRunEvent, PlanEvent, RenderChunkEvent } from "./events.js";
+import type { CloudRunEvent, PlanEvent, RenderChunkEvent } from "./events.js";
 import {
   createApp,
   createStudioBundleCache,
   dispatch,
   type HandlerDeps,
+  isTrustedServiceToken,
   unwrapEvent,
 } from "./server.js";
 import { tarDirectory } from "./gcsTransport.js";
@@ -64,6 +74,10 @@ describe("createStudioBundleCache", () => {
     revision += 1;
     expect(await bundle("/project")).toBe("html-2");
     expect(calls).toBe(2);
+
+    bundle.invalidate("/project");
+    expect(await bundle("/project")).toBe("html-3");
+    expect(calls).toBe(3);
   });
 });
 
@@ -76,37 +90,34 @@ async function seedProjectTar(gcs: FakeGcs, uri: string): Promise<void> {
   gcs.seedFromFile(uri, tarPath);
 }
 
-/** Build a real plan tarball containing plan.json, seed it, return its URI. */
-async function seedPlanTar(gcs: FakeGcs, uri: string, planHash: string): Promise<void> {
-  const planDir = mkTmp("hf-plan-");
-  writeFileSync(join(planDir, "plan.json"), JSON.stringify({ planHash }));
-  const tarPath = join(mkTmp("hf-plan-tar-"), "plan.tar.gz");
-  await tarDirectory(planDir, tarPath);
-  gcs.seedFromFile(uri, tarPath);
+function makeMinimalV1PlanDir(dir: string, withAudio: boolean): void {
+  mkdirSync(join(dir, "meta"), { recursive: true });
+  mkdirSync(join(dir, "compiled"), { recursive: true });
+  writeFileSync(join(dir, "compiled", "index.html"), "<html>gcp v2 fixture</html>");
+  const planJson = {
+    planHash: "a".repeat(64),
+    chunkCount: 1,
+    totalFrames: 30,
+    dimensions: { fpsNum: 30, fpsDen: 1, width: 640, height: 360, format: "mp4" },
+    ffmpegVersion: "6.0",
+    producerVersion: "test",
+    fontSnapshotSha: "font-snapshot-test",
+  };
+  writeFileSync(join(dir, "plan.json"), JSON.stringify(planJson));
+  writeFileSync(
+    join(dir, "meta", "chunks.json"),
+    JSON.stringify([{ index: 0, startFrame: 0, endFrame: 30 }]),
+  );
+  writeFileSync(join(dir, "meta", "encoder.json"), "{}");
+  if (withAudio) writeFileSync(join(dir, "audio.m4a"), "AAC");
+  planJson.planHash = recomputePlanHashFromPlanDir(dir);
+  writeFileSync(join(dir, "plan.json"), JSON.stringify(planJson));
 }
-
-const planResult: PlanResult = {
-  planDir: "(set at call time)",
-  planHash: PLAN_HASH,
-  chunkCount: 3,
-  totalFrames: 90,
-  fps: 30,
-  width: 1920,
-  height: 1080,
-  format: "mp4",
-  ffmpegVersion: "ffmpeg version 6.1.1",
-  producerVersion: "0.6.79",
-};
 
 function depsWith(
   gcs: FakeGcs,
   overrides: Partial<NonNullable<HandlerDeps["primitives"]>> = {},
 ): HandlerDeps {
-  const plan = async (_projectDir: string, _config: unknown, planDir: string) => {
-    mkdirSync(planDir, { recursive: true });
-    writeFileSync(join(planDir, "plan.json"), JSON.stringify({ planHash: PLAN_HASH }));
-    return planResult;
-  };
   const renderChunk = async (_planDir: string, chunkIndex: number, outputBase: string) => {
     writeFileSync(outputBase, Buffer.from(`chunk-${chunkIndex}`));
     return {
@@ -114,6 +125,14 @@ function depsWith(
       outputKind: "file",
       framesEncoded: 30,
       sha256: `sha-${chunkIndex}`,
+      captureMode: "beginframe",
+      durationMs: 0,
+      planHashMs: 0,
+      sessionBootMs: 0,
+      captureStageMs: 0,
+      encodeStageMs: 0,
+      workers: 1,
+      perfPath: `${outputBase}.perf.json`,
     } satisfies ChunkResult;
   };
   const assemble = async (
@@ -128,9 +147,7 @@ function depsWith(
   return {
     storage: asStorage(gcs),
     skipChromeResolution: true,
-    primitives: { plan, renderChunk, assemble, ...overrides } as NonNullable<
-      HandlerDeps["primitives"]
-    >,
+    primitives: { renderChunk, assemble, ...overrides } as NonNullable<HandlerDeps["primitives"]>,
   };
 }
 
@@ -162,73 +179,158 @@ describe("unwrapEvent", () => {
 });
 
 describe("dispatch", () => {
-  it("routes plan, uploads the plan tarball", async () => {
+  it("rejects explicit Plan v1 before touching GCS", async () => {
     const gcs = new FakeGcs();
-    await seedProjectTar(gcs, "gs://b/sites/x/project.tar.gz");
-    const event: PlanEvent = {
+    const event = {
       Action: "plan",
-      ProjectGcsUri: "gs://b/sites/x/project.tar.gz",
+      PlanProtocol: "v1",
+      ProjectGcsUri: "gs://b/project.tar.gz",
       PlanOutputGcsPrefix: "gs://b/renders/r1/",
-      Config: { fps: 30, width: 1920, height: 1080, format: "mp4" } as PlanEvent["Config"],
-    };
-    const res = await dispatch(event, depsWith(gcs));
-    expect(res.Action).toBe("plan");
-    if (res.Action !== "plan") throw new Error("unreachable");
-    expect(res.PlanHash).toBe(PLAN_HASH);
-    expect(res.ChunkCount).toBe(3);
-    expect(res.PlanGcsUri).toBe("gs://b/renders/r1/plan.tar.gz");
-    expect(gcs.objects.has("gs://b/renders/r1/plan.tar.gz")).toBe(true);
+      Config: { fps: 30, width: 640, height: 360, format: "mp4" },
+    } as unknown as PlanEvent;
+
+    await expect(
+      dispatch(event, { storage: asStorage(gcs), skipChromeResolution: true }),
+    ).rejects.toMatchObject({ name: "PLAN_PROTOCOL_UNSUPPORTED" });
+    expect(gcs.ops).toEqual([]);
   });
 
-  it("routes renderChunk and uploads the chunk", async () => {
+  it("defaults omitted plan protocol to v2 across plan → chunk → assemble", async () => {
     const gcs = new FakeGcs();
-    await seedPlanTar(gcs, "gs://b/renders/r1/plan.tar.gz", PLAN_HASH);
-    const event: RenderChunkEvent = {
+    await seedProjectTar(gcs, "gs://b/sites/v2/project.tar.gz");
+    const root = mkTmp("hf-v2-e2e-");
+    const planV2WithPublisher = async (
+      projectDir: string,
+      _config: unknown,
+      publisher: PlanV2ArtifactPublisher,
+      options: Readonly<{ stagingParentDir?: string }>,
+    ): Promise<PlanV2Manifest> => {
+      const v1Dir = join(root, "v1");
+      makeMinimalV1PlanDir(v1Dir, true);
+      const manifest = await publishPlanV2FromExecutionPlan(v1Dir, publisher);
+      expect(options.stagingParentDir).toBe(dirname(projectDir));
+      expect(existsSync(join(dirname(projectDir), "plan-v2"))).toBe(false);
+      return manifest;
+    };
+    const renderChunk = async (
+      planDir: string,
+      chunkIndex: number,
+      outputBase: string,
+    ): Promise<ChunkResult> => {
+      expect(existsSync(join(planDir, "audio.m4a"))).toBe(false);
+      writeFileSync(outputBase, `chunk-${chunkIndex}`);
+      return {
+        outputPath: outputBase,
+        outputKind: "file",
+        framesEncoded: 30,
+        sha256: "b".repeat(64),
+        captureMode: "beginframe",
+        durationMs: 0,
+        planHashMs: 0,
+        sessionBootMs: 0,
+        captureStageMs: 0,
+        encodeStageMs: 0,
+        workers: 1,
+        perfPath: `${outputBase}.perf.json`,
+      };
+    };
+    const assemble = async (
+      _planDir: string,
+      _chunks: string[],
+      audioPath: string | null,
+      finalOutput: string,
+    ): Promise<AssembleResult> => {
+      expect(audioPath).not.toBeNull();
+      expect(readFileSync(audioPath as string, "utf8")).toBe("AAC");
+      writeFileSync(finalOutput, "v2-output");
+      return { framesEncoded: 30, fileSize: 9 };
+    };
+    const deps = depsWith(gcs, { planV2WithPublisher, renderChunk, assemble });
+
+    const planned = await dispatch(
+      {
+        Action: "plan",
+        ProjectGcsUri: "gs://b/sites/v2/project.tar.gz",
+        PlanOutputGcsPrefix: "gs://b/renders/v2/",
+        Config: { fps: 30, width: 640, height: 360, format: "mp4" },
+      },
+      deps,
+    );
+    expect(planned).toMatchObject({
+      PlanProtocol: "v2",
+      PlanV2ManifestGcsUri: "gs://b/renders/v2/v2/manifest.json",
+      PlanV2ArtifactGcsPrefix: "gs://b/renders/v2/v2/artifacts/sha256",
+      AudioGcsUri: null,
+    });
+    expect("PlanGcsUri" in planned).toBe(false);
+    const uploadUris = gcs.ops.filter((op) => op.kind === "upload").map((op) => op.uri);
+    expect(uploadUris.at(-1)).toBe("gs://b/renders/v2/v2/manifest.json");
+    expect(gcs.metadata.get(uploadUris.at(-1) ?? "")?.sha256).toMatch(/^[a-f0-9]{64}$/);
+    await dispatch(
+      {
+        Action: "plan",
+        ProjectGcsUri: "gs://b/sites/v2/project.tar.gz",
+        PlanOutputGcsPrefix: "gs://b/renders/v2/",
+        Config: { fps: 30, width: 640, height: 360, format: "mp4" },
+      },
+      deps,
+    );
+    expect(gcs.ops.filter((op) => op.kind === "upload").map((op) => op.uri)).toEqual(uploadUris);
+    if (!("PlanProtocol" in planned) || planned.PlanProtocol !== "v2") {
+      throw new Error("expected v2 plan result");
+    }
+
+    const beforeChunk = gcs.ops.length;
+    const chunk = await dispatch(
+      {
+        Action: "renderChunk",
+        PlanV2ManifestGcsUri: planned.PlanV2ManifestGcsUri,
+        PlanV2ArtifactGcsPrefix: planned.PlanV2ArtifactGcsPrefix,
+        PlanHash: planned.PlanHash,
+        ChunkIndex: 0,
+        ChunkOutputGcsPrefix: "gs://b/renders/v2/",
+        Format: "mp4",
+      },
+      deps,
+    );
+    if (chunk.Action !== "renderChunk") throw new Error("expected chunk result");
+    const audioDigest = createHash("sha256").update("AAC").digest("hex");
+    const audioUri = `${planned.PlanV2ArtifactGcsPrefix}/${audioDigest.slice(0, 2)}/${audioDigest}`;
+    expect(gcs.ops.slice(beforeChunk).some((operation) => operation.uri === audioUri)).toBe(false);
+
+    await dispatch(
+      {
+        Action: "assemble",
+        PlanV2ManifestGcsUri: planned.PlanV2ManifestGcsUri,
+        PlanV2ArtifactGcsPrefix: planned.PlanV2ArtifactGcsPrefix,
+        PlanHash: planned.PlanHash,
+        ChunkGcsUris: [chunk.ChunkGcsUri],
+        AudioGcsUri: null,
+        OutputGcsUri: "gs://b/renders/v2/output.mp4",
+        Format: "mp4",
+      },
+      deps,
+    );
+    expect(
+      gcs.ops.some((operation) => operation.kind === "download" && operation.uri === audioUri),
+    ).toBe(true);
+  });
+
+  it("rejects mixed v1/v2 locators at runtime", async () => {
+    const event = {
       Action: "renderChunk",
+      PlanProtocol: "v2",
       PlanGcsUri: "gs://b/renders/r1/plan.tar.gz",
+      PlanV2ManifestGcsUri: "gs://b/renders/r1/v2/manifest.json",
+      PlanV2ArtifactGcsPrefix: "gs://b/renders/r1/v2/artifacts/sha256",
       PlanHash: PLAN_HASH,
-      ChunkIndex: 2,
-      ChunkOutputGcsPrefix: "gs://b/renders/r1/",
-      Format: "mp4",
-    };
-    const res = await dispatch(event, depsWith(gcs));
-    if (res.Action !== "renderChunk") throw new Error("unreachable");
-    expect(res.ChunkIndex).toBe(2);
-    expect(res.ChunkGcsUri).toBe("gs://b/renders/r1/chunks/0002.mp4");
-    expect(gcs.objects.has("gs://b/renders/r1/chunks/0002.mp4")).toBe(true);
-  });
-
-  it("throws PLAN_HASH_MISMATCH when the event hash disagrees", async () => {
-    const gcs = new FakeGcs();
-    await seedPlanTar(gcs, "gs://b/renders/r1/plan.tar.gz", PLAN_HASH);
-    const event: RenderChunkEvent = {
-      Action: "renderChunk",
-      PlanGcsUri: "gs://b/renders/r1/plan.tar.gz",
-      PlanHash: "WRONG_HASH",
       ChunkIndex: 0,
       ChunkOutputGcsPrefix: "gs://b/renders/r1/",
       Format: "mp4",
-    };
-    await expect(dispatch(event, depsWith(gcs))).rejects.toThrow(/PLAN_HASH_MISMATCH/);
-  });
-
-  it("routes assemble and uploads the final output", async () => {
-    const gcs = new FakeGcs();
-    await seedPlanTar(gcs, "gs://b/renders/r1/plan.tar.gz", PLAN_HASH);
-    gcs.seed("gs://b/renders/r1/chunks/0000.mp4", Buffer.from("c0"));
-    gcs.seed("gs://b/renders/r1/chunks/0001.mp4", Buffer.from("c1"));
-    const event: AssembleEvent = {
-      Action: "assemble",
-      PlanGcsUri: "gs://b/renders/r1/plan.tar.gz",
-      ChunkGcsUris: ["gs://b/renders/r1/chunks/0000.mp4", "gs://b/renders/r1/chunks/0001.mp4"],
-      AudioGcsUri: null,
-      OutputGcsUri: "gs://b/renders/r1/output.mp4",
-      Format: "mp4",
-    };
-    const res = await dispatch(event, depsWith(gcs));
-    if (res.Action !== "assemble") throw new Error("unreachable");
-    expect(res.FramesEncoded).toBe(90);
-    expect(gcs.objects.has("gs://b/renders/r1/output.mp4")).toBe(true);
+    } as unknown as RenderChunkEvent;
+    await expect(dispatch(event, depsWith(new FakeGcs()))).rejects.toMatchObject({
+      name: "PLAN_PROTOCOL_UNSUPPORTED",
+    });
   });
 
   it("rejects an unknown action", async () => {
@@ -247,7 +349,9 @@ describe("bucket allowlist guard", () => {
     try {
       const event: RenderChunkEvent = {
         Action: "renderChunk",
-        PlanGcsUri: "gs://evil-bucket/plan.tar.gz",
+        PlanProtocol: "v2",
+        PlanV2ManifestGcsUri: "gs://evil-bucket/v2/manifest.json",
+        PlanV2ArtifactGcsPrefix: "gs://allowed-bucket/v2/artifacts/sha256",
         PlanHash: PLAN_HASH,
         ChunkIndex: 0,
         ChunkOutputGcsPrefix: "gs://allowed-bucket/renders/r1/",
@@ -260,22 +364,49 @@ describe("bucket allowlist guard", () => {
     }
   });
 
-  it('treats HYPERFRAMES_RENDER_BUCKET="*" as an explicit opt-out (off-bucket allowed)', async () => {
-    const gcs = new FakeGcs();
-    await seedPlanTar(gcs, "gs://any-bucket/renders/r1/plan.tar.gz", PLAN_HASH);
+  it("checks both v2 manifest and artifact-prefix buckets", async () => {
     const prev = process.env.HYPERFRAMES_RENDER_BUCKET;
-    process.env.HYPERFRAMES_RENDER_BUCKET = "*";
+    process.env.HYPERFRAMES_RENDER_BUCKET = "allowed-bucket";
     try {
       const event: RenderChunkEvent = {
         Action: "renderChunk",
-        PlanGcsUri: "gs://any-bucket/renders/r1/plan.tar.gz",
+        PlanProtocol: "v2",
+        PlanV2ManifestGcsUri: "gs://allowed-bucket/v2/manifest.json",
+        PlanV2ArtifactGcsPrefix: "gs://evil-bucket/v2/artifacts/sha256",
         PlanHash: PLAN_HASH,
         ChunkIndex: 0,
-        ChunkOutputGcsPrefix: "gs://any-bucket/renders/r1/",
+        ChunkOutputGcsPrefix: "gs://allowed-bucket/renders/r1/",
         Format: "mp4",
       };
-      const res = await dispatch(event, depsWith(gcs));
-      expect(res.Action).toBe("renderChunk");
+      await expect(dispatch(event, depsWith(new FakeGcs()))).rejects.toThrow(/GCS_URI_NOT_ALLOWED/);
+    } finally {
+      if (prev === undefined) delete process.env.HYPERFRAMES_RENDER_BUCKET;
+      else process.env.HYPERFRAMES_RENDER_BUCKET = prev;
+    }
+  });
+
+  it('treats HYPERFRAMES_RENDER_BUCKET="*" as an explicit opt-out (off-bucket allowed)', async () => {
+    const gcs = new FakeGcs();
+    await seedProjectTar(gcs, "gs://any-bucket/project.tar.gz");
+    const prev = process.env.HYPERFRAMES_RENDER_BUCKET;
+    process.env.HYPERFRAMES_RENDER_BUCKET = "*";
+    try {
+      const event: PlanEvent = {
+        Action: "plan",
+        ProjectGcsUri: "gs://any-bucket/project.tar.gz",
+        PlanOutputGcsPrefix: "gs://any-bucket/renders/r1/",
+        Config: { fps: 30, width: 640, height: 360, format: "mp4" },
+      };
+      await expect(
+        dispatch(
+          event,
+          depsWith(gcs, {
+            planV2WithPublisher: async () => {
+              throw new Error("reached primitive");
+            },
+          }),
+        ),
+      ).rejects.toThrow("reached primitive");
     } finally {
       if (prev === undefined) delete process.env.HYPERFRAMES_RENDER_BUCKET;
       else process.env.HYPERFRAMES_RENDER_BUCKET = prev;
@@ -284,69 +415,123 @@ describe("bucket allowlist guard", () => {
 });
 
 describe("createApp HTTP mapping", () => {
-  it("returns 200 with the result body on success", async () => {
+  const planBody = {
+    Action: "plan",
+    ProjectGcsUri: "gs://b/project.tar.gz",
+    PlanOutputGcsPrefix: "gs://b/renders/r1/",
+    Config: { fps: 30, width: 640, height: 360, format: "mp4" },
+  };
+
+  it("returns 200 with a Plan v2 result", async () => {
     const gcs = new FakeGcs();
-    await seedPlanTar(gcs, "gs://b/renders/r1/plan.tar.gz", PLAN_HASH);
-    const app = createApp(depsWith(gcs));
+    await seedProjectTar(gcs, planBody.ProjectGcsUri);
+    const manifest: PlanV2Manifest = {
+      protocol: {
+        schemaVersion: 2,
+        artifactLayout: "content-addressed-plan-v2",
+        hashSchema: "hyperframes-plan-manifest-hash-v2",
+      },
+      planHash: "a".repeat(64),
+      sourcePlanV1Hash: "b".repeat(64),
+      chunkCount: 1,
+      totalFrames: 30,
+      fps: 30,
+      width: 640,
+      height: 360,
+      format: "mp4",
+      ffmpegVersion: "6.0",
+      producerVersion: "test",
+      limitations: { videoDependencyMode: "source-extract" },
+      artifacts: [],
+    };
+    const app = createApp(depsWith(gcs, { planV2WithPublisher: async () => manifest }));
     const res = await app.request("/", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        Action: "renderChunk",
-        PlanGcsUri: "gs://b/renders/r1/plan.tar.gz",
-        PlanHash: PLAN_HASH,
-        ChunkIndex: 0,
-        ChunkOutputGcsPrefix: "gs://b/renders/r1/",
-        Format: "mp4",
-      }),
+      body: JSON.stringify(planBody),
     });
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { Action: string };
-    expect(body.Action).toBe("renderChunk");
+    expect(await res.json()).toMatchObject({ Action: "plan", PlanProtocol: "v2" });
   });
 
-  it("returns 400 for a non-retryable error (plan-hash mismatch)", async () => {
-    const gcs = new FakeGcs();
-    await seedPlanTar(gcs, "gs://b/renders/r1/plan.tar.gz", PLAN_HASH);
-    const app = createApp(depsWith(gcs));
+  it("returns 400 for explicit Plan v1", async () => {
+    const app = createApp(depsWith(new FakeGcs()));
     const res = await app.request("/", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...planBody, PlanProtocol: "v1" }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: "PLAN_PROTOCOL_UNSUPPORTED" });
+  });
+
+  it("does not retry a chunk whose frame shows an image that never arrived", async () => {
+    const gcs = new FakeGcs();
+    await seedProjectTar(gcs, planBody.ProjectGcsUri);
+    const root = mkTmp("hf-image-missing-");
+    const deps = depsWith(gcs, {
+      planV2WithPublisher: async (_projectDir, _config, publisher) => {
+        const v1Dir = join(root, "v1");
+        makeMinimalV1PlanDir(v1Dir, false);
+        return publishPlanV2FromExecutionPlan(v1Dir, publisher);
+      },
+      renderChunk: async () => {
+        throw Object.assign(new Error("test"), { name: "ImageMissingFromFrameError" });
+      },
+    });
+    const planned = await dispatch(planBody, deps);
+    if (!("PlanProtocol" in planned) || planned.PlanProtocol !== "v2") {
+      throw new Error("expected v2 plan result");
+    }
+    const res = await createApp(deps).request("/", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         Action: "renderChunk",
-        PlanGcsUri: "gs://b/renders/r1/plan.tar.gz",
-        PlanHash: "WRONG",
+        PlanV2ManifestGcsUri: planned.PlanV2ManifestGcsUri,
+        PlanV2ArtifactGcsPrefix: planned.PlanV2ArtifactGcsPrefix,
+        PlanHash: planned.PlanHash,
         ChunkIndex: 0,
-        ChunkOutputGcsPrefix: "gs://b/renders/r1/",
+        ChunkOutputGcsPrefix: "gs://b/renders/image-missing/",
         Format: "mp4",
       }),
     });
     expect(res.status).toBe(400);
-    const body = (await res.json()) as { error: string };
-    expect(body.error).toBe("PLAN_HASH_MISMATCH");
+    expect(await res.json()).toMatchObject({ error: "ImageMissingFromFrameError" });
   });
 
-  it("returns 500 for a retryable/unknown error", async () => {
-    const gcs = new FakeGcs(); // plan tar NOT seeded → download fails (retryable)
-    const app = createApp(depsWith(gcs));
+  it.each([
+    ["INVALID_VIDEO_METADATA", 400],
+    [PLAN_V2_INTEGRITY_UNRECOVERABLE, 400],
+    ["VIDEO_SOURCE_UNRENDERABLE", 400],
+    ["VIDEO_EXTRACTION_FAILED", 500],
+    ["FONT_FETCH_FAILED", 400],
+    ["FONT_FETCH_UNAVAILABLE", 500],
+    ["CHUNK_EXCEEDS_WORKER_TIMEOUT", 400],
+    ["UNKNOWN_RETRYABLE", 500],
+  ] as const)("routes producer code %s with HTTP %s", async (code, expectedStatus) => {
+    const gcs = new FakeGcs();
+    await seedProjectTar(gcs, planBody.ProjectGcsUri);
+    const app = createApp(
+      depsWith(gcs, {
+        planV2WithPublisher: async () => {
+          throw Object.assign(new Error(`test ${code}`), { name: "ProducerError", code });
+        },
+      }),
+    );
     const res = await app.request("/", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        Action: "renderChunk",
-        PlanGcsUri: "gs://b/renders/r1/missing.tar.gz",
-        PlanHash: PLAN_HASH,
-        ChunkIndex: 0,
-        ChunkOutputGcsPrefix: "gs://b/renders/r1/",
-        Format: "mp4",
-      }),
+      body: JSON.stringify(planBody),
     });
-    expect(res.status).toBe(500);
+    expect(res.status).toBe(expectedStatus);
+    expect(await res.json()).toMatchObject({
+      error: code === "UNKNOWN_RETRYABLE" ? "ProducerError" : code,
+    });
   });
 
   it("returns 400 when the body is not JSON", async () => {
-    const gcs = new FakeGcs();
-    const app = createApp(depsWith(gcs));
+    const app = createApp(depsWith(new FakeGcs()));
     const res = await app.request("/", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -355,10 +540,47 @@ describe("createApp HTTP mapping", () => {
     expect(res.status).toBe(400);
   });
 
+  it("refuses a browser-sent request before dispatching it", async () => {
+    let planned = false;
+    const app = createApp(
+      depsWith(new FakeGcs(), {
+        planV2WithPublisher: async () => {
+          planned = true;
+          throw new Error("must not run");
+        },
+      }),
+    );
+    const res = await app.request("/", {
+      method: "POST",
+      headers: { "content-type": "text/plain", origin: "http://127.0.0.1:41234" },
+      body: JSON.stringify(planBody),
+    });
+    expect(res.status).toBe(403);
+    expect(planned).toBe(false);
+  });
+
   it("healthz returns ok", async () => {
     const app = createApp(depsWith(new FakeGcs()));
     const res = await app.request("/healthz");
     expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).toMatchObject({
+      status: "ok",
+      service: "hyperframes-runtime",
+      renderEngine: "producer",
+      lintEngine: "hyperframes-lint",
+      maxConcurrentRenders: 1,
+    });
+  });
+
+  it("exposes runtime info capabilities without secrets", async () => {
+    const app = createApp({ ...depsWith(new FakeGcs()), serviceToken: "secret-token" });
+    const res = await app.request("/api/runtime/info");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { capabilities: string[] };
+    expect(body.capabilities).toContain("render-status");
+    expect(body.capabilities).toContain("cache-invalidate");
+    expect(JSON.stringify(body)).not.toContain("secret-token");
   });
 
   it("serves the interactive preview runtime", async () => {
@@ -367,5 +589,98 @@ describe("createApp HTTP mapping", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("application/javascript");
     expect(await res.text()).toContain("__player");
+  });
+
+  it("enforces Bearer auth on cache invalidation and allows trusted backend Studio API calls", async () => {
+    const projDir = mkTmp("hf-studio-api-");
+    writeFileSync(
+      join(projDir, "index.html"),
+      '<!doctype html><html><body><div id="composition" data-duration="2" data-width="1080" data-height="1920">Hi</div></body></html>',
+    );
+    const invalidated: string[] = [];
+    const app = createApp({
+      ...depsWith(new FakeGcs()),
+      projects: [{ id: "proj-1", dir: projDir, title: "Test" }],
+      serviceToken: "top-secret-token",
+      onInvalidateCache: (id) => {
+        invalidated.push(id);
+      },
+      renderExecutor: async ({ renderOpts, onProgress }) => {
+        onProgress(50, "capturing");
+        writeFileSync(renderOpts.outputPath, "mp4-bytes");
+        return { audioLoweredDb: -1.5 };
+      },
+    });
+
+    expect(isTrustedServiceToken("Bearer top-secret-token", "top-secret-token")).toBe(true);
+    expect(isTrustedServiceToken("Bearer wrong", "top-secret-token")).toBe(false);
+
+    const unauthInvalidate = await app.request("/api/projects/proj-1/cache/invalidate", {
+      method: "POST",
+    });
+    expect(unauthInvalidate.status).toBe(401);
+
+    const authInvalidate = await app.request("/api/projects/proj-1/cache/invalidate", {
+      method: "POST",
+      headers: { authorization: "Bearer top-secret-token" },
+    });
+    expect(authInvalidate.status).toBe(200);
+    expect(invalidated).toEqual(["proj-1"]);
+
+    // Trusted backend call from public proxy host without sec-fetch-site succeeds for lint & render
+    const lintRes = await app.request(
+      "https://hyperapi.datmarketing.edu.vn/api/projects/proj-1/lint",
+      {
+        headers: {
+          host: "hyperapi.datmarketing.edu.vn",
+          authorization: "Bearer top-secret-token",
+        },
+      },
+    );
+    expect(lintRes.status).toBe(200);
+    const lintBody = (await lintRes.json()) as { findings: unknown[] };
+    expect(Array.isArray(lintBody.findings)).toBe(true);
+
+    const renderRes = await app.request(
+      "https://hyperapi.datmarketing.edu.vn/api/projects/proj-1/render",
+      {
+        method: "POST",
+        headers: {
+          host: "hyperapi.datmarketing.edu.vn",
+          authorization: "Bearer top-secret-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ format: "mp4", quality: "standard", fps: 30 }),
+      },
+    );
+    expect(renderRes.status).toBe(200);
+    const { jobId } = (await renderRes.json()) as { jobId: string };
+    expect(typeof jobId).toBe("string");
+
+    // Wait briefly for microtask/async executor completion
+    let statusBody: Record<string, unknown> = {};
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 15));
+      const statusRes = await app.request(`/api/render/${encodeURIComponent(jobId)}/status`, {
+        headers: { authorization: "Bearer top-secret-token" },
+      });
+      expect(statusRes.status).toBe(200);
+      statusBody = (await statusRes.json()) as Record<string, unknown>;
+      if (statusBody.status === "complete") break;
+    }
+    expect(statusBody).toMatchObject({
+      id: jobId,
+      projectId: "proj-1",
+      status: "complete",
+      progress: 100,
+      outputReady: true,
+      audioLoweredDb: -1.5,
+    });
+
+    const dlRes = await app.request(`/api/render/${encodeURIComponent(jobId)}/download`, {
+      headers: { authorization: "Bearer top-secret-token" },
+    });
+    expect(dlRes.status).toBe(200);
+    expect(await dlRes.text()).toBe("mp4-bytes");
   });
 });

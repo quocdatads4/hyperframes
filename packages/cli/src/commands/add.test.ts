@@ -1,9 +1,52 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { runCommand as runCittyCommand, type CommandDef } from "citty";
+import {
+  existsSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RegistryItem, RegistryManifest } from "@hyperframes/core";
-import { AddError, buildSnippet, remapTarget, runAdd } from "./add.js";
+import { lintHyperframeHtml } from "@hyperframes/lint";
+import type { RunAddResult } from "./add.js";
+import addCommand, {
+  AddError,
+  buildSnippet,
+  compositionRootId,
+  describeInstallFailure,
+  parseVariableValues,
+  remapTarget,
+  runAdd,
+  tagAddJson,
+} from "./add.js";
+import { DEFAULT_REGISTRY_URL } from "../registry/index.js";
+import { stagePublishFiles } from "../utils/publishProject.js";
+import { trackRegistryItemAdded } from "../telemetry/events.js";
+import { trackCommandFailures } from "../utils/command-failure-tracking.js";
+
+// Assert the emitted payload rather than the transport: `shouldTrack()` is
+// already false under test (dev mode / no PostHog key), so a real call would
+// be indistinguishable from no call at all.
+vi.mock("../telemetry/events.js", () => ({ trackRegistryItemAdded: vi.fn() }));
+
+// A write that fails on every platform: publishing the file whose target ends with `failing` throws.
+const failingWrite = vi.hoisted(() => ({ failing: null as string | null }));
+vi.mock("../registry/publication.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../registry/publication.js")>();
+  return {
+    ...actual,
+    publishRegistryFile: (...args: Parameters<typeof actual.publishRegistryFile>) => {
+      if (failingWrite.failing && args[1].endsWith(failingWrite.failing))
+        throw new Error(`could not write ${args[1]}`);
+      return actual.publishRegistryFile(...args);
+    },
+  };
+});
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -19,6 +62,7 @@ const MANIFEST: RegistryManifest = {
     { name: "base-component", type: "hyperframes:component" },
     { name: "my-component", type: "hyperframes:component" },
     { name: "my-example", type: "hyperframes:example" },
+    { name: "example-dep-block", type: "hyperframes:block" },
   ],
 };
 
@@ -133,7 +177,14 @@ const EXAMPLE_ITEM: RegistryItem = {
   files: [{ path: "index.html", target: "index.html", type: "hyperframes:composition" }],
 };
 
+const EXAMPLE_DEP_BLOCK_ITEM: RegistryItem = {
+  ...BLOCK_ITEM,
+  name: "example-dep-block",
+  registryDependencies: ["my-example"],
+};
+
 const ITEM_BY_NAME: Record<string, RegistryItem> = {
+  "example-dep-block": EXAMPLE_DEP_BLOCK_ITEM,
   "my-block": BLOCK_ITEM,
   "deprecated-block": DEPRECATED_BLOCK_ITEM,
   "future-block": FUTURE_BLOCK_ITEM,
@@ -141,6 +192,14 @@ const ITEM_BY_NAME: Record<string, RegistryItem> = {
   "base-component": BASE_COMPONENT_ITEM,
   "my-component": COMPONENT_ITEM,
   "my-example": EXAMPLE_ITEM,
+};
+
+const DEP_BLOCK_HTML = `<div data-composition-variables='[{ "id": "maths", "type": "boolean", "label": "Maths", "default": false }]'></div>`;
+
+const FILE_BODIES: Record<string, string> = {
+  "dep-block.html": DEP_BLOCK_HTML,
+  "deprecated-block.html": `<div data-composition-id="deprecated-block"></div>`,
+  "my-block.html": `<div data-composition-id="my-block-root" data-width="1080" data-height="1350"></div>`,
 };
 
 function mockFetch(): void {
@@ -159,7 +218,7 @@ function mockFetch(): void {
       // File fetch — match `/<type-dir>/<name>/<rest>` and serve synthetic content.
       const f = /\/(examples|blocks|components)\/([^/]+)\/(.+)$/.exec(url);
       if (f) {
-        return new Response(`/* ${f[3]} */\n`, { status: 200 });
+        return new Response(FILE_BODIES[f[3]!] ?? `/* ${f[3]} */\n`, { status: 200 });
       }
       return new Response("not found", { status: 404 });
     }),
@@ -237,6 +296,26 @@ describe("add command pure helpers", () => {
       expect(snip).toContain('data-duration="6"');
     });
 
+    it("reads a composition's root id, inside its <template> when it has one", () => {
+      expect(compositionRootId(`<div data-composition-id="plain" data-width="1"></div>`)).toBe(
+        "plain",
+      );
+      expect(
+        compositionRootId(
+          `<html><head><template id="t"><div data-composition-id="templated"></div></template></head><body></body></html>`,
+        ),
+      ).toBe("templated");
+      expect(compositionRootId(`<div>no root</div>`)).toBeUndefined();
+    });
+
+    it("gives the block host the composition id that check requires", async () => {
+      const snip = buildSnippet(BLOCK_ITEM, "compositions/my-block.html", null, "my-block-root");
+      const html = `<!doctype html><html><body><div data-composition-id="root" data-width="1080" data-height="1350">${snip}</div></body></html>`;
+      const { findings } = await lintHyperframeHtml(html);
+      expect(findings.map((f) => f.code)).not.toContain("host_missing_composition_id");
+      expect(snip).toContain('data-composition-id="my-block-root"');
+    });
+
     it("emits a paste hint for components", () => {
       const snip = buildSnippet(COMPONENT_ITEM, "src/fx/my-component/my-component.html");
       expect(snip).toContain("paste from");
@@ -250,7 +329,10 @@ describe("add command pure helpers", () => {
 });
 
 describe("runAdd (integration, mocked registry)", () => {
-  beforeEach(() => mockFetch());
+  beforeEach(() => {
+    vi.mocked(trackRegistryItemAdded).mockClear();
+    mockFetch();
+  });
   afterEach(() => {
     vi.unstubAllGlobals();
   });
@@ -271,8 +353,9 @@ describe("runAdd (integration, mocked registry)", () => {
       expect(existsSync(join(dir, "compositions/my-block.html"))).toBe(true);
       const installed = readFileSync(join(dir, "compositions/my-block.html"), "utf-8");
       expect(installed).toContain("<!-- hyperframes-registry-item: my-block -->");
-      expect(installed).toContain("my-block.html");
+      expect(installed).toContain('data-composition-id="my-block-root"');
       expect(result.snippet).toContain("compositions/my-block.html");
+      expect(result.snippet).toContain('data-composition-id="my-block-root"');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -313,6 +396,9 @@ describe("runAdd (integration, mocked registry)", () => {
         code: "incompatible-cli",
       });
       expect(existsSync(join(dir, "compositions/future-block.html"))).toBe(false);
+      // Nothing was written, so nothing may be counted: an install count that
+      // also counts refused installs is not a download count.
+      expect(trackRegistryItemAdded).not.toHaveBeenCalled();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -338,6 +424,20 @@ describe("runAdd (integration, mocked registry)", () => {
     }
   });
 
+  it("refuses a wrong-typed --vars before writing any item in the plan", async () => {
+    const dir = tmp();
+    try {
+      writeRegistryConfig(dir);
+      await expect(
+        runAdd({ name: "dep-block", projectDir: dir, skipClipboard: true, vars: '{"maths":1}' }),
+      ).rejects.toThrow(/maths: expected boolean, got number/);
+      expect(existsSync(join(dir, "compositions/components/base-component"))).toBe(false);
+      expect(existsSync(join(dir, "hyperframes.lock.json"))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("installs transitive registryDependencies before the requested item", async () => {
     const dir = tmp();
     try {
@@ -354,6 +454,36 @@ describe("runAdd (integration, mocked registry)", () => {
       expect(existsSync(join(dir, "compositions/dep-block.html"))).toBe(true);
       // Snippet points at the requested block, not the dependency.
       expect(result.snippet).toContain("compositions/dep-block.html");
+      expect(result.warnings).toEqual([
+        expect.stringContaining("compositions/dep-block.html declares no data-composition-id"),
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports every installed item, marking only the requested one", async () => {
+    const dir = tmp();
+    try {
+      writeRegistryConfig(dir);
+
+      await runAdd({ name: "dep-block", projectDir: dir, skipClipboard: true });
+
+      // A dependency dragged in behind the request must not read as a vote for
+      // itself, or a popular dependency outranks everything that depends on it.
+      expect(trackRegistryItemAdded).toHaveBeenCalledTimes(2);
+      expect(trackRegistryItemAdded).toHaveBeenCalledWith({
+        item: "base-component",
+        itemType: "hyperframes:component",
+        requested: false,
+        source: "cli",
+      });
+      expect(trackRegistryItemAdded).toHaveBeenCalledWith({
+        item: "dep-block",
+        itemType: "hyperframes:block",
+        requested: true,
+        source: "cli",
+      });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -374,6 +504,21 @@ describe("runAdd (integration, mocked registry)", () => {
     }
   });
 
+  it("refuses a block that depends on an example, before writing anything", async () => {
+    const dir = tmp();
+    try {
+      writeRegistryConfig(dir);
+
+      await expect(
+        runAdd({ name: "example-dep-block", projectDir: dir, skipClipboard: true }),
+      ).rejects.toMatchObject({ code: "example-type" });
+      expect(existsSync(join(dir, "index.html"))).toBe(false);
+      expect(existsSync(join(dir, "compositions"))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("throws AddError with code 'unknown-item' for a missing name", async () => {
     const dir = tmp();
     try {
@@ -385,5 +530,469 @@ describe("runAdd (integration, mocked registry)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("variable values in the snippet", () => {
+  const block = {
+    name: "split-flap-board",
+    type: "hyperframes:block",
+    duration: 3.5,
+    dimensions: { width: 1920, height: 1080 },
+  } as unknown as RegistryItem;
+
+  it("leaves the snippet alone when no values are passed", () => {
+    const snippet = buildSnippet(block, "compositions/split-flap-board.html");
+    expect(snippet).not.toContain("data-variable-values");
+  });
+
+  it("carries values tuned on the catalog page", () => {
+    const snippet = buildSnippet(block, "compositions/split-flap-board.html", {
+      boardText: "GATE 42",
+      cellCount: 16,
+    });
+    expect(snippet).toContain(`data-variable-values='{"boardText":"GATE 42","cellCount":16}'`);
+  });
+
+  it("escapes a single quote rather than letting it close the attribute", () => {
+    const snippet = buildSnippet(block, "x.html", { boardText: "IT'S BOARDING" });
+    expect(snippet).toContain("&#39;");
+    expect(snippet.match(/data-variable-values='/g)?.length).toBe(1);
+  });
+
+  it("treats an empty object as nothing to say", () => {
+    expect(buildSnippet(block, "x.html", {})).not.toContain("data-variable-values");
+  });
+
+  it("rejects --vars that is not a JSON object", () => {
+    expect(() => parseVariableValues("not json")).toThrow(/JSON object/);
+    expect(() => parseVariableValues("[1,2]")).toThrow(/JSON object/);
+    expect(parseVariableValues(undefined)).toBeNull();
+  });
+});
+
+describe("add command run() — several names", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = tmp();
+    writeRegistryConfig(dir);
+    mockFetch();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function runWrapped(rawArgs: string[]): Promise<void> {
+    const cmd = await trackCommandFailures(() => Promise.resolve(addCommand as CommandDef))();
+    await runCittyCommand(cmd, { rawArgs });
+  }
+
+  it("installs every name in one call and reports them together", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runWrapped(["my-block", "--dir", dir, "deprecated-block", "--no-clipboard", "--json"]);
+
+    expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toEqual({
+      ok: true,
+      installed: ["my-block", "deprecated-block"],
+      warnings: expect.any(Array),
+      errors: [],
+    });
+    expect(existsSync(join(dir, "compositions", "my-block.html"))).toBe(true);
+    expect(existsSync(join(dir, "compositions", "deprecated-block.html"))).toBe(true);
+  });
+
+  it("prints a deprecation note from the registry with control characters escaped", async () => {
+    // Built rather than written: a literal control character in the source is a lint error.
+    const esc = String.fromCharCode(27);
+    const note = DEPRECATED_BLOCK_ITEM.deprecated;
+    DEPRECATED_BLOCK_ITEM.deprecated = `gone${esc}]52;c;cA==${String.fromCharCode(7)}`;
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await runWrapped(["deprecated-block", "--dir", dir, "--no-clipboard"]);
+    } finally {
+      DEPRECATED_BLOCK_ITEM.deprecated = note;
+    }
+
+    const printed = warn.mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(printed.replace(new RegExp(`${esc}\\[[0-9;]*m`, "g"), "")).not.toContain(esc);
+    expect(printed).toContain("is deprecated: gone\\x1b]52;c;cA==\\x07");
+  });
+
+  it("keeps the installs that worked when one name is unknown, and fails the call", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await expect(
+      runWrapped(["my-block", "no-such-block", "--dir", dir, "--no-clipboard", "--json"]),
+    ).rejects.toMatchObject({ result: { exitCode: 1 } });
+
+    const out = JSON.parse(String(log.mock.calls[0]?.[0]));
+    expect(out).toMatchObject({ ok: false, installed: ["my-block"] });
+    expect(out.errors).toEqual([{ name: "no-such-block", error: expect.any(String) }]);
+    expect(existsSync(join(dir, "compositions", "my-block.html"))).toBe(true);
+  });
+
+  it("says --dir is the project root when it does not exist", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const missing = join(dir, "compositions", "new-folder");
+
+    await expect(
+      runWrapped(["my-block", "--dir", missing, "--no-clipboard", "--json"]),
+    ).rejects.toMatchObject({ result: { exitCode: 1 } });
+
+    const out = JSON.parse(String(log.mock.calls[0]?.[0]));
+    expect(out.error.message).toContain(`Project folder not found: ${missing}`);
+    expect(out.error.message).toContain("--dir is the project root");
+    expect(out.error.message).toContain(
+      `Create one with \`hyperframes init ${JSON.stringify(missing)}\``,
+    );
+    expect(existsSync(missing)).toBe(false);
+  });
+
+  it("still installs a single name the way it did", async () => {
+    await expect(
+      runWrapped(["my-block", "--dir", dir, "--no-clipboard", "--json"]),
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe("describeInstallFailure", () => {
+  it("explains a bare transport failure instead of echoing it", () => {
+    // What the user actually sees after copying a command off the catalog page.
+    // Item FILES are not cached, so a blip surfaces as node's `fetch failed`
+    // with no URL and no cause, and reads like the command was wrong.
+    const message = describeInstallFailure(new Error("fetch failed"));
+
+    expect(message).toContain("could not download the item's files");
+    expect(message).toContain("rather than a bad command");
+    expect(message).toContain("HTTPS_PROXY");
+  });
+
+  it("names the project's own registry when it is not the public one", () => {
+    // The reported failure: hyperframes.json pointed at a private host with a
+    // self-signed certificate. Telling that reader to check their connection
+    // sends them to debug the one thing that was working.
+    const message = describeInstallFailure(
+      new Error("fetch failed"),
+      "https://private.example/registry",
+    );
+
+    expect(message).toContain("https://private.example/registry");
+    expect(message).toContain("not the public registry");
+  });
+
+  it("stays quiet about the registry when it is the default one", () => {
+    const message = describeInstallFailure(
+      new Error("fetch failed"),
+      "https://raw.githubusercontent.com/heygen-com/hyperframes/main/registry",
+    );
+
+    expect(message).not.toContain("not the public registry");
+  });
+
+  it("leaves a non-transport failure exactly as it was", () => {
+    // An unsafe target or a malformed item is the caller's problem to read; a
+    // connectivity lecture there would send them to fix the wrong thing.
+    const message = describeInstallFailure(new Error('Unsafe target "../x"'));
+
+    expect(message).toBe('Install failed: Unsafe target "../x"');
+  });
+});
+
+describe("tagAddJson", () => {
+  it("carries every installed item's warnings", () => {
+    const result = (name: string, warnings: string[]) => ({ name, warnings }) as RunAddResult;
+    expect(tagAddJson("lower-thirds", [result("a", []), result("b", ["no id"])])).toEqual({
+      ok: true,
+      tag: "lower-thirds",
+      installed: ["a", "b"],
+      warnings: ["b: no id"],
+      errors: [],
+    });
+  });
+});
+
+describe("tag installation failures", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = tmp();
+    writeRegistryConfig(dir);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it.each([
+    { names: ["my-block"], failed: ["my-block"], installed: [], json: true },
+    {
+      names: ["my-block", "deprecated-block"],
+      failed: ["my-block"],
+      installed: ["deprecated-block"],
+      json: true,
+    },
+    { names: ["my-block"], failed: [], installed: ["my-block"], json: true },
+    { names: ["my-block"], failed: ["my-block"], installed: [], json: false },
+    { names: ["my-block"], failed: [], installed: ["my-block"], json: false },
+  ])("reports failed downloads and keeps successful installs: %j", async (scenario) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL) => {
+        const url = new URL(input);
+        if (url.pathname.endsWith("/registry.json")) {
+          return Response.json({
+            ...MANIFEST,
+            items: MANIFEST.items.filter((item) => scenario.names.includes(item.name)),
+          });
+        }
+        const name = scenario.names.find((item) => url.pathname.includes(`/blocks/${item}/`));
+        if (!name) return new Response("not found", { status: 404 });
+        if (url.pathname.endsWith("/registry-item.json")) {
+          return Response.json({ ...ITEM_BY_NAME[name], tags: ["test-tag"] });
+        }
+        if (scenario.failed.includes(name)) return new Response("not found", { status: 404 });
+        return new Response(FILE_BODIES[`${name}.html`]);
+      }),
+    );
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const run = runCittyCommand(addCommand, {
+      rawArgs: ["test-tag", "--dir", dir, "--no-clipboard", ...(scenario.json ? ["--json"] : [])],
+    });
+    if (scenario.failed.length > 0) {
+      await expect(run).rejects.toMatchObject({ result: { exitCode: 1, presented: true } });
+    } else {
+      await expect(run).resolves.toBeDefined();
+    }
+
+    if (scenario.json) {
+      expect(log).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toMatchObject({
+        ok: scenario.failed.length === 0,
+        tag: "test-tag",
+        installed: scenario.installed,
+        errors: scenario.failed.map((name) => ({
+          name,
+          error: expect.stringContaining("HTTP 404"),
+        })),
+      });
+    } else {
+      expect(log).toHaveBeenLastCalledWith(
+        `${scenario.failed.length > 0 ? "✗" : "✓"} Installed ${scenario.installed.length}/${scenario.names.length} blocks`,
+      );
+      if (scenario.failed.length > 0) {
+        expect(log.mock.calls.flat().join(" ")).toContain("HTTP 404");
+      }
+    }
+    for (const name of scenario.names) {
+      expect(existsSync(join(dir, "compositions", `${name}.html`))).toBe(
+        scenario.installed.includes(name),
+      );
+    }
+  });
+});
+
+describe("installs from the registry a received hyperframes.json names", () => {
+  let dir: string;
+  const recordPath = () => join(dir, ".hyperframes", "received-files.json");
+  const listed = () => JSON.parse(readFileSync(recordPath(), "utf-8")).files;
+  const receive = (files: string[]) => {
+    mkdirSync(join(dir, ".hyperframes"));
+    writeFileSync(recordPath(), JSON.stringify({ files }));
+  };
+  const writeConfig = (registry: string, name = "hyperframes.json", prefix = "") =>
+    writeFileSync(join(dir, name), prefix + JSON.stringify({ registry }));
+
+  beforeEach(() => {
+    dir = tmp();
+    mockFetch();
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("lists every file the install writes as received, dependencies included", async () => {
+    writeConfig(uniqueBase());
+    receive(["hyperframes.json"]);
+
+    await runAdd({ name: "dep-block", projectDir: dir, skipClipboard: true });
+
+    expect(listed()).toEqual([
+      "compositions/components/base-component/base-component.css",
+      "compositions/dep-block.html",
+      "hyperframes.json",
+    ]);
+  });
+
+  it("keeps a publish from carrying an outside file the installed block names", async () => {
+    mkdirSync(join(dir, "shared"));
+    writeFileSync(join(dir, "shared", "logo.png"), "png");
+    const project = join(dir, "p");
+    mkdirSync(join(project, ".hyperframes"), { recursive: true });
+    writeFileSync(join(project, "hyperframes.json"), JSON.stringify({ registry: uniqueBase() }));
+    writeFileSync(
+      join(project, ".hyperframes", "received-files.json"),
+      JSON.stringify({ files: ["hyperframes.json"] }),
+    );
+    writeFileSync(join(project, "index.html"), `<div data-composition-id="main"></div>`);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL) => {
+        const url = new URL(input);
+        if (url.pathname.endsWith("/registry.json")) return Response.json(MANIFEST);
+        if (url.pathname.endsWith("/blocks/my-block/registry-item.json"))
+          return Response.json(BLOCK_ITEM);
+        return new Response(`<div data-composition-id="b"><img src="../../shared/logo.png"></div>`);
+      }),
+    );
+
+    await runAdd({ name: "my-block", projectDir: project, skipClipboard: true });
+
+    const staged = stagePublishFiles(project, Infinity, () => {});
+    expect([...staged.keys()].filter((key) => key.startsWith("_ext/"))).toEqual([]);
+  });
+
+  it("lists what an install by tag writes", async () => {
+    writeConfig(uniqueBase());
+    receive(["hyperframes.json"]);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL) => {
+        const url = new URL(input);
+        if (url.pathname.endsWith("/registry.json")) return Response.json(MANIFEST);
+        if (url.pathname.endsWith("/blocks/my-block/registry-item.json"))
+          return Response.json({ ...BLOCK_ITEM, tags: ["test-tag"] });
+        if (url.pathname.endsWith("/blocks/my-block/my-block.html"))
+          return new Response(FILE_BODIES["my-block.html"]);
+        return new Response("not found", { status: 404 });
+      }),
+    );
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runCittyCommand(addCommand, { rawArgs: ["test-tag", "--dir", dir, "--no-clipboard"] });
+
+    expect(listed()).toEqual(["compositions/my-block.html", "hyperframes.json"]);
+  });
+
+  it("reads a received config that starts with a byte-order mark", async () => {
+    writeConfig(uniqueBase(), "hyperframes.json", "\uFEFF");
+    receive(["hyperframes.json"]);
+
+    await runAdd({ name: "my-block", projectDir: dir, skipClipboard: true });
+
+    expect(listed()).toEqual(["compositions/my-block.html", "hyperframes.json"]);
+  });
+
+  it("finds a received config listed under another spelling of the file it opens", async () => {
+    writeConfig(uniqueBase(), "HyperFrames.json");
+    // A disk that tells case apart gets a second name for the same file, as one that ignores case has.
+    if (!existsSync(join(dir, "hyperframes.json")))
+      linkSync(join(dir, "HyperFrames.json"), join(dir, "hyperframes.json"));
+    receive(["HyperFrames.json"]);
+
+    await runAdd({ name: "my-block", projectDir: dir, skipClipboard: true });
+
+    expect(listed()).toEqual(["HyperFrames.json", "compositions/my-block.html"]);
+  });
+
+  it("leaves what a person's own config installs off the record", async () => {
+    writeConfig(uniqueBase());
+
+    await runAdd({ name: "my-block", projectDir: dir, skipClipboard: true });
+
+    expect(existsSync(join(dir, "compositions/my-block.html"))).toBe(true);
+    expect(existsSync(recordPath())).toBe(false);
+  });
+
+  it("leaves what the public registry installs off the record", async () => {
+    writeConfig(`${DEFAULT_REGISTRY_URL}/${crypto.randomUUID()}`);
+    receive(["hyperframes.json"]);
+
+    await runAdd({ name: "my-block", projectDir: dir, skipClipboard: true });
+
+    expect(existsSync(join(dir, "compositions/my-block.html"))).toBe(true);
+    expect(listed()).toEqual(["hyperframes.json"]);
+  });
+
+  it("takes back what a failed install listed but never wrote", async () => {
+    writeConfig(uniqueBase());
+    receive(["hyperframes.json"]);
+    failingWrite.failing = "base-component.css";
+    try {
+      await expect(
+        runAdd({ name: "dep-block", projectDir: dir, skipClipboard: true }),
+      ).rejects.toThrow(AddError);
+    } finally {
+      failingWrite.failing = null;
+    }
+    expect(listed()).toEqual(["hyperframes.json"]);
+  });
+
+  it("leaves off a file the person edited while the install downloaded", async () => {
+    writeConfig(uniqueBase());
+    await runAdd({ name: "my-block", projectDir: dir, skipClipboard: true });
+    receive(["hyperframes.json"]);
+    const block = join(dir, "compositions", "my-block.html");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL) => {
+        const url = new URL(input);
+        if (url.pathname.endsWith("/registry.json")) return Response.json(MANIFEST);
+        if (url.pathname.endsWith("/registry-item.json")) return Response.json(BLOCK_ITEM);
+        writeFileSync(block, "<div>the person's edit</div>");
+        return new Response(FILE_BODIES["my-block.html"]);
+      }),
+    );
+
+    const result = await runAdd({ name: "my-block", projectDir: dir, skipClipboard: true });
+
+    expect(result.preserved).toHaveLength(1);
+    expect(readFileSync(block, "utf-8")).toBe("<div>the person's edit</div>");
+    expect(listed()).toEqual(["hyperframes.json"]);
+  });
+
+  it("counts a hyperframes.json it cannot parse as received, not as the person's own", async () => {
+    vi.stubEnv("HYPERFRAMES_CACHE_DIR", tmp());
+    writeFileSync(join(dir, "hyperframes.json"), "{ not json");
+
+    await runAdd({ name: "my-block", projectDir: dir, skipClipboard: true });
+
+    expect(listed()).toEqual(["compositions/my-block.html"]);
+  });
+
+  it("keeps a failed install's files that are on disk listed", async () => {
+    writeConfig(uniqueBase());
+    receive(["hyperframes.json"]);
+    failingWrite.failing = "dep-block.html";
+    try {
+      await expect(
+        runAdd({ name: "dep-block", projectDir: dir, skipClipboard: true }),
+      ).rejects.toThrow(AddError);
+    } finally {
+      failingWrite.failing = null;
+    }
+    expect(listed()).toEqual([
+      "compositions/components/base-component/base-component.css",
+      "hyperframes.json",
+    ]);
+  });
+
+  it("leaves a record it cannot read as it is", async () => {
+    writeConfig(uniqueBase());
+    mkdirSync(join(dir, ".hyperframes"));
+    writeFileSync(recordPath(), "{oops");
+
+    await runAdd({ name: "my-block", projectDir: dir, skipClipboard: true });
+
+    expect(readFileSync(recordPath(), "utf-8")).toBe("{oops");
   });
 });

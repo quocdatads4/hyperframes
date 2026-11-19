@@ -1,274 +1,477 @@
 ---
-title: Examples
-description: "Built-in examples for common video patterns. Hover to preview animations."
+title: "Inspiration"
+description: "Videos people made, remixed in HyperFrames: launch films, motion graphics and talking-head edits. Find one you like and remix it in the Studio app."
 ---
 
-Hyperframes includes starter examples to help you scaffold compositions quickly. Each example gives you a working project with the correct [composition structure](/concepts/compositions), [data attributes](/concepts/data-attributes), and a [GSAP timeline](/guides/gsap-animation) already wired up.
+import { RemixShelf } from "/snippets/remix-shelf.jsx";
+import { FilmRows } from "/snippets/film-rows.jsx";
+import { ReplicaCompare } from "/snippets/replica-compare.jsx";
 
-<Note>
-  Looking for finished videos and production projects? Start with the [Showcase](/showcase).
-</Note>
+export const motion = [
+  {
+    "id": "jake-pond",
+    "name": "Pond: a new Linux OS",
+    "ratio": "16/9",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/jake-pond-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/jake-pond-result.jpg",
+    "handle": "@bflycomputer",
+    "post": "https://x.com/bflycomputer/status/2082496873655648632"
+  },
+  {
+    "id": "jake-lovable",
+    "name": "Lovable: Aesthetics Update",
+    "ratio": "16/9",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/jake-lovable-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/jake-lovable-result.jpg",
+    "handle": "@Lovable",
+    "post": "https://x.com/Lovable/status/2053874566460752191"
+  },
+  {
+    "id": "jake-figma-draw",
+    "name": "Figma Draw",
+    "ratio": "16/9",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/jake-figma-draw-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/jake-figma-draw-result.jpg",
+    "handle": "@figma",
+    "post": "https://x.com/figma/status/1920168282751185360"
+  },
+  {
+    "id": "remix-anduril",
+    "name": "Anduril: AI Grand Prix",
+    "ratio": "1/1",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-anduril-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-anduril-result.jpg",
+    "handle": "@anduriltech",
+    "post": "https://x.com/anduriltech/status/2016233946607141290"
+  },
+  {
+    "id": "remix-grok-bot",
+    "name": "Grok Bot: now on more plans",
+    "ratio": "16/9",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-grok-bot-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-grok-bot-result.jpg",
+    "handle": "@bot",
+    "post": "https://x.com/bot/status/2090852881373311369"
+  },
+  {
+    "id": "remix-kimi-k3",
+    "name": "Kimi K3 teaser",
+    "ratio": "16/9",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-kimi-k3-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-kimi-k3-result.jpg",
+    "handle": "@Kimi_Moonshot",
+    "post": "https://x.com/Kimi_Moonshot/status/2081757327146045450"
+  },
+  {
+    "id": "remix-jordanarchivess",
+    "name": "How do you communicate that",
+    "ratio": "4/3",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-jordanarchivess-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-jordanarchivess-result.jpg",
+    "handle": "@jordanarchivess",
+    "post": "https://x.com/jordanarchivess/status/2107536262894915762"
+  },
+  {
+    "id": "remix-firecrawl",
+    "name": "Firecrawl Free Keyless",
+    "ratio": "16/9",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-firecrawl-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-firecrawl-result.jpg",
+    "handle": "@ericciarla",
+    "post": "https://x.com/ericciarla/status/2093375835679977570"
+  },
+  {
+    "id": "remix-authorize-once",
+    "name": "Authorize Once, Everyone Connected",
+    "ratio": "16/9",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-authorize-once-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-authorize-once-result.jpg",
+    "post": "https://x.com/ClaudeDevs/status/2091953609185657251",
+    "handle": "@ClaudeDevs"
+  },
+  {
+    "id": "remix-zaro",
+    "name": "Zaro: apps and agents on your context",
+    "ratio": "16/9",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-zaro-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-zaro-result.jpg",
+    "handle": "@ZaroAI_",
+    "post": "https://x.com/ZaroAI_/status/2070084796378747316"
+  },
+  {
+    "id": "remix-polymarket-perps",
+    "name": "Polymarket Perps",
+    "ratio": "16/9",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-polymarket-perps-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-polymarket-perps-result.jpg",
+    "handle": "@Polymarket",
+    "post": "https://x.com/Polymarket/status/2095530373274816595"
+  },
+  {
+    "id": "remix-web-noise",
+    "name": "From web noise to working UI",
+    "ratio": "16/9",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-web-noise-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-web-noise-result.jpg",
+    "post": "https://x.com/firecrawl/status/2057495269785358384",
+    "handle": "@firecrawl"
+  },
+  {
+    "id": "remix-linear-loops",
+    "name": "Linear Loops",
+    "ratio": "16/9",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-linear-loops-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-linear-loops-result.jpg",
+    "handle": "@linear",
+    "post": "https://x.com/linear/status/2079233260161323371"
+  },
+  {
+    "id": "remix-glyph",
+    "name": "Glyph: GPU typography for the web",
+    "ratio": "640/461",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-glyph-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-glyph-result.jpg",
+    "handle": "@pmndrs",
+    "post": "https://x.com/pmndrs/status/2100980802091708818"
+  },
+  {
+    "id": "remix-hermes-omarchy",
+    "name": "Hermes in Omarchy",
+    "ratio": "1/1",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-hermes-omarchy-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-hermes-omarchy-result.jpg",
+    "handle": "@NousResearch",
+    "post": "https://x.com/NousResearch/status/2097403926072987986"
+  },
+  {
+    "id": "remix-iskra-light",
+    "name": "Iskra Light",
+    "ratio": "5/4",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-iskra-light-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-iskra-light-result.jpg",
+    "handle": "@world_is_web",
+    "post": "https://x.com/world_is_web/status/2084694934657892557"
+  },
+  {
+    "id": "remix-elevenlabs-reception",
+    "name": "Reception by ElevenLabs",
+    "ratio": "16/9",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-elevenlabs-reception-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-elevenlabs-reception-result.jpg",
+    "handle": "@ElevenLabs",
+    "post": "https://x.com/ElevenLabs/status/2100262886916358361"
+  },
+  {
+    "id": "remix-cyera",
+    "name": "Cyera brand video",
+    "ratio": "16/9",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-cyera-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-cyera-result.jpg",
+    "handle": "@motionimo",
+    "post": "https://x.com/motionimo/status/2103703350017433670"
+  },
+  {
+    "id": "remix-harvey",
+    "name": "Harvey",
+    "ratio": "16/9",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-harvey-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/remix-harvey-result.jpg",
+    "handle": "@harvey",
+    "post": "https://x.com/harvey/status/2089722668761432349"
+  }
+];
 
-```bash Terminal
-npx hyperframes init my-video --example <name>
-```
+export const aroll = [
+  {
+    "id": "aroll-aiwithsachi",
+    "name": "Top 5 plugins to install in Claude",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/aiwithsachi-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/aiwithsachi-result.jpg",
+    "handle": "@aiwithsachi",
+    "post": "https://www.instagram.com/reel/Dc7G9Pxu_1O/"
+  },
+  {
+    "id": "aroll-tenfoldmarc",
+    "name": "17 video effects Claude can create",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/tenfoldmarc-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/tenfoldmarc-result.jpg",
+    "handle": "@tenfoldmarc",
+    "post": "https://www.instagram.com/reel/Def9pj5TWtA/"
+  },
+  {
+    "id": "aroll-careerwithriya",
+    "name": "6 essential skills to transform your career",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/careerwithriya-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/careerwithriya-result.jpg",
+    "handle": "@careerwithriya",
+    "post": "https://www.instagram.com/reel/Ddd57MBszhc/"
+  },
+  {
+    "id": "aroll-harpercarrollai",
+    "name": "10 Days of AI Basics, Day 1",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/harpercarrollai-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/harpercarrollai-result.jpg",
+    "handle": "@harpercarrollai",
+    "post": "https://www.instagram.com/reel/C4eNPF3PdpG/"
+  },
+  {
+    "id": "aroll-mattfarmerai",
+    "name": "Best AI image generators, October 2026",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/mattfarmerai-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/mattfarmerai-result.jpg",
+    "handle": "@mattfarmerai",
+    "post": "https://www.instagram.com/reel/DeCtQ_9JACg/"
+  },
+  {
+    "id": "aroll-nocode-joshua",
+    "name": "10/10 Claude Skills for marketing",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/nocode-joshua-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/nocode-joshua-result.jpg",
+    "handle": "@nocode.joshua",
+    "post": "https://www.tiktok.com/@nocode.joshua/video/7663973344026397960"
+  },
+  {
+    "id": "aroll-mpaige13",
+    "name": "Granola + Claude Skills",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/mpaige13-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/mpaige13-result.jpg",
+    "handle": "@mpaige13",
+    "post": "https://www.instagram.com/reel/DY5X72kxE-4/"
+  },
+  {
+    "id": "aroll-brockmesarich",
+    "name": "These 5 GitHub Repos Give You Thousands of Free Claude Skills",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/brockmesarich-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/brockmesarich-result.jpg",
+    "handle": "Brock Mesarich",
+    "post": "https://www.youtube.com/shorts/rxOcBowQcS0"
+  },
+  {
+    "id": "aroll-drcintas",
+    "name": "Motion graphics in seconds",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/drcintas-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/drcintas-result.jpg",
+    "handle": "@drcintas",
+    "post": "https://www.instagram.com/reel/DPoXbzZjb8J/"
+  },
+  {
+    "id": "aroll-itsbetterwithai",
+    "name": "Astra makes complete AI videos inside ChatGPT",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/itsbetterwithai-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/itsbetterwithai-result.jpg",
+    "handle": "@itsbetterwithai",
+    "post": "https://www.instagram.com/reel/DdTzYbkCkvc/"
+  },
+  {
+    "id": "aroll-kevinstratvert",
+    "name": "Stop Paying for 5 AI Tools",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/kevinstratvert-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/reference/aroll/kevinstratvert-result.jpg",
+    "handle": "Kevin Stratvert",
+    "post": "https://www.youtube.com/shorts/1fA5j5_5TRY"
+  },
+  {
+    "id": "aroll-dan-martell-tools",
+    "name": "What's the best AI tool right now?",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/dan-martell-tools-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/dan-martell-tools-result.jpg",
+    "handle": "Dan Martell",
+    "post": "https://www.youtube.com/shorts/mk1zJd9Rm4c"
+  },
+  {
+    "id": "aroll-ali-abdaal-workflow",
+    "name": "5 tools I use every day",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/ali-abdaal-workflow-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/ali-abdaal-workflow-result.jpg",
+    "handle": "@aliabdaal",
+    "post": "https://www.youtube.com/shorts/S2AZbZ_K8vY"
+  },
+  {
+    "id": "aroll-ali-abdaal-archival",
+    "name": "Face over archival art",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/ali-abdaal-archival-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/ali-abdaal-archival-result.jpg",
+    "handle": "@aliabdaal",
+    "post": "https://www.youtube.com/shorts/Ksjt_I8rDrE"
+  },
+  {
+    "id": "aroll-ali-abdaal-dm",
+    "name": "Reads a DM, answers it",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/ali-abdaal-dm-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/ali-abdaal-dm-result.jpg",
+    "handle": "Ali Abdaal",
+    "post": "https://www.youtube.com/shorts/jCyhEO3h-Ik"
+  },
+  {
+    "id": "aroll-cindy-zhu-ranking",
+    "name": "Webcam ranking, 1 to 10",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/cindy-zhu-ranking-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/cindy-zhu-ranking-result.jpg",
+    "handle": "@cindiezhu",
+    "post": "https://www.tiktok.com/@cindiezhu/video/7694049166972013831"
+  },
+  {
+    "id": "aroll-hook-open-loops",
+    "name": "Hook, lead, open loops",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/hook-open-loops-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/hook-open-loops-result.jpg",
+    "post": "https://www.instagram.com/reel/DambEp1igDW/",
+    "handle": "@realskytan"
+  },
+  {
+    "id": "aroll-hundred-days-story",
+    "name": "100 days with stickers and photo cards",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/hundred-days-story-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/hundred-days-story-result.jpg",
+    "post": "https://www.instagram.com/reel/Dd6vHlQgpok/",
+    "handle": "@anyway.julia"
+  },
+  {
+    "id": "aroll-khris-sheer-founder",
+    "name": "The Founder Experiments, Ep. 1",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/khris-sheer-founder-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/khris-sheer-founder-result.jpg",
+    "handle": "@khris.sheer",
+    "post": "https://www.tiktok.com/@khris.sheer/video/7491715587895430402"
+  },
+  {
+    "id": "aroll-john-tagudin-capso",
+    "name": "Tool demo with callouts",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/john-tagudin-capso-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/john-tagudin-capso-result.jpg",
+    "handle": "@john.tagudin",
+    "post": "https://www.tiktok.com/@john.tagudin/video/7524883942328126728"
+  },
+  {
+    "id": "aroll-ugc-rachelll",
+    "name": "AI creator with product",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/ugc-rachelll-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/ugc-rachelll-result.jpg",
+    "handle": "@ugc.rachelll",
+    "post": "https://www.tiktok.com/@ugc.rachelll/video/7616996050066345246"
+  },
+  {
+    "id": "aroll-gusfiraa-meitu",
+    "name": "Photo glow-up in an editing app",
+    "ratio": "9/16",
+    "result": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/gusfiraa-meitu-result.mp4",
+    "resultPoster": "https://static.heygen.ai/hyperframes-oss/desktop/viral-clone/gusfiraa-meitu-result.jpg",
+    "handle": "@gusfiraa",
+    "post": "https://www.tiktok.com/@gusfiraa/video/7668295832994598162"
+  }
+];
 
-## Landscape Templates
+Every video on this page was made with HyperFrames: launch films, cartoons, explainers, 3D, logo stings, live-coded
+music. Click one to watch it with sound.
 
-<div className="not-prose grid grid-cols-2 gap-4 my-6">
-  <div className="tpl-card relative rounded-xl overflow-hidden bg-zinc-900 transition-transform hover:-translate-y-0.5 hover:shadow-xl">
-    <video className="w-full aspect-video object-cover block" src="https://static.heygen.ai/hyperframes-oss/docs/images/templates/warm-grain.mp4" poster="https://static.heygen.ai/hyperframes-oss/docs/images/templates/warm-grain.png" muted loop playsInline preload="metadata" />
-    <div className="absolute bottom-0 left-0 right-0 pt-6 pb-2 px-3" style={{background: "linear-gradient(transparent, rgba(0,0,0,0.7))"}}><strong className="text-sm font-semibold text-white block">Warm Grain</strong><span className="text-xs text-zinc-300">Branding & lifestyle</span></div>
-  </div>
-  <div className="tpl-card relative rounded-xl overflow-hidden bg-zinc-900 transition-transform hover:-translate-y-0.5 hover:shadow-xl">
-    <video className="w-full aspect-video object-cover block" src="https://static.heygen.ai/hyperframes-oss/docs/images/templates/play-mode.mp4" poster="https://static.heygen.ai/hyperframes-oss/docs/images/templates/play-mode.png" muted loop playsInline preload="metadata" />
-    <div className="absolute bottom-0 left-0 right-0 pt-6 pb-2 px-3" style={{background: "linear-gradient(transparent, rgba(0,0,0,0.75))"}}><strong className="text-sm font-semibold text-white block">Play Mode</strong><span className="text-xs text-zinc-300">Social media</span></div>
-  </div>
-  <div className="tpl-card relative rounded-xl overflow-hidden bg-zinc-900 transition-transform hover:-translate-y-0.5 hover:shadow-xl">
-    <video className="w-full aspect-video object-cover block" src="https://static.heygen.ai/hyperframes-oss/docs/images/templates/swiss-grid.mp4" poster="https://static.heygen.ai/hyperframes-oss/docs/images/templates/swiss-grid.png" muted loop playsInline preload="metadata" />
-    <div className="absolute bottom-0 left-0 right-0 pt-6 pb-2 px-3" style={{background: "linear-gradient(transparent, rgba(0,0,0,0.75))"}}><strong className="text-sm font-semibold text-white block">Swiss Grid</strong><span className="text-xs text-zinc-300">Corporate & technical</span></div>
-  </div>
-  <div className="tpl-card relative rounded-xl overflow-hidden bg-zinc-900 transition-transform hover:-translate-y-0.5 hover:shadow-xl">
-    <video className="w-full aspect-video object-cover block" src="https://static.heygen.ai/hyperframes-oss/docs/images/templates/kinetic-type.mp4" poster="https://static.heygen.ai/hyperframes-oss/docs/images/templates/kinetic-type.png" muted loop playsInline preload="metadata" />
-    <div className="absolute bottom-0 left-0 right-0 pt-6 pb-2 px-3" style={{background: "linear-gradient(transparent, rgba(0,0,0,0.75))"}}><strong className="text-sm font-semibold text-white block">Kinetic Type</strong><span className="text-xs text-zinc-300">Promos & title cards</span></div>
-  </div>
-  <div className="tpl-card relative rounded-xl overflow-hidden bg-zinc-900 transition-transform hover:-translate-y-0.5 hover:shadow-xl">
-    <video className="w-full aspect-video object-cover block" src="https://static.heygen.ai/hyperframes-oss/docs/images/templates/decision-tree.mp4" poster="https://static.heygen.ai/hyperframes-oss/docs/images/templates/decision-tree.png" muted loop playsInline preload="metadata" />
-    <div className="absolute bottom-0 left-0 right-0 pt-6 pb-2 px-3" style={{background: "linear-gradient(transparent, rgba(0,0,0,0.75))"}}><strong className="text-sm font-semibold text-white block">Decision Tree</strong><span className="text-xs text-zinc-300">Explainers & tutorials</span></div>
-  </div>
-  <div className="tpl-card relative rounded-xl overflow-hidden bg-zinc-900 transition-transform hover:-translate-y-0.5 hover:shadow-xl">
-    <video className="w-full aspect-video object-cover block" src="https://static.heygen.ai/hyperframes-oss/docs/images/templates/product-promo.mp4" poster="https://static.heygen.ai/hyperframes-oss/docs/images/templates/product-promo.png" muted loop playsInline preload="metadata" />
-    <div className="absolute bottom-0 left-0 right-0 pt-6 pb-2 px-3" style={{background: "linear-gradient(transparent, rgba(0,0,0,0.75))"}}><strong className="text-sm font-semibold text-white block">Product Promo</strong><span className="text-xs text-zinc-300">Product showcases</span></div>
-  </div>
-  <div className="tpl-card relative rounded-xl overflow-hidden bg-zinc-900 transition-transform hover:-translate-y-0.5 hover:shadow-xl">
-    <video className="w-full aspect-video object-cover block" src="https://static.heygen.ai/hyperframes-oss/docs/images/templates/nyt-graph.mp4" poster="https://static.heygen.ai/hyperframes-oss/docs/images/templates/nyt-graph.png" muted loop playsInline preload="metadata" />
-    <div className="absolute bottom-0 left-0 right-0 pt-6 pb-2 px-3" style={{background: "linear-gradient(transparent, rgba(0,0,0,0.75))"}}><strong className="text-sm font-semibold text-white block">NYT Graph</strong><span className="text-xs text-zinc-300">Data stories</span></div>
-  </div>
+<FilmRows />
+
+## Remix a video you like
+
+The fastest way to a video you love is to start from one. Every video below is a remix: someone's original, rebuilt
+in HyperFrames with new words, people and brand. Hover to play. Like one? Choose **Remix in Studio** and make your
+own version; see [Reference any video](/studio-app/reference-video) for how it works.
+
+### Launch films and motion graphics
+
+Product launches and type-led motion, rebuilt from the original's cuts, timing and effects.
+
+<RemixShelf items={motion} />
+
+### Talking-head edits
+
+The editing style of popular Reels, TikToks and Shorts, with a different presenter: captions, cutaways, callouts and
+pacing.
+
+<RemixShelf items={aroll} tall />
+
+## Recreate any video, 1:1
+
+Point HyperFrames at a finished video and it rebuilds the same film in editable HTML —
+gestures, type, timing and all. Below, each **reference** (the original, on the left) sits
+next to its **HyperFrames replica** (on the right), matched frame for frame.
+
+<div className="not-prose my-6 space-y-8">
+  <ReplicaCompare
+    title="THE OBLIST"
+    meta="38.58s · 60fps"
+    refSrc="https://static.heygen.ai/hyperframes-oss/docs/images/showcase/reverse-oblist-reference-snd.mp4"
+    refPoster="https://static.heygen.ai/hyperframes-oss/docs/images/showcase/reverse-oblist-reference.jpg"
+    replicaSrc="https://static.heygen.ai/hyperframes-oss/docs/images/showcase/reverse-oblist-replica.mp4"
+    replicaPoster="https://static.heygen.ai/hyperframes-oss/docs/images/showcase/reverse-oblist-replica.jpg"
+  />
+  <ReplicaCompare
+    title="Srinika × Mercury"
+    meta="30.56s · 25fps · avatar footage"
+    refSrc="https://static.heygen.ai/hyperframes-oss/docs/images/showcase/reverse-srinika-reference-snd.mp4"
+    refPoster="https://static.heygen.ai/hyperframes-oss/docs/images/showcase/reverse-srinika-reference.jpg"
+    replicaSrc="https://static.heygen.ai/hyperframes-oss/docs/images/showcase/reverse-srinika-replica.mp4"
+    replicaPoster="https://static.heygen.ai/hyperframes-oss/docs/images/showcase/reverse-srinika-replica.jpg"
+  />
 </div>
 
-## Portrait Templates
+## Most-installed blocks
 
-<div className="not-prose grid grid-cols-3 gap-3 my-6">
-  <div className="tpl-card relative rounded-xl overflow-hidden bg-zinc-900 transition-transform hover:-translate-y-0.5 hover:shadow-xl">
-    <video className="w-full object-cover block" style={{aspectRatio: "9/16"}} src="https://static.heygen.ai/hyperframes-oss/docs/images/templates/vignelli.mp4" poster="https://static.heygen.ai/hyperframes-oss/docs/images/templates/vignelli.png" muted loop playsInline preload="metadata" />
-    <div className="absolute bottom-0 left-0 right-0 pt-6 pb-2 px-3" style={{background: "linear-gradient(transparent, rgba(0,0,0,0.75))"}}><strong className="text-sm font-semibold text-white block">Vignelli</strong><span className="text-xs text-zinc-300">Headlines & announcements</span></div>
-  </div>
-</div>
+These ready-to-run examples are ordered by human requested installs from the last 30 days. Add any block to a project, then customize its content in place.
+
+| Example | Start here |
+| --- | --- |
+| logo-outro | npx hyperframes add logo-outro |
+| data-chart | npx hyperframes add data-chart |
+| editorial-flash-overlay | npx hyperframes add editorial-flash-overlay |
+| organic-light-leak-overlay | npx hyperframes add organic-light-leak-overlay |
+| mk-progress-stat | npx hyperframes add mk-progress-stat |
+| flowchart | npx hyperframes add flowchart |
+| mk-specs-list | npx hyperframes add mk-specs-list |
+| mk-callout-highlight | npx hyperframes add mk-callout-highlight |
+| hw-title | npx hyperframes add hw-title |
+| code-typing | npx hyperframes add code-typing |
+| lt-dark-card | npx hyperframes add lt-dark-card |
+| cinematic-zoom | npx hyperframes add cinematic-zoom |
+
+## Project templates
+
+The init templates remain available for scaffolding complete projects.
+
+| Template | Good starting point for |
+| --- | --- |
+| warm-grain | Branding, lifestyle, and editorial work |
+| play-mode | Energetic social videos and product launches |
+| swiss-grid | Technical, structured, and corporate stories |
+| kinetic-type | Type-led promos, intros, and title cards |
+| decision-tree | Explainable diagrams and tutorials |
+| product-promo | Multi-scene product showcases |
+| nyt-graph | Editorial charts and data stories |
+| vignelli | Bold portrait announcements |
+| blank | Agent-generated or fully custom work |
 
 <Tip>
-  Looking for a minimal starting point? Use **blank** — it gives you an empty composition with just the scaffolding, no visual design.
-
-  ```bash Terminal
-  npx hyperframes init my-video --example blank
-  ```
+  Use npx hyperframes init my-video --example &lt;name&gt; for a full project template, or npx hyperframes add &lt;block&gt; to start from one of the examples above.
 </Tip>
 
-## Choosing an Example
+## Related topics
 
-| Example | Style | Format | Best for |
-|----------|-------|--------|----------|
-| `warm-grain` | Organic, textured | Landscape | Lifestyle, branding, editorial |
-| `play-mode` | Energetic, elastic | Landscape | Social media, product launches |
-| `swiss-grid` | Clean, structured | Landscape | Corporate, data, technical |
-| `kinetic-type` | Dramatic type | Landscape | Promos, intros, title cards |
-| `decision-tree` | Diagrammatic | Landscape | Explainers, tutorials |
-| `product-promo` | Multi-scene | Landscape | Product showcases, demos |
-| `nyt-graph` | Editorial data | Landscape | Data stories, reports |
-| `vignelli` | Bold, typographic | Portrait | Headlines, announcements |
-| `blank` | Minimal scaffolding | — | Full control, agent-generated |
-
-## Example Details
-
-<Tabs>
-  <Tab title="warm-grain">
-    ### warm-grain
-
-    Cream-toned aesthetic with grain texture overlay.
-
-    **What it produces:** A composition with warm color grading, textured grain, and smooth transitions. Includes an intro sub-composition and captions support.
-
-    ```
-    my-video/
-    ├── meta.json
-    ├── index.html
-    ├── compositions/
-    │   ├── intro.html
-    │   ├── graphics.html
-    │   └── captions.html
-    └── assets/
-    ```
-  </Tab>
-  <Tab title="play-mode">
-    ### play-mode
-
-    Playful elastic animations with bold, energetic motion.
-
-    ```
-    my-video/
-    ├── meta.json
-    ├── index.html
-    ├── compositions/
-    │   ├── intro.html
-    │   ├── stats.html
-    │   └── captions.html
-    └── assets/
-    ```
-  </Tab>
-  <Tab title="swiss-grid">
-    ### swiss-grid
-
-    Structured grid layout inspired by Swiss/International Typographic Style.
-
-    ```
-    my-video/
-    ├── meta.json
-    ├── index.html
-    ├── compositions/
-    │   ├── intro.html
-    │   ├── graphics.html
-    │   └── captions.html
-    └── assets/
-    ```
-  </Tab>
-  <Tab title="vignelli">
-    ### vignelli
-
-    Bold typography with red accents (1080×1920 portrait).
-
-    ```
-    my-video/
-    ├── meta.json
-    ├── index.html
-    ├── compositions/
-    │   ├── overlays.html
-    │   └── captions.html
-    └── assets/
-    ```
-  </Tab>
-  <Tab title="kinetic-type">
-    ### kinetic-type
-
-    Bold kinetic typography promo with dramatic text animations.
-
-    ```
-    my-video/
-    ├── meta.json
-    ├── index.html
-    └── compositions/
-        └── main-graphics.html
-    ```
-  </Tab>
-  <Tab title="decision-tree">
-    ### decision-tree
-
-    Animated flowchart with branching paths and progressive reveal.
-
-    ```
-    my-video/
-    ├── meta.json
-    ├── index.html
-    └── compositions/
-        └── decision_tree.html
-    ```
-  </Tab>
-  <Tab title="product-promo">
-    ### product-promo
-
-    Multi-scene product showcase with SVG assets.
-
-    ```
-    my-video/
-    ├── meta.json
-    ├── index.html
-    ├── compositions/
-    │   ├── scene1-logo-intro.html
-    │   ├── scene2-4-canvas.html
-    │   └── scene5-logo-outro.html
-    └── assets/
-        ├── figma-cursors.svg
-        ├── figma-logo-pieces.svg
-        └── figma-logo-pills.svg
-    ```
-  </Tab>
-  <Tab title="nyt-graph">
-    ### nyt-graph
-
-    Animated data chart in print editorial style.
-
-    ```
-    my-video/
-    ├── meta.json
-    ├── index.html
-    └── compositions/
-        └── nyt-chart.html
-    ```
-  </Tab>
-  <Tab title="blank">
-    ### blank
-
-    Empty composition with just the scaffolding.
-
-    ```
-    my-video/
-    ├── meta.json
-    ├── index.html
-    └── compositions/
-        └── captions.html
-    ```
-  </Tab>
-</Tabs>
-
-## Passing a Source Video
-
-```bash Terminal
-npx hyperframes init my-video --example warm-grain --video ./my-clip.mp4
-```
-
-The CLI will probe the video for duration, resolution, and codec. If the video uses an incompatible codec, it will be automatically transcoded to H.264 MP4 if FFmpeg is available.
-
-## Custom Examples
-
-Any directory with an `index.html` can serve as an example. Your custom example needs:
-
-1. An `index.html` with a [`data-composition-id`](/concepts/data-attributes#composition-attributes) root element
-2. A [GSAP timeline](/guides/gsap-animation) registered in `window.__timelines`
-3. Any assets in the same directory or a subdirectory
-
-```html index.html
-<div id="root" data-composition-id="my-example"
-     data-start="0" data-width="1920" data-height="1080">
-
-  <!-- Your elements here -->
-
-  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
-  <script>
-    const tl = gsap.timeline({ paused: true });
-    // Add your animations...
-    window.__timelines = window.__timelines || {};
-    window.__timelines["my-example"] = tl;
-  </script>
-</div>
-```
-
-After creating a custom example, validate it with the [linter](/packages/cli#lint):
-
-```bash Terminal
-npx hyperframes lint
-```
-
-## Next Steps
-
-<CardGroup cols={2}>
-  <Card title="Quickstart" icon="rocket" href="/quickstart">
-    Create, preview, and render your first video
-  </Card>
-  <Card title="Launch Videos" icon="github" href="/launch-videos">
-    Real production projects from HeyGen's launches — open-source for you to read and remix.
-  </Card>
-  <Card title="GSAP Animation" icon="wand-magic-sparkles" href="/guides/gsap-animation">
-    Add animations to your example
-  </Card>
-  <Card title="Compositions" icon="layer-group" href="/concepts/compositions">
-    Understand the composition data model
-  </Card>
-</CardGroup>
+- [Reference any video to recreate its style](/studio-app/reference-video)
+- [What do you want to make?](/workflows)
+- [Make your first video](/quickstart)

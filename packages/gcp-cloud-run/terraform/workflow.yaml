@@ -1,20 +1,9 @@
-# HyperFrames distributed render orchestration on Cloud Workflows.
+# HyperFrames Plan v2 distributed render orchestration on Cloud Workflows.
 #
-#   Plan → BuildChunkList → AssertChunkCount → RenderChunks (parallel) → Assemble
+#   Plan → BuildChunkList → RenderChunks (parallel) → Assemble
 #
-# Mirrors the Step Functions state machine in
-# `examples/aws-lambda/template.yaml`. Every step POSTs to the same Cloud Run
-# service URL (passed in as `args.ServiceUrl`) and varies only the body's
-# `Action`. The service returns the step's small result body on 2xx; on a
-# non-retryable failure it returns HTTP 400, on a retryable failure HTTP 5xx —
-# the `retryable` predicate below keys off exactly that split.
-#
-# The final returned object accumulates every step's result body so
-# `getRenderProgress` can read frame totals + per-step durations on success:
-#   { Plan: {...}, Chunks: [{...}, ...], Assemble: {...} }
-#
-# Deploy with `gcloud workflows deploy` (the Terraform module / the
-# `hyperframes cloudrun deploy` command do this for you).
+# Every step POSTs to the same Cloud Run service URL and varies only the
+# body's Action. Plan v2 is the only supported transport.
 
 main:
   params: [args]
@@ -26,8 +15,19 @@ main:
           - planOutputGcsPrefix: ${args.PlanOutputGcsPrefix}
           - outputGcsUri: ${args.OutputGcsUri}
           - config: ${args.Config}
+          - planProtocol: ${default(map.get(args, "PlanProtocol"), "v2")}
 
-    # ── Plan (Activity A) ────────────────────────────────────────────────────
+    - checkPlanProtocol:
+        switch:
+          - condition: ${planProtocol == "v2"}
+            next: plan
+        next: unsupportedPlanProtocol
+
+    - unsupportedPlanProtocol:
+        raise:
+          code: PLAN_PROTOCOL_UNSUPPORTED
+          message: ${"PlanProtocol must be v2 or absent; got " + string(planProtocol)}
+
     - plan:
         try:
           call: http.post
@@ -36,42 +36,44 @@ main:
             timeout: 1800
             auth:
               type: OIDC
+              audience: ${serviceUrl}
             body:
               Action: plan
+              PlanProtocol: v2
               ProjectGcsUri: ${projectGcsUri}
               PlanOutputGcsPrefix: ${planOutputGcsPrefix}
               Config: ${config}
           result: planResp
         retry:
           predicate: ${retryable}
-          max_retries: 4
+          max_retries: 6
           backoff:
             initial_delay: 2
             max_delay: 60
             multiplier: 2
+
     - capturePlan:
         assign:
           - planResult: ${planResp.body}
-          - chunkCount: ${planResult.ChunkCount}
+          - chunkCount: ${planResp.body.ChunkCount}
 
-    # ── BuildChunkList + AssertChunkCount ──────────────────────────────────────
-    - assertChunkCount:
+    - validatePlanResult:
         switch:
-          - condition: ${chunkCount > 0}
+          - condition: ${planResult.PlanProtocol == "v2" and ("PlanV2ManifestGcsUri" in planResult) and ("PlanV2ArtifactGcsPrefix" in planResult) and not("PlanGcsUri" in planResult) and chunkCount > 0}
             next: buildChunkList
-        next: planProducedZeroChunks
-    - planProducedZeroChunks:
+        next: invalidPlanResult
+
+    - invalidPlanResult:
         raise:
-          code: PLAN_PRODUCED_ZERO_CHUNKS
-          message: "Plan returned ChunkCount=0 — the composition produced no frames. Non-retryable producer-side invariant violation."
+          code: PLAN_RESULT_INVALID
+          message: "Plan response did not satisfy the Plan v2 locator contract or produced no chunks."
+
     - buildChunkList:
-        # Pre-size the ordered chunk-URI + per-chunk result lists so the
-        # parallel branches below assign by index (distinct indices, no
-        # read-modify-write race on a shared accumulator).
         assign:
           - chunkIndexes: []
           - chunkUris: []
           - chunkResults: []
+
     - fillLists:
         for:
           value: i
@@ -83,16 +85,9 @@ main:
                   - chunkUris: ${list.concat(chunkUris, "")}
                   - chunkResults: ${list.concat(chunkResults, "")}
 
-    # ── RenderChunks (Activity B, fanned out) ──────────────────────────────────
     - renderChunks:
         parallel:
           shared: [chunkUris, chunkResults]
-          # Run up to chunkCount chunks at once, clamped to 20 — Cloud
-          # Workflows hard-caps concurrent branches/iterations per execution
-          # at 20 (https://cloud.google.com/workflows/quotas). Above that,
-          # iterations queue regardless of concurrency_limit, so a config with
-          # maxParallelChunks > 20 still renders correctly; the extra chunks
-          # just wait. All chunkCount iterations always run.
           concurrency_limit: ${math.min(chunkCount, 20)}
           for:
             value: idx
@@ -106,10 +101,13 @@ main:
                       timeout: 1800
                       auth:
                         type: OIDC
+                        audience: ${serviceUrl}
                       body:
                         Action: renderChunk
+                        PlanProtocol: v2
                         ChunkIndex: ${idx}
-                        PlanGcsUri: ${planResult.PlanGcsUri}
+                        PlanV2ManifestGcsUri: ${planResult.PlanV2ManifestGcsUri}
+                        PlanV2ArtifactGcsPrefix: ${planResult.PlanV2ArtifactGcsPrefix}
                         PlanHash: ${planResult.PlanHash}
                         ChunkOutputGcsPrefix: ${planOutputGcsPrefix}
                         Format: ${planResult.Format}
@@ -126,7 +124,6 @@ main:
                     - chunkUris[idx]: ${chunkResp.body.ChunkGcsUri}
                     - chunkResults[idx]: ${chunkResp.body}
 
-    # ── Assemble (Activity C) ──────────────────────────────────────────────────
     - assemble:
         try:
           call: http.post
@@ -135,16 +132,17 @@ main:
             timeout: 1800
             auth:
               type: OIDC
+              audience: ${serviceUrl}
             body:
               Action: assemble
-              PlanGcsUri: ${planResult.PlanGcsUri}
+              PlanProtocol: v2
+              PlanV2ManifestGcsUri: ${planResult.PlanV2ManifestGcsUri}
+              PlanV2ArtifactGcsPrefix: ${planResult.PlanV2ArtifactGcsPrefix}
+              PlanHash: ${planResult.PlanHash}
               ChunkGcsUris: ${chunkUris}
-              AudioGcsUri: ${planResult.AudioGcsUri}
+              AudioGcsUri: null
               OutputGcsUri: ${outputGcsUri}
               Format: ${planResult.Format}
-              # Forward the caller's exact-CFR request (Config.cfr) to assemble.
-              # `"cfr" in config` guards the optional key; when unset this is
-              # false, which the handler reads as the default -c copy path.
               Cfr: ${("cfr" in config) and config.cfr}
           result: assembleResp
         retry:
@@ -161,9 +159,7 @@ main:
           Chunks: ${chunkResults}
           Assemble: ${assembleResp.body}
 
-# Retry predicate: retry transient/server failures (429 + 5xx), never the
-# handler's non-retryable 400s (bad input, plan-hash mismatch, unsupported
-# format, …). Connection / timeout errors carry no `.code`; retry those too.
+# Retry transient/server failures, never handler-classified HTTP 400s.
 retryable:
   params: [e]
   steps:
@@ -172,6 +168,8 @@ retryable:
           - condition: ${not("code" in e)}
             return: true
           - condition: ${e.code == 429}
+            return: true
+          - condition: ${e.code == 403}
             return: true
           - condition: ${e.code >= 500 and e.code < 600}
             return: true

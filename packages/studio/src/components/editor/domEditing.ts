@@ -27,6 +27,7 @@ export {
 export {
   buildDefaultDomEditTextField,
   buildDomEditPatchTarget,
+  buildDomEditRichTextPatchOperation,
   buildDomEditStylePatchOperation,
   buildDomEditTextPatchOperation,
   collectDomEditLayerItems,
@@ -36,6 +37,7 @@ export {
   getDomEditNonEditableReason,
   getDomEditTargetKey,
   isTextEditableSelection,
+  liveLayerElement,
   readHfId,
   refreshDomEditSelection,
   resolveDomEditCapabilities,
@@ -44,4 +46,10 @@ export {
 } from "./domEditingLayers";
 
 // Agent prompt
-export { buildElementAgentPrompt } from "./domEditingAgentPrompt";
+export {
+  buildElementAgentPrompt,
+  buildAgentContextPreview,
+  buildPickerAgentPrompt,
+  buildPickerAgentContextPreview,
+} from "./domEditingAgentPrompt";
+export type { AgentPromptElementInfo } from "./domEditingAgentPrompt";

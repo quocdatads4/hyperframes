@@ -4,7 +4,23 @@
  * The engine's page contract. Any web page that wants to be rendered
  * as video must expose `window.__hf` implementing the HfProtocol interface.
  */
-import type { Fps } from "@hyperframes/core";
+import type { ReferenceBackground } from "./services/referenceBackground.js";
+import type { AudioFailureDiagnostic } from "./services/audioMixer.types.js";
+import type { Fps, MotionBlurFingerprint } from "@hyperframes/core";
+import type { CompositionLengthSource } from "@hyperframes/core/runtime/composition-length";
+import type { ChromeMemoryStats } from "./services/chromeMemorySampler.js";
+import type { MotionBlurOptions } from "./services/motionBlur.js";
+
+export type PageMotionBlurOff = "off" | "hdr-render" | "layered-composite" | "distributed-render";
+
+export interface PageMotionBlurSummary {
+  tier: "capture" | "filter" | null;
+  reasonCode: string | null;
+  movers: number;
+  failedFrames: number;
+  readEvents: boolean;
+  fingerprint: MotionBlurFingerprint | null;
+}
 
 /**
  * Outcome of waiting for a sub-composition's GSAP timelines to register.
@@ -13,12 +29,32 @@ import type { Fps } from "@hyperframes/core";
  */
 export type SubTimelineWaitOutcome = "ready" | "timeout" | "script_failure";
 
+/**
+ * Shared by every capture session of one render: timeline waits that already timed out
+ * (so later sessions skip the wait), and scene callback errors the render log already shows.
+ */
+export interface SubTimelineWaitMemo {
+  unregisteredIds?: readonly string[];
+  loggedSceneCallbackErrors?: string[];
+}
+
+/**
+ * Shared by every capture session of one render: per key, the first session's static-frame dedup check,
+ * which later sessions with that key wait for. It resolves to the verified frames, or null for none.
+ */
+export interface StaticDedupMemo {
+  checks?: Map<string, Promise<readonly number[] | null>>;
+}
+
 export type CaptureWarningCode =
   | "media_readiness_timeout"
   | "media_load_failed"
+  | "image_missing_from_frame"
   | "audio_processing_failed"
   | "sub_timeline_readiness_timeout"
   | "sub_timeline_script_failure"
+  | "script_error_isolated"
+  | "vfx_failure"
   | "live_map_detected";
 
 /** Structured correctness warning produced while preparing a capture session. */
@@ -28,7 +64,14 @@ export interface CaptureWarning {
   details?: {
     mediaType?: "image" | "video" | "audio";
     sources?: string[];
+    pendingCompositionIds?: string[];
+    isolatedElements?: Array<{ compositionId: string; elementId: string | null }>;
     timeoutMs?: number;
+    audioFailures?: AudioFailureDiagnostic[];
+    failureReasons?: string[];
+    failureStages?: string[];
+    failureOwner?: "user" | "system";
+    retryable?: boolean;
   };
 }
 
@@ -92,22 +135,40 @@ export interface HfTransitionMeta {
  * GSAP, Framer Motion, CSS animations, Three.js — anything works as long
  * as `seek()` produces deterministic visual output for a given time.
  */
+/**
+ * Per-seek controls the page honours. Both default off, which is an ordinary frame seek.
+ *
+ * `suppressEvents` stops a composition's own timeline callbacks from firing, and
+ * `subFrameDivisions` refines the grid the page quantizes onto so a fractional time is
+ * not floored back onto the output frame. Motion-blur sampling sets both.
+ */
+export interface HfSeekOptions {
+  suppressEvents?: boolean;
+  subFrameDivisions?: number;
+}
+
 export interface HfProtocol {
   /** Total duration of the composition in seconds */
   duration: number;
+  /** Which input set `duration`. */
+  lengthSource?: CompositionLengthSource;
   /** Seek to a specific time. Must produce deterministic visual output. */
-  seek(time: number): void;
+  seek(time: number, options?: HfSeekOptions): void;
   /** Optional: media elements the engine should handle */
   media?: HfMediaElement[];
   /** Optional: shader transition metadata, populated by @hyperframes/shader-transitions */
   transitions?: HfTransitionMeta[];
+  clipWindow?(el: Element): { start: number; end: number } | null;
 }
 
 // ── Capture Types ──────────────────────────────────────────────────────────────
 
 export interface CaptureOptions {
+  /** Shared once-only reader, invoked before capture changes root/body paint. */
+  recordReferenceBackground?: (read: () => Promise<ReferenceBackground>) => Promise<void>;
   width: number;
   height: number;
+  onSubTimelineScriptFailure?: (warnings: readonly CaptureWarning[]) => void;
   /**
    * Producer-resolved composition duration (seconds) — the data-duration
    * clamp actually rendered, which can differ from the page's raw
@@ -117,6 +178,15 @@ export interface CaptureOptions {
    * self-verification) MUST prefer this over `__hf.duration`.
    */
   compositionDurationSeconds?: number;
+  /** The composition declares `data-requires-webgpu`; skips createCaptureSession's own fetch. */
+  requiresWebGpu?: boolean;
+  /**
+   * Live Chrome memory samples during capture (browser/renderer RSS peaks,
+   * last total, GPU process presence). Invoked from an unref'd interval; must
+   * not throw. The producer forwards these to capture observability so a
+   * crash mid-render still reports the last known memory state.
+   */
+  onMemorySample?: (stats: ChromeMemoryStats) => void;
   /**
    * Frame rate as an exact rational. Integer fps is `{ num: 30, den: 1 }`;
    * NTSC is `{ num: 30000, den: 1001 }`. Captures are scheduled by the
@@ -125,7 +195,17 @@ export interface CaptureOptions {
    */
   fps: Fps;
   format?: "jpeg" | "png";
+  transparent?: boolean;
+  hiddenElementIds?: string[];
   quality?: number;
+  /**
+   * Opt into sub-frame multi-sample motion blur (issue #4010). Absent means off and the
+   * capture path is byte-identical to a render without it. Requires `format: "png"` and
+   * screenshot capture mode; see `services/motionBlur.ts`.
+   */
+  motionBlur?: MotionBlurOptions;
+  /** Why the page's capture motion blur stands down: the preview could not blur, or the route cannot host it. */
+  pageMotionBlur?: PageMotionBlurOff;
   deviceScaleFactor?: number;
   /**
    * Opt into Chrome's capture-beyond-viewport screenshot path. Leave undefined
@@ -152,6 +232,16 @@ export interface CaptureOptions {
    * intrinsic media dimensions.
    */
   skipReadinessVideoIds?: readonly string[];
+  /** Pass one object to every session of a render; see `SubTimelineWaitMemo`. */
+  subTimelineWaitMemo?: SubTimelineWaitMemo;
+  /** Pass one object to every session of a render, with `compositionHash`; see `StaticDedupMemo`. */
+  staticDedupMemo?: StaticDedupMemo;
+  /** Hash of the composition HTML this session loads; part of the static dedup sharing key. */
+  compositionHash?: string;
+  /** The frames of this session's task, [start, end); an interleaved task captures only some of them. */
+  staticDedupFrameRange?: { start: number; end: number };
+  deferStaticDedup?: boolean;
+  onStaticDedupActivity?: () => void;
   /**
    * Render-time variable overrides for the composition. The engine injects
    * these as `window.__hfVariables` via `evaluateOnNewDocument` before any
@@ -163,6 +253,11 @@ export interface CaptureOptions {
    * `--variables-file <path>`. Must be a JSON-serializable plain object.
    */
   variables?: Record<string, unknown>;
+  /**
+   * Check `variables` against the page's `data-composition-variables` once it is ready, before any frame;
+   * a mismatch or unreadable declarations end the session with `VariablesInvalidError`. Off by default.
+   */
+  strictVariables?: boolean;
   /**
    * When `true`, the BeginFrame warmup loop driven during page navigation
    * runs exactly `LOCKED_WARMUP_TICKS` (60) iterations regardless of how
@@ -187,6 +282,9 @@ export interface CaptureOptions {
    * Clamped to 0..8 like the env knob; HF_DE_VERIFY, when set, still wins.
    */
   deVerifySamples?: number;
+  deFrameFallback?: boolean;
+  onEffectScanProgress?: (scannedFrames: number, totalFrames: number) => void;
+  onEffectScanEnd?: () => void;
 }
 
 export interface CaptureVideoMetadataHint {
@@ -213,6 +311,7 @@ export interface CapturePerfSummary {
   avgSeekMs: number;
   avgBeforeCaptureMs: number;
   avgScreenshotMs: number;
+  captureBeyondViewport?: boolean;
   /**
    * Median per-frame capture time — warmup-robust, unlike `avgTotalMs`
    * (first frames pay font/image decode + GC that swamps short renders'
@@ -237,6 +336,38 @@ export interface CapturePerfSummary {
   p99TotalMs: number;
   /** Sub-composition timeline wait outcome (absent pre-init). */
   subTimelineWaitOutcome?: SubTimelineWaitOutcome;
+  /**
+   * Session init telemetry, mirrored from the `[FrameCapture:INIT]` console
+   * line so PARALLEL workers report it too: worker sessions' console buffers
+   * only propagate to the orchestrator on failure, which left the
+   * multi-worker path — the short-comp band's entire population — with 0%
+   * coverage of the motion axis (`observability_init_tween_count`) in fleet
+   * telemetry. Riding the perf summary reuses the one channel that already
+   * flows back per worker on success.
+   */
+  initDurationMs?: number;
+  /** GSAP tween count at init — the motion-axis signal for capture routing analysis. */
+  initTweenCount?: number;
+  /**
+   * Live DOM element count at end of init; undefined when the measurement
+   * failed (never 0 — see collectSessionInitTelemetry).
+   *
+   * WHICH FIELD TO QUERY — two element counts exist and they answer
+   * different questions:
+   *   • `composition_element_count` (+ `_source`) is the ROUTING-RELEVANT
+   *     one. Measured from the PROBE session before the routing decision,
+   *     falling back to a static source scan. That is what the short-comp
+   *     band actually gates on.
+   *   • `observability_init_element_count` (this field) is the
+   *     OBSERVATIONAL counterpart. Measured from the capture session's own
+   *     DOM at end of init, on every surviving render — including the ~83%
+   *     with no probe, where the routing signal is a blind static scan.
+   * They agree for most comps and diverge for one that mutates its DOM
+   * between probe launch and capture init. Use this for distribution and
+   * tail questions; use `composition_element_count` for anything about what
+   * the router did (review finding).
+   */
+  initElementCount?: number;
   /** Correctness warnings observed before or during capture. */
   warnings?: CaptureWarning[];
   /**
@@ -250,15 +381,32 @@ export interface CapturePerfSummary {
   staticDedupEnabled: boolean;
   /** Dedup passed every gate + verification and was active. */
   staticDedupArmed: boolean;
-  /** Predicted reusable frame count when armed; 0 otherwise. */
+  /** Original predicted reusable frame count before profitability/budget filtering. */
   staticDedupPredicted: number;
+  /** Frames retained after complete-run verification. */
+  staticDedupVerified?: number;
+  /** Bounded verifier result taxonomy. */
+  staticDedupVerificationOutcome?:
+    | "verified"
+    | "unprofitable"
+    | "time_budget"
+    | "count_budget"
+    | "mismatch"
+    | "infrastructure";
+  staticDedupVerificationPlannedRuns?: number;
+  staticDedupVerificationCompletedRuns?: number;
+  staticDedupVerificationScreenshots?: number;
+  staticDedupVerificationSeeks?: number;
+  staticDedupVerificationComparisons?: number;
+  staticDedupVerificationElapsedMs?: number;
   /**
    * Low-cardinality reason dedup did not arm: `capture_mode` | `video_injection`
-   * | `page_composite` | `ineligible` | `verification_failed` | `verification_budget`.
+   * | `page_composite` | `ineligible` | `unprofitable` | `verification_failed` | `verification_budget`.
    * Undefined when armed or when dedup was disabled. (Render-level aggregation may
    * `|`-join distinct reasons when parallel workers diverge.)
    */
   staticDedupSkipReason?: string;
+  staticDedupIneligibleCause?: string;
   // ── BeginFrame no-damage reuse (Linux/Docker lastFrameCache visibility) ──
   /**
    * BeginFrame frames where Chrome reported `hasDamage=false` and the previous
@@ -273,12 +421,29 @@ export interface CapturePerfSummary {
   /** Final capture mode this session used: "drawelement" | "screenshot" | "beginframe". */
   captureMode: string;
   /**
+   * Low-cardinality GPU bucket from DE session init: `<backend>/<vendor>`
+   * (e.g. `metal/apple`, `d3d11/nvidia`). Undefined when drawElement was
+   * never attempted. Lets telemetry cluster backend-specific damage now that
+   * DE engages on both Metal (darwin) and D3D11 (win32). Bucketed, not raw —
+   * see `classifyGpuRenderer`.
+   */
+  gpuRenderer?: string;
+  // ── Chrome process memory (spec: long-form render capture, Phase −1).
+  // Undefined when the sampler was disabled (HF_CHROME_MEMORY_SAMPLER=false)
+  // or never produced a successful sample. ──
+  chromeBrowserRssPeakMb?: number;
+  chromeRendererRssPeakMb?: number;
+  chromeRssLastMb?: number;
+  chromeGpuProcessSeenLastSample?: boolean;
+  chromeMemorySamples?: number;
+  /**
    * Low-cardinality init-time gate that routed a drawElement-eligible session
-   * to the baseline: `swiftshader` | `css_effect:<fx>` | `at_risk_timeline` |
-   * `3d_init_failed` | `supersampling` | `render_mode_hint`. Undefined when
-   * drawElement ran or was never attempted.
+   * to the baseline: `swiftshader` | `webgl_unavailable` | `beginframe_no_self_verify` |
+   * `css_effect:<fx>` | `at_risk_timeline` | `3d_init_failed` | `supersampling` |
+   * `render_mode_hint`. Undefined when drawElement ran or was never attempted.
    */
   deGateReason?: string;
+  motionBlur?: PageMotionBlurSummary;
   /**
    * Full-fidelity fallback trigger — the specific reason (CSS FX + property,
    * e.g. `filter:blur`, `filter:drop-shadow`, `backdrop-filter`, `clip-path`,
@@ -299,8 +464,16 @@ export interface CapturePerfSummary {
   deVerifyInitMs: number;
   /** Clip-cut boundary frames routed to per-frame screenshot (Lim 6). */
   deBoundaryFrames: number;
+  deRiskFrames: number;
   /** Per-frame "No cached paint record" screenshot fallbacks during capture. */
   deNcprFallbacks: number;
+  /**
+   * Per-frame drawElement captures that blew the `HF_DE_FRAME_TIMEOUT_MS`
+   * deadline (renderer stopped scheduling after drawElementImage returned —
+   * PRINFRA-488). Each timeout aborts that attempt so the producer can retry the
+   * whole render on a fresh screenshot session.
+   */
+  deFrameTimeouts: number;
 }
 
 // ── Global Augmentation ────────────────────────────────────────────────────────
@@ -308,5 +481,6 @@ export interface CapturePerfSummary {
 declare global {
   interface Window {
     __hf?: HfProtocol;
+    __HF_VIRTUAL_TIME__?: { originalSetTimeout?: typeof setTimeout };
   }
 }

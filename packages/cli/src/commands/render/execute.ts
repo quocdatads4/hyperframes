@@ -1,24 +1,38 @@
-import { mkdirSync, readFileSync } from "node:fs";
+// fallow-ignore-file code-duplication
+import { readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import type { CanvasResolution, OutputResolutionIssueKind } from "@hyperframes/core";
+import { PRORES_PROFILES } from "@hyperframes/engine";
 import { c } from "../../ui/colors.js";
 import { errorBox, formatBytes } from "../../ui/format.js";
-import { formatLintFindings } from "../../utils/lintFormat.js";
-import { lintProject, shouldBlockRender } from "../../utils/lintProject.js";
+import { formatLintStartupMessage } from "../../utils/lintFormat.js";
+import {
+  hasDefinitiveEntryMismatch,
+  lintProject,
+  shouldBlockRender,
+  type ProjectLintResult,
+} from "../../utils/lintProject.js";
 import { normalizeErrorMessage } from "../../utils/errorMessage.js";
-import { failCommand, setCommandExitCode } from "../../utils/commandResult.js";
+import { makeOutputFolder } from "../../utils/outputFolder.js";
+import { CliRuntimeError, failCommand, setCommandExitCode } from "../../utils/commandResult.js";
 import {
   reportVariableIssues,
   resolveVariablesArg,
   validateVariablesAgainstProject,
 } from "../../utils/variables.js";
 import { trackRenderPreflightRejected } from "../../telemetry/events.js";
+import { renderMachineResult } from "../../ui/renderResult.js";
 import { applyRenderEnvironment, renderOutputDirectory, type RenderPlan } from "./plan.js";
 import type { RenderOptions, SingleRenderResult } from "../render.js";
+import type { RenderCancellationScope } from "../../utils/renderCancellation.js";
+import { runRenderSetupWorker } from "../../utils/cancellableProcess.js";
+import { outsideAssetsAllowed } from "../../utils/receivedRender.js";
 
 type RenderExecutor = (
   projectDir: string,
   outputPath: string,
   options: RenderOptions,
+  cancellation?: RenderCancellationScope,
 ) => Promise<SingleRenderResult>;
 
 type ResolutionPreflight = (
@@ -31,23 +45,37 @@ export interface RenderExecutionDependencies {
   renderDocker: RenderExecutor;
   renderLocal: RenderExecutor;
   checkResolution: ResolutionPreflight;
+  acquireRenderSlot?: (plan: RenderPlan, signal?: AbortSignal) => Promise<() => void>;
 }
 
 // Exported only through render.ts so command tests can lock the user-facing guidance.
-// fallow-ignore-next-line unused-export
 export function renderLintContinuationHint(strictErrors: boolean): string {
   return strictErrors
     ? "  Continuing render despite lint warnings. Use --strict-all to block warnings."
     : "  Continuing render despite lint issues. Use --strict to block errors.";
 }
 
+function renderLintShouldAbort(
+  strictErrors: boolean,
+  strictAll: boolean,
+  lintResult: ProjectLintResult,
+  definitiveEntryMismatch: boolean,
+): boolean {
+  return (
+    definitiveEntryMismatch ||
+    shouldBlockRender(strictErrors, strictAll, lintResult.totalErrors, lintResult.totalWarnings)
+  );
+}
+
 /** Execute a validated plan. Output and process lifecycle stay outside parsing. */
 export async function executeRenderPlan(
   plan: RenderPlan,
   dependencies: RenderExecutionDependencies,
+  cancellation?: RenderCancellationScope,
 ): Promise<void> {
+  assertRenderActive(cancellation);
   applyRenderEnvironment(plan);
-  if (!plan.batchPath) mkdirSync(renderOutputDirectory(plan), { recursive: true });
+  if (!plan.batchPath) makeOutputFolder(renderOutputDirectory(plan));
 
   let batchModule: typeof import("../batchRender.js") | undefined;
   let preparedBatch: import("../batchRender.js").PreparedBatchRender | undefined;
@@ -67,27 +95,97 @@ export async function executeRenderPlan(
     }
   }
 
-  const browserPath = plan.useDocker ? undefined : await ensureRenderBrowser(plan);
-  await runRenderLint(plan);
+  const variables = plan.batchPath
+    ? undefined
+    : resolveVariablesArg(plan.variablesArg, plan.variablesFileArg);
+  await runRenderLint(plan, lintProject, cancellation?.signal);
+  assertRenderActive(cancellation);
+  if (!plan.useDocker) await refuseLowDiskBeforeBrowserDownload(plan);
+  const browserPath = plan.useDocker
+    ? undefined
+    : await ensureRenderBrowser(plan, cancellation?.signal);
+  assertRenderActive(cancellation);
   await runResolutionPreflight(plan, dependencies.checkResolution);
+  assertRenderActive(cancellation);
 
+  const releaseSlot = await dependencies.acquireRenderSlot?.(plan, cancellation?.signal);
+  try {
+    assertRenderActive(cancellation);
+    await executeHeldRender(plan, browserPath, variables, dependencies, cancellation, {
+      batchModule,
+      preparedBatch,
+    });
+  } finally {
+    releaseSlot?.();
+  }
+}
+
+async function executeHeldRender(
+  plan: RenderPlan,
+  browserPath: string | undefined,
+  variables: RenderOptions["variables"],
+  dependencies: RenderExecutionDependencies,
+  cancellation: RenderCancellationScope | undefined,
+  batch: {
+    batchModule?: typeof import("../batchRender.js");
+    preparedBatch?: import("../batchRender.js").PreparedBatchRender;
+  },
+): Promise<void> {
+  const { batchModule, preparedBatch } = batch;
   if (plan.batchPath && batchModule && preparedBatch) {
-    await executeBatchRender(plan, browserPath, batchModule, preparedBatch, dependencies);
+    await executeBatchRender(
+      plan,
+      browserPath,
+      batchModule,
+      preparedBatch,
+      dependencies,
+      cancellation,
+    );
     return;
   }
 
-  const variables = resolveVariablesArg(plan.variablesArg, plan.variablesFileArg);
+  reportSingleRenderNotes(plan, variables);
+  const options = renderOptionsFromPlan(plan, browserPath, variables);
+  const execute = plan.useDocker ? dependencies.renderDocker : dependencies.renderLocal;
+  const result = await execute(plan.project.dir, plan.outputPath, options, cancellation);
+  renderMachineResult(result, plan.effectiveQuiet);
+}
+
+function reportSingleRenderNotes(plan: RenderPlan, variables: RenderOptions["variables"]): void {
   if (variables && Object.keys(variables).length > 0) {
     const issues = validateVariablesAgainstProject(plan.renderTarget, variables);
-    reportVariableIssues(issues, { strict: plan.strictVariables, quiet: plan.quiet });
+    reportVariableIssues(issues, { strict: plan.strictVariables, quiet: plan.effectiveQuiet });
   }
 
+  if (plan.proresProfile && !PRORES_PROFILES[plan.proresProfile].alpha && !plan.effectiveQuiet) {
+    console.log(
+      c.dim(`ProRes ${plan.proresProfile} has no alpha channel: transparent areas render black.`),
+    );
+  }
+}
+
+/**
+ * The plan -> RenderOptions hop for a single render. Pure and exported so the
+ * flags that cross it are pinned by a test: `--resume` / `--keep-segments`
+ * were once dropped exactly here and nothing but a manual gate noticed.
+ */
+export function renderOptionsFromPlan(
+  plan: RenderPlan,
+  browserPath: string | undefined,
+  variables: RenderOptions["variables"],
+): RenderOptions {
   const options: RenderOptions = {
     fps: plan.fps,
     quality: plan.quality,
     authoringSkill: plan.authoringSkill,
+    authoringSkillSource: plan.authoringSkillSource,
+    authoringSkillInvalid: plan.invalidAuthoringSkill,
+    hfEnvOverrides: plan.hfEnvOverrides,
+    catalogUsage: plan.catalogUsage,
     format: plan.format,
     gifLoop: plan.gifLoop,
+    gifFpsCapped: plan.gifFpsCapped,
+    hlsSegmentSeconds: plan.hlsSegmentSeconds,
     workers: plan.workers,
     gpu: plan.useGpu,
     browserGpuMode: plan.browserGpuMode,
@@ -95,11 +193,22 @@ export async function executeRenderPlan(
     crf: plan.crf,
     vp9CpuUsed: plan.vp9CpuUsed,
     videoBitrate: plan.videoBitrate,
+    keyframeIntervalSeconds: plan.keyframeIntervalSeconds,
+    range: plan.range,
+    proresProfile: plan.proresProfile,
+    maxBitrate: plan.maxBitrate,
+    bufferSize: plan.bufferSize,
     videoFrameFormat: plan.videoFrameFormat,
-    quiet: plan.quiet,
+    chromaSubsampling: plan.chromaSubsampling,
+    pageMotionBlur: plan.pageMotionBlur,
+    quiet: plan.effectiveQuiet,
     browserPath,
     debug: plan.debug,
+    resumeSegments: plan.resumeSegments,
+    keepSegments: plan.keepSegments,
     bestEffort: plan.bestEffort,
+    includeOutsideScripts: plan.includeOutsideScripts,
+    refuseOutsideFiles: plan.refuseOutsideFiles ? true : undefined,
     variables,
     entryFile: plan.entryFile,
     outputResolution: plan.outputResolution,
@@ -109,17 +218,31 @@ export async function executeRenderPlan(
     protocolTimeout: plan.protocolTimeout,
     playerReadyTimeout: plan.playerReadyTimeout,
     exitAfterComplete: true,
-    enableDeParallelRouterTrial: true,
+    manageDeParallelRouterBreaker: true,
   };
   if (plan.useDocker) {
     options.pageSideCompositing = plan.pageSideCompositing;
     options.experimentalFastCapture = plan.experimentalFastCapture;
   }
-  const execute = plan.useDocker ? dependencies.renderDocker : dependencies.renderLocal;
-  await execute(plan.project.dir, plan.outputPath, options);
+  return options;
 }
 
-async function ensureRenderBrowser(plan: RenderPlan): Promise<string> {
+function assertRenderActive(cancellation?: RenderCancellationScope): void {
+  cancellation?.checkAncestors();
+  cancellation?.signal.throwIfAborted();
+}
+
+async function refuseLowDiskBeforeBrowserDownload(plan: RenderPlan): Promise<void> {
+  const { checkDisk } = await import("../../browser/preflight.js");
+  await (await import("../../browser/manager.js")).sweepKilledInstalls();
+  const paths = new Set([tmpdir(), renderOutputDirectory(plan)]);
+  const low = [...paths].map((path) => checkDisk(path)).filter((outcome) => !outcome.ok);
+  if (low.length === 0) return;
+  for (const check of low) errorBox(check.title ?? "Low disk space", check.detail, check.hint);
+  failCommand();
+}
+
+async function ensureRenderBrowser(plan: RenderPlan, signal?: AbortSignal): Promise<string> {
   const { ensureBrowser } = await import("../../browser/manager.js");
   let browserSpinner:
     | {
@@ -130,13 +253,14 @@ async function ensureRenderBrowser(plan: RenderPlan): Promise<string> {
     | undefined;
   try {
     if (plan.effectiveQuiet) {
-      return (await ensureBrowser({ preferManagedChrome: true })).executablePath;
+      return (await ensureBrowser({ preferManagedChrome: true, signal })).executablePath;
     }
-    const clack = await import("@clack/prompts");
+    const clack = await import("../../ui/prompts.js");
     browserSpinner = clack.spinner();
     browserSpinner.start("Checking browser...");
     const info = await ensureBrowser({
       preferManagedChrome: true,
+      signal,
       onProgress: (downloaded, total) => {
         if (total <= 0) return;
         const pct = Math.floor((downloaded / total) * 100);
@@ -149,52 +273,86 @@ async function ensureRenderBrowser(plan: RenderPlan): Promise<string> {
     return info.executablePath;
   } catch (error: unknown) {
     browserSpinner?.stop(c.error("Browser not available"));
+    if (signal?.aborted) signal.throwIfAborted();
     errorBox(
       "Chrome not found",
       normalizeErrorMessage(error),
       "Run: npx hyperframes browser ensure",
     );
-    failCommand();
+    failCommand(1, undefined, "chrome_not_found");
   }
 }
 
 // fallow-ignore-next-line complexity
-async function runRenderLint(plan: RenderPlan): Promise<void> {
+export async function runRenderLint(
+  plan: RenderPlan,
+  runLint: (projectDir: string, entryFile?: string) => Promise<ProjectLintResult> = lintProject,
+  signal?: AbortSignal,
+): Promise<void> {
   // lintProject's explicit-entry contract is an absolute source path;
   // entryFile remains project-relative for the producer.
   const explicitEntry = plan.entryFile ? plan.renderTarget : undefined;
-  const lintResult = await lintProject(plan.project.dir, explicitEntry);
+  const lintResult =
+    signal && runLint === lintProject
+      ? await runRenderLintInOwnedProcess(plan.project.dir, explicitEntry, signal)
+      : await runLint(plan.project.dir, explicitEntry);
   if (lintResult.totalErrors === 0 && lintResult.totalWarnings === 0) return;
-  presentRenderLintFindings(lintResult, plan.effectiveQuiet);
-  if (
-    shouldBlockRender(
-      plan.strictErrors,
-      plan.strictAll,
-      lintResult.totalErrors,
-      lintResult.totalWarnings,
-    )
-  ) {
-    presentRenderLintAbort(plan);
-    failCommand();
+  const definitiveEntryMismatch = hasDefinitiveEntryMismatch(lintResult);
+  const willAbort = renderLintShouldAbort(
+    plan.strictErrors,
+    plan.strictAll,
+    lintResult,
+    definitiveEntryMismatch,
+  );
+  presentRenderLintFindings(lintResult, plan.effectiveQuiet, plan.lintVerbose || willAbort);
+  if (willAbort) {
+    const message = presentRenderLintAbort(lintResult, definitiveEntryMismatch);
+    throw new CliRuntimeError(message, { presented: true });
   }
   presentRenderLintContinuation(plan);
+}
+
+async function runRenderLintInOwnedProcess(
+  projectDir: string,
+  entryFile: string | undefined,
+  signal: AbortSignal,
+): Promise<ProjectLintResult> {
+  return runRenderSetupWorker<ProjectLintResult>(
+    "lint",
+    { projectDir, entryFile },
+    {
+      signal,
+      maxBufferBytes: 8 * 1024 * 1024,
+    },
+  );
 }
 
 function presentRenderLintFindings(
   lintResult: Awaited<ReturnType<typeof lintProject>>,
   quiet: boolean,
+  lintVerbose: boolean,
 ): void {
   if (quiet) return;
   console.log("");
-  for (const line of formatLintFindings(lintResult, { errorsFirst: true })) console.log(line);
+  for (const line of formatLintStartupMessage(
+    lintResult,
+    lintVerbose ? { kind: "verbose", options: { errorsFirst: true } } : { kind: "summary" },
+  ))
+    console.log(line);
 }
 
-function presentRenderLintAbort(plan: RenderPlan): void {
-  if (plan.effectiveQuiet) return;
-  const mode = plan.strictAll ? "--strict-all" : "--strict";
-  console.log("");
-  console.log(c.error(`  Aborting render due to lint issues (${mode} mode).`));
-  console.log("");
+function presentRenderLintAbort(
+  lintResult: ProjectLintResult,
+  definitiveEntryMismatch: boolean,
+): string {
+  const counts = `${lintResult.totalErrors} error(s), ${lintResult.totalWarnings} warning(s)`;
+  const findings = lintResult.results.flatMap((entry) => entry.result.findings);
+  const first = findings.find((finding) => finding.severity === "error") ?? findings[0];
+  const message = definitiveEntryMismatch
+    ? "Cannot render: the default index.html entry is blank."
+    : `Cannot render: ${counts}. ${first ? `${first.code}: ${first.message}` : "Fix the project lint issues."} Run hyperframes lint for details.`;
+  errorBox(message);
+  return message;
 }
 
 function presentRenderLintContinuation(plan: RenderPlan): void {
@@ -225,19 +383,23 @@ async function runResolutionPreflight(
   failCommand();
 }
 
-async function executeBatchRender(
+export function batchRowRenderOptions(
   plan: RenderPlan,
   browserPath: string | undefined,
-  batchModule: typeof import("../batchRender.js"),
-  preparedBatch: import("../batchRender.js").PreparedBatchRender,
-  dependencies: RenderExecutionDependencies,
-): Promise<void> {
+): RenderOptions {
   const batchQuiet = plan.quiet || plan.batchJson;
-  const renderOptionsBase: RenderOptions = {
+  return {
     fps: plan.fps,
     quality: plan.quality,
     authoringSkill: plan.authoringSkill,
+    authoringSkillSource: plan.authoringSkillSource,
+    authoringSkillInvalid: plan.invalidAuthoringSkill,
+    hfEnvOverrides: plan.hfEnvOverrides,
+    catalogUsage: plan.catalogUsage,
     format: plan.format,
+    gifLoop: plan.gifLoop,
+    gifFpsCapped: plan.gifFpsCapped,
+    hlsSegmentSeconds: plan.hlsSegmentSeconds,
     workers: plan.workers,
     gpu: plan.useGpu,
     browserGpuMode: plan.browserGpuMode,
@@ -245,6 +407,14 @@ async function executeBatchRender(
     crf: plan.crf,
     vp9CpuUsed: plan.vp9CpuUsed,
     videoBitrate: plan.videoBitrate,
+    keyframeIntervalSeconds: plan.keyframeIntervalSeconds,
+    range: plan.range,
+    proresProfile: plan.proresProfile,
+    maxBitrate: plan.maxBitrate,
+    bufferSize: plan.bufferSize,
+    videoFrameFormat: plan.videoFrameFormat,
+    chromaSubsampling: plan.chromaSubsampling,
+    pageMotionBlur: plan.pageMotionBlur,
     quiet: batchQuiet,
     browserPath,
     entryFile: plan.entryFile,
@@ -255,12 +425,36 @@ async function executeBatchRender(
     protocolTimeout: plan.protocolTimeout,
     playerReadyTimeout: plan.playerReadyTimeout,
     debug: plan.debug,
+    resumeSegments: plan.resumeSegments,
+    keepSegments: plan.keepSegments,
     bestEffort: plan.bestEffort,
+    includeOutsideScripts: plan.includeOutsideScripts,
+    refuseOutsideFiles: plan.refuseOutsideFiles ? true : undefined,
     exitAfterComplete: false,
     throwOnError: true,
     skipFeedback: true,
-    enableDeParallelRouterTrial: plan.batchConcurrency <= 1,
+    desktopHint: false,
+    manageDeParallelRouterBreaker: plan.batchConcurrency <= 1,
   };
+}
+
+function outsideAssetsAllowedOnceForEveryRow(plan: RenderPlan): boolean {
+  return outsideAssetsAllowed(plan.project.dir, plan.entryFile, (line) =>
+    console.warn(c.warn(`  ${line}`)),
+  );
+}
+
+async function executeBatchRender(
+  plan: RenderPlan,
+  browserPath: string | undefined,
+  batchModule: typeof import("../batchRender.js"),
+  preparedBatch: import("../batchRender.js").PreparedBatchRender,
+  dependencies: RenderExecutionDependencies,
+  cancellation?: RenderCancellationScope,
+): Promise<void> {
+  const batchQuiet = plan.quiet || plan.batchJson;
+  const renderOptionsBase = batchRowRenderOptions(plan, browserPath);
+  renderOptionsBase.refuseOutsideFiles ??= !outsideAssetsAllowedOnceForEveryRow(plan);
   const manifest = await batchModule.runBatchRender({
     prepared: preparedBatch,
     concurrency: plan.batchConcurrency,
@@ -268,10 +462,11 @@ async function executeBatchRender(
     quiet: batchQuiet,
     json: plan.batchJson,
     renderOne: (row) => {
+      assertRenderActive(cancellation);
       const options: RenderOptions = { ...renderOptionsBase, variables: row.variables };
       if (plan.useDocker) options.pageSideCompositing = plan.pageSideCompositing;
       const execute = plan.useDocker ? dependencies.renderDocker : dependencies.renderLocal;
-      return execute(plan.project.dir, row.outputPath, options);
+      return execute(plan.project.dir, row.outputPath, options, cancellation);
     },
   });
   if (manifest.failed > 0) setCommandExitCode(1);

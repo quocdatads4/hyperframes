@@ -1,6 +1,19 @@
-import { existsSync } from "node:fs";
-import { isAbsolute, posix, relative, resolve } from "node:path";
+import { scanHtmlOpeningTags, decodeAuthoredAttribute } from "./htmlAttributeSpans.js";
+import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync } from "node:fs";
+import { isAbsolute, join, parse, posix, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+import { isNonRelativeUrl } from "./assetPaths.js";
 import { decodeUrlPathVariants } from "./composition.js";
+import { decodedUrlPath } from "./utils/urlPath.js";
+import { rewriteAssetPath, type AssetExists } from "./rewriteSubCompPaths.js";
+
+/** The subset of `node:path` that `isWithinProjectRoot` needs to run under
+ * an injected platform (tests pass `path.win32` / `path.posix`). */
+interface PathModuleLike {
+  resolve: (...segments: string[]) => string;
+  relative: (from: string, to: string) => string;
+  isAbsolute: (path: string) => boolean;
+}
 
 /**
  * Shared local-asset resolution helpers for every package that maps
@@ -13,14 +26,83 @@ export function isRemoteOrInlineUrl(url: string): boolean {
   return /^(https?:|data:|blob:|\/\/|#)/i.test(url);
 }
 
+/**
+ * True when a URL still contains an unresolved templating placeholder —
+ * `<<token>>`, `{{ token }}`, or `${token}` — that a build or templating step
+ * substitutes before render. The static linter runs before that substitution,
+ * so it cannot resolve such a value to a file on disk and must not report it as
+ * a missing asset. Check the RAW url, before any `cleanAssetUrl()` step: that
+ * splits on `?`/`#`, which also chops inside a `${...}` expression. (The `__UPPER__`
+ * placeholder shape is combined with this in `isUnresolvedAssetPlaceholder` below, the
+ * shared predicate asset-src sites skip on.)
+ */
+export function hasUnresolvedTemplatingToken(url: string): boolean {
+  return /<<[^<>]+>>|\{\{[^{}]+\}\}|\$\{[^{}]+\}/.test(url);
+}
+
+/**
+ * True when an asset src is a build-time placeholder rather than a resolvable path:
+ * the `__UPPER__` shape (e.g. `__DURATION__`) or an unresolved templating token
+ * (`<<...>>`, `{{...}}`, `${...}`). Pass the RAW src, before any `cleanAssetUrl()` step —
+ * cleanAssetUrl splits on `?`/`#`, which would chop inside a `${...}` expression and defeat
+ * the token match. Remote/inline URL handling is deliberately NOT folded in: call sites
+ * differ (e.g. audio uses a narrower http/data/blob check), so each keeps its own.
+ *
+ * This is the single skip predicate every asset-src lint / codec / compile site should
+ * route through, so the placeholder rules can't drift apart across call sites.
+ */
+export function isUnresolvedAssetPlaceholder(rawSrc: string): boolean {
+  return /^__[A-Z_]+__$/.test(rawSrc.trim()) || hasUnresolvedTemplatingToken(rawSrc);
+}
+
+/**
+ * Collect active, local composition paths in document order, including template content.
+ * Paths are physical file names relative to the project root at every nesting level.
+ */
+export function collectSubCompositionSrcs(html: string): string[] {
+  const srcs: string[] = [];
+  const seen = new Set<string>();
+
+  for (const tag of scanHtmlOpeningTags(html)) {
+    if (!tag.closed) continue;
+    const attribute = tag.attributes.find((attr) => attr.name === "data-composition-src");
+    if (attribute?.kind !== "value") continue;
+    const src = decodeAuthoredAttribute(attribute.value).trim();
+    if (!src || seen.has(src)) continue;
+    // __UPPER__ placeholder or late-bound templating token — not a real reference.
+    if (isUnresolvedAssetPlaceholder(src)) continue;
+    // A remote or inline mount names no file on disk. Every caller resolves
+    // these against the project root, so letting one through produces a
+    // nonsense path (`<projectDir>/https:/host/a.html`) that then reads as a
+    // missing local file: a false "does not exist" for lint, and a wasted
+    // visit against the telemetry walk's file budget.
+    if (isRemoteOrInlineUrl(src)) continue;
+    seen.add(src);
+    srcs.push(src);
+  }
+  return srcs;
+}
+
 export function cleanAssetUrl(url: string): string {
   return url.trim().split(/[?#]/, 1)[0] ?? "";
 }
 
-export function isWithinProjectRoot(projectDir: string, candidate: string): boolean {
-  const projectRoot = resolve(projectDir);
-  const relativePath = relative(projectRoot, candidate);
-  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+/**
+ * `pathModule` defaults to the host's native `node:path`, so every existing
+ * caller gets its actual OS's separator and drive-letter rules unchanged.
+ * Tests inject `path.win32` / `path.posix` to exercise both platforms' rules
+ * from a single OS (same pattern as producer/fileServer.ts's `isPathInside`).
+ */
+export function isWithinProjectRoot(
+  projectDir: string,
+  candidate: string,
+  pathModule: PathModuleLike = { resolve, relative, isAbsolute },
+): boolean {
+  const projectRoot = pathModule.resolve(projectDir);
+  const relativePath = pathModule.relative(projectRoot, candidate);
+  return (
+    relativePath === "" || (!relativePath.startsWith("..") && !pathModule.isAbsolute(relativePath))
+  );
 }
 
 function addCandidate(candidates: string[], candidate: string): void {
@@ -42,12 +124,57 @@ export function resolveLocalAssetCandidates(projectDir: string, url: string): st
 
     const normalized = posix.normalize(projectRelative.replace(/\\/g, "/"));
     const clamped = normalized.replace(/^(\.\.\/)+/, "");
-    if (clamped && !clamped.startsWith("..")) {
-      addCandidate(candidates, resolve(projectRoot, clamped));
-    }
+    if (!clamped || clamped.startsWith("..")) continue;
+    const reanchored = resolve(projectRoot, clamped);
+    if (isWithinProjectRoot(projectRoot, reanchored)) addCandidate(candidates, reanchored);
   }
 
   return candidates;
+}
+
+// On Windows even a stat of a UNC or device path (\\host\share, \\?\, \\.\) connects to that host.
+export function namesAnotherNetworkRoot(base: string, target: string): boolean {
+  const root = parse(resolve(target)).root;
+  return /^[\\/]{2}/.test(root) && root.toLowerCase() !== parse(resolve(base)).root.toLowerCase();
+}
+
+/** `AssetExists` for a project on disk; a path outside it (a share, another drive) is missing, never looked at. */
+export function projectAssetExists(projectDir: string): AssetExists {
+  return (path) => {
+    const file = resolve(projectDir, path);
+    return isWithinProjectRoot(projectDir, file) && existsSync(file);
+  };
+}
+
+export function srcOnAnotherNetworkRoot(projectDir: string, src: string): boolean {
+  const path = fileUrlAsPath(cleanAssetUrl(src));
+  return isAbsolute(path) && namesAnotherNetworkRoot(projectDir, path);
+}
+
+const LEADING_PARENT_SEGMENT = /^\.\.(?:[\\/]|$)/;
+
+function staysInsideProject(projectDir: string, path: string): boolean {
+  const relativePath = relative(resolve(projectDir), path);
+  return !LEADING_PARENT_SEGMENT.test(relativePath) && !isAbsolute(relativePath);
+}
+
+/** The project file a data-composition-src names, as the preview reads it; null when it leaves the project. */
+export function resolveCompositionSrc(projectDir: string, src: string): string | null {
+  const rooted = (value: string) => resolve(projectDir, value.replace(/^(?:\.?[\\/])+/, ""));
+  const decoded = rooted(decodedUrlPath(src));
+  if (!staysInsideProject(projectDir, decoded)) return null;
+  const raw = rooted(src);
+  return !existsSync(decoded) && staysInsideProject(projectDir, raw) && existsSync(raw)
+    ? raw
+    : decoded;
+}
+
+// A Windows absolute src (C:\clip.mp4) that render copies in. A POSIX /x is a project URL; another share is skipped.
+export function localAbsoluteAssetFile(projectDir: string, src: string): string | null {
+  const path = cleanAssetUrl(src);
+  if (isNonRelativeUrl(path) || !isAbsolute(path)) return null;
+  const file = resolve(projectDir, path);
+  return !namesAnotherNetworkRoot(projectDir, file) && existsSync(file) ? file : null;
 }
 
 export function resolveExistingLocalAsset(
@@ -58,6 +185,77 @@ export function resolveExistingLocalAsset(
   const resolved = resolveLocalAssetCandidates(projectRoot, url).find(existsSync);
   if (!resolved) return null;
   return { resolved, rootRelativePath: relative(projectRoot, resolved) };
+}
+
+/** The project file a `src` authored in `compositionFile` loads in preview and render; null when none exists. */
+export function resolveAuthoredAssetFile(
+  projectDir: string,
+  compositionFile: string,
+  src: string,
+): string | null {
+  const cleanSrc = cleanAssetUrl(src.trim());
+  if (!cleanSrc) return null;
+  const rootRelative = cleanSrc.startsWith("/")
+    ? cleanSrc
+    : rewriteAssetPath(compositionFile, cleanSrc, (path) => existsSync(join(projectDir, path)));
+  return (
+    resolveExistingLocalAsset(projectDir, rootRelative)?.resolved ??
+    localAbsoluteAssetFile(projectDir, cleanSrc)
+  );
+}
+
+// Candidates for a variant whose join escaped the project root, re-anchored at the root.
+function reanchoredCandidates(variant: string, baseDir: string, compiledDir?: string): string[] {
+  const baseAbs = resolve(baseDir);
+  const joinedAbs = resolve(join(baseDir, variant));
+  if (joinedAbs === baseAbs || joinedAbs.startsWith(baseAbs + sep)) return [];
+  // Normalize before stripping, or `assets/../../assets/foo` becomes `assets/assets/foo`.
+  const stripped = posix.normalize(variant.replace(/\\/g, "/")).replace(/^(\.\.\/)+/, "");
+  if (!stripped || stripped === variant || stripped.startsWith("..")) return [];
+  return compiledDir
+    ? [join(compiledDir, stripped), join(baseDir, stripped)]
+    : [join(baseDir, stripped)];
+}
+
+// A file: URL names a path on this machine; one that names no local path stays as written and reads as missing.
+function fileUrlAsPath(src: string): string {
+  if (!/^file:/i.test(src)) return src;
+  try {
+    return fileURLToPath(src);
+  } catch {
+    return src;
+  }
+}
+
+// `/c/Users/...`: agents on Windows write what their Git Bash shell prints. A project file of that name wins.
+function gitBashFile(src: string): string | undefined {
+  if (process.platform !== "win32" || !/^\/[a-zA-Z]\//.test(src)) return undefined;
+  const path = resolve(`${src[1]}:${src.slice(2)}`);
+  return existsSync(path) ? path : undefined;
+}
+
+/** Resolves a media `src` like a browser URL (`..` clamps at the project root); a miss returns the base-dir join. */
+export function resolveProjectRelativeSrc(
+  src: string,
+  baseDir: string,
+  compiledDir?: string,
+): string {
+  const cleanSrc = fileUrlAsPath(cleanAssetUrl(src));
+
+  // A leading slash is an origin-root URL served from the project root, unless the absolute path exists.
+  if (isAbsolute(cleanSrc) && !namesAnotherNetworkRoot(baseDir, cleanSrc) && existsSync(cleanSrc)) {
+    return cleanSrc;
+  }
+
+  const candidates = new Set<string>();
+  for (const variant of decodeUrlPathVariants(cleanSrc)) {
+    for (const candidate of reanchoredCandidates(variant, baseDir, compiledDir)) {
+      candidates.add(candidate);
+    }
+    if (compiledDir) candidates.add(join(compiledDir, variant));
+    candidates.add(join(baseDir, variant));
+  }
+  return [...candidates].find(existsSync) ?? gitBashFile(cleanSrc) ?? join(baseDir, cleanSrc);
 }
 
 function maskRange(src: string, pattern: RegExp): string {
@@ -88,4 +286,41 @@ export function maskNonScannableRanges(html: string): string {
   out = maskRange(out, /<style\b[^>]*>[\s\S]*?<\/style\b[^>]*>/gi);
   out = maskRange(out, /<script\b[^>]*>[\s\S]*?<\/script\b[^>]*>/gi);
   return out;
+}
+
+export type ProjectFileRead =
+  | { kind: "file"; text: string }
+  | { kind: "folder" }
+  | { kind: "missing" };
+
+// A byte order mark names the encoding, as browsers read it: PowerShell 5.1 saves files as UTF-16LE with one.
+export function decodeTextHonoringBom(bytes: Buffer): string {
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return bytes.subarray(2).toString("utf16le");
+  if (bytes[0] === 0xfe && bytes[1] === 0xff)
+    return Buffer.from(bytes.subarray(2, bytes.length - (bytes.length % 2)))
+      .swap16()
+      .toString("utf16le");
+  return bytes.toString("utf-8").replace(/^\uFEFF/, "");
+}
+
+export const readTextFile = (path: string): string => decodeTextHonoringBom(readFileSync(path));
+
+/** Reads through one descriptor, so the file-type check and the read see the same file. */
+export function readProjectFile(path: string): ProjectFileRead {
+  let fd: number;
+  try {
+    // Non-blocking so a named pipe is reported, not waited on; the mode never applies (no O_CREAT).
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0), 0o600);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "";
+    if (["EISDIR", "ENXIO"].includes(code)) return { kind: "folder" };
+    if (["ENOENT", "ENOTDIR", "ELOOP", "ENAMETOOLONG"].includes(code)) return { kind: "missing" };
+    throw error;
+  }
+  try {
+    if (!fstatSync(fd).isFile()) return { kind: "folder" };
+    return { kind: "file", text: decodeTextHonoringBom(readFileSync(fd)) };
+  } finally {
+    closeSync(fd);
+  }
 }

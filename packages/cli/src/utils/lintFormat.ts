@@ -1,3 +1,4 @@
+import { terminalText } from "@hyperframes/core";
 import { c } from "../ui/colors.js";
 import type { ProjectLintResult } from "./lintProject.js";
 
@@ -39,11 +40,14 @@ export function formatLintFindings(
           : finding.severity === "warning"
             ? c.warn("⚠")
             : c.dim("ℹ");
-      const fileLabel = multiFile ? c.dim(`[${file}] `) : "";
+      const fileLabel = findingFileLabel(file, finding, multiFile);
       const loc =
-        showElementId && finding.elementId ? ` ${c.accent(`[${finding.elementId}]`)}` : "";
-      lines.push(`  ${prefix} ${fileLabel}${c.bold(finding.code)}${loc}: ${finding.message}`);
-      if (finding.fixHint) lines.push(`    ${c.dim(`Fix: ${finding.fixHint}`)}`);
+        showElementId && finding.elementId
+          ? ` ${c.accent(`[${terminalText(finding.elementId)}]`)}`
+          : "";
+      const message = terminalText(finding.message);
+      lines.push(`  ${prefix} ${fileLabel}${c.bold(finding.code)}${loc}: ${message}`);
+      if (finding.fixHint) lines.push(`    ${c.dim(`Fix: ${terminalText(finding.fixHint)}`)}`);
     };
 
     if (errorsFirst) {
@@ -58,10 +62,49 @@ export function formatLintFindings(
   if (showSummary) {
     const icon = totalErrors > 0 ? c.error("◇") : c.success("◇");
     lines.push("");
-    const summaryParts = [`${totalErrors} error(s)`, `${totalWarnings} warning(s)`];
-    if (verbose && totalInfos > 0) summaryParts.push(`${totalInfos} info(s)`);
-    lines.push(`${icon}  ${summaryParts.join(", ")}`);
+    lines.push(`${icon}  ${formatLintCounts(totalErrors, totalWarnings, totalInfos, verbose)}`);
   }
 
   return lines;
+}
+
+function formatLintCounts(
+  totalErrors: number,
+  totalWarnings: number,
+  totalInfos: number,
+  verbose: boolean,
+): string {
+  const parts = [`${totalErrors} error(s)`, `${totalWarnings} warning(s)`];
+  if (verbose && totalInfos > 0) parts.push(`${totalInfos} info(s)`);
+  return parts.join(", ");
+}
+
+/** Full findings in verbose mode, a one-line summary otherwise. `pointer` (summary
+ * mode) picks the hint: both name the lint command, "studio" also the Studio badge. --lint-verbose is
+ * not named: only render, preview and publish take it, and agents tried it on lint and check. */
+export type LintMessageMode =
+  | { kind: "verbose"; options?: LintFormatOptions }
+  | { kind: "summary"; pointer?: "cli" | "studio" };
+
+export function formatLintStartupMessage(
+  lintResult: ProjectLintResult,
+  mode: LintMessageMode,
+): string[] {
+  if (mode.kind === "verbose") return formatLintFindings(lintResult, mode.options);
+  const counts = formatLintCounts(lintResult.totalErrors, lintResult.totalWarnings, 0, false);
+  const hint =
+    mode.pointer === "studio"
+      ? "see the Lint badge in Studio, or run `hyperframes lint` for full output"
+      : "run `hyperframes lint` for full output";
+  return [`  Lint: ${counts} — ${hint}.`];
+}
+
+function findingFileLabel(
+  file: string,
+  finding: import("@hyperframes/lint").HyperframeLintFinding,
+  multiFile: boolean,
+): string {
+  if (finding.line === undefined) return multiFile ? c.dim(`[${terminalText(file)}] `) : "";
+  const column = finding.column === undefined ? "" : `:${finding.column}`;
+  return c.dim(`[${terminalText(finding.file ?? file)}:${finding.line}${column}] `);
 }

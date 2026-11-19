@@ -7,6 +7,7 @@ export type HyperframePickerBoundingBox = {
 
 export type HyperframePickerElementInfo = {
   id: string | null;
+  className?: string | null;
   tagName: string;
   selector: string;
   label: string;
@@ -37,6 +38,7 @@ export type HyperframePickerApi = {
     clientY: number,
     indexes?: number[],
   ) => HyperframePickerElementInfo[];
+  describe?: (element: Element) => HyperframePickerElementInfo | null;
 };
 
 declare global {

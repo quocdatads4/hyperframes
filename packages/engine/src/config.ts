@@ -7,6 +7,8 @@
  */
 
 import { tmpdir } from "node:os";
+import { DISTRIBUTED_FPS, type DistributedFps } from "@hyperframes/core/distributed-fps";
+import { chromeMajorCeiling } from "./services/chromeHostCeiling.js";
 import { join } from "node:path";
 import {
   getSystemTotalMb,
@@ -22,7 +24,7 @@ import { DEFAULT_VP9_CPU_USED, normalizeVp9CpuUsed } from "./services/vp9Options
  */
 export interface EngineConfig {
   // ── Rendering ────────────────────────────────────────────────────────
-  fps: 24 | 30 | 60;
+  fps: DistributedFps;
   quality: "draft" | "standard" | "high";
   format: "jpeg" | "png";
   jpegQuality: number;
@@ -50,6 +52,11 @@ export interface EngineConfig {
    *   Cost: one extra Chrome launch (~1-2 s) per process; result cached.
    */
   browserGpuMode: "software" | "hardware" | "auto";
+  /**
+   * Render a `data-requires-webgpu` composition on SwiftShader when no GPU is in use, instead of refusing it.
+   * Off by default: software WebGPU is slow and skips the compositor workaround for HF#3049.
+   */
+  allowSoftwareWebGpu: boolean;
   enableBrowserPool: boolean;
   browserTimeout: number;
   protocolTimeout: number;
@@ -63,11 +70,13 @@ export interface EngineConfig {
    * `HF_STATIC_DEDUP` in {false,0,off}. Only arms in screenshot capture mode.
    */
   staticFrameDedup: boolean;
+  /** Opt-in `HF_VIDEO_LAYER_PASSTHROUGH`: ffmpeg composites a full-canvas source video under the page capture. */
+  videoLayerPassthrough: boolean;
   /**
    * Use drawElementImage for frame capture (requires the CanvasDrawElement
    * Chrome flag, added globally in buildChromeArgs). Default ON, clamped in
-   * `resolveConfig` to hosts where it can actually engage (macOS + hardware-GPU
-   * browser); compile/init gates and the runtime self-verification net route
+   * `resolveConfig` to hosts where it can actually engage (macOS or Windows +
+   * hardware-GPU browser); compile/init gates and the runtime self-verification net route
    * incompatible or damaged renders back to screenshot capture.
    * Kill switch: `PRODUCER_EXPERIMENTAL_FAST_CAPTURE=false` (or the CLI
    * `--experimental-fast-capture=false`).
@@ -81,6 +90,7 @@ export interface EngineConfig {
    * true. Kill switch: `HF_DE_WORKER_ENCODE=false`.
    */
   enableDrawElementWorkerEncode: boolean;
+  useInPageEncode: boolean;
   /**
    * INTERNAL. Set by resolveConfig when it disabled enablePageSideCompositing
    * solely because drawElement was on. Lets the producer's compile-time gates
@@ -101,6 +111,8 @@ export interface EngineConfig {
    * the runtime probe fires). Not intended to be set by callers.
    */
   forceScreenshotExplicitlyOptedOut?: boolean;
+  /** How long a BeginFrame capture may take to draw its first frame before the render retries by screenshot. */
+  beginFrameFirstFrameDeadlineMs?: number;
   /**
    * Low-memory render profile. When `true`, the orchestrator collapses the
    * pipeline to its cheapest shape on memory-constrained hosts: it skips the
@@ -160,16 +172,25 @@ export interface EngineConfig {
    */
   streamingEncodeAutoDisabledOnWin32Compound?: boolean;
   /**
-   * Max composition duration eligible for streaming encode (seconds).
-   * Mirrors GSAP rendering's 4-minute streaming guard: production has seen
-   * ffmpeg's streaming pipe hit FFMPEG_STREAMING_TIMEOUT_MS on longer videos.
+   * Max composition duration eligible for streaming encode (seconds). Only
+   * applied when `streamingEncodeDurationCapEnabled` is true. Historical: the
+   * 240 s default (#579) guarded a total-render ffmpeg timeout that became an
+   * inactivity timeout in efc16a945, so the cap is off by default. Because of
+   * that, `PRODUCER_STREAMING_ENCODE_MAX_DURATION_SECONDS=0` no longer
+   * disables streaming on its own; `PRODUCER_ENABLE_STREAMING_ENCODE=false`
+   * is the supported off switch.
    */
   streamingEncodeMaxDurationSeconds: number;
+  /**
+   * Apply `streamingEncodeMaxDurationSeconds`. Default false: long single-worker
+   * renders stream. Env: PRODUCER_STREAMING_ENCODE_DURATION_CAP_ENABLED.
+   */
+  streamingEncodeDurationCapEnabled: boolean;
 
   // ── FFmpeg timeouts ──────────────────────────────────────────────────
-  /** Timeout for FFmpeg frame encoding (ms). Default: 600_000 */
+  /** How long a disk-frame encode may go without a new frame before it is stopped (ms). Default: 600_000 */
   ffmpegEncodeTimeout: number;
-  /** Timeout for FFmpeg mux/faststart processes (ms). Default: 300_000 */
+  /** How long any other FFmpeg step (audio, mux, extraction) may go without progress (ms). Default: 300_000 */
   ffmpegProcessTimeout: number;
   /**
    * Inactivity timeout for FFmpeg streaming encode (ms). The timer resets on
@@ -277,13 +298,16 @@ export const DEFAULT_CONFIG: EngineConfig = {
 
   disableGpu: false,
   browserGpuMode: "software",
+  allowSoftwareWebGpu: false,
   enableBrowserPool: true,
   browserTimeout: 120_000,
   protocolTimeout: 300_000,
   forceScreenshot: false,
   staticFrameDedup: true,
+  videoLayerPassthrough: false,
   useDrawElement: true,
   enableDrawElementWorkerEncode: true,
+  useInPageEncode: false,
   // Auto-detected per host in `resolveConfig`; defaults off for the raw
   // DEFAULT_CONFIG (used directly by tests and worker-sizing fallbacks).
   lowMemoryMode: false,
@@ -294,6 +318,7 @@ export const DEFAULT_CONFIG: EngineConfig = {
   chunkSizeFrames: 360,
   enableStreamingEncode: true,
   streamingEncodeMaxDurationSeconds: 240,
+  streamingEncodeDurationCapEnabled: false,
 
   ffmpegEncodeTimeout: 600_000,
   ffmpegProcessTimeout: 300_000,
@@ -322,6 +347,7 @@ const OPTIONAL_ENGINE_CONFIG_FIELDS = [
   "expectedChromiumMajor",
   "pageSideCompositingAutoDisabled",
   "forceScreenshotExplicitlyOptedOut",
+  "beginFrameFirstFrameDeadlineMs",
   "streamingEncodeAutoDisabledOnWin32Compound",
   "runtimeManifestPath",
   "extractCacheDir",
@@ -329,15 +355,19 @@ const OPTIONAL_ENGINE_CONFIG_FIELDS = [
 
 const BOOLEAN_ENGINE_CONFIG_FIELDS = [
   "disableGpu",
+  "allowSoftwareWebGpu",
   "enableBrowserPool",
   "forceScreenshot",
   "staticFrameDedup",
+  "videoLayerPassthrough",
   "useDrawElement",
   "enableDrawElementWorkerEncode",
+  "useInPageEncode",
   "lowMemoryMode",
   "enablePageSideCompositing",
   "enableChunkedEncode",
   "enableStreamingEncode",
+  "streamingEncodeDurationCapEnabled",
   "hdrAutoDetect",
   "verifyRuntime",
   "debug",
@@ -359,7 +389,7 @@ const POSITIVE_NUMBER_ENGINE_CONFIG_FIELDS = [
 ] as const;
 
 const ENUM_ENGINE_CONFIG_FIELDS = {
-  fps: [24, 30, 60],
+  fps: DISTRIBUTED_FPS,
   quality: ["draft", "standard", "high"],
   format: ["jpeg", "png"],
   browserGpuMode: ["software", "hardware", "auto"],
@@ -429,6 +459,9 @@ function validateEngineConfigScalars(config: Record<string, unknown>): void {
   assertEngineConfigNumber(config, "jpegQuality", 0);
   if (typeof config.jpegQuality === "number" && config.jpegQuality > 100) {
     throw new Error("Engine config jpegQuality must be <= 100");
+  }
+  if (config.beginFrameFirstFrameDeadlineMs !== undefined) {
+    assertEngineConfigNumber(config, "beginFrameFirstFrameDeadlineMs", 1, true);
   }
 }
 
@@ -708,6 +741,108 @@ function memoryAdaptiveCacheBytesMb(): number {
  * Env vars provide backward compatibility during migration; explicit config
  * takes precedence over everything.
  */
+/**
+ * Platforms where default-on drawElement may engage: macOS (Metal-ANGLE,
+ * the original validated envelope) and Windows (D3D11-ANGLE, opened
+ * 2026-07-27 — see the clamp comment above resolveDefaultDrawElement's call
+ * site). Linux is excluded: that fleet is headless/Docker SwiftShader.
+ * Internal — the exported `resolveDefaultDrawElement` is the tested surface.
+ */
+function isDrawElementPlatform(platform: NodeJS.Platform): boolean {
+  return platform === "darwin" || platform === "win32";
+}
+
+/**
+ * Default-on drawElement host clamp. An explicit opt-in always wins (attempt
+ * DE, let the init-time gates route away — debugging relies on it). Otherwise
+ * DE stays on only where it can actually engage — a supported platform with a
+ * non-software-GPU browser — AND with worker-encode enabled: the runtime
+ * self-verification net lives in the worker-encode drain (the serial path has
+ * only the blank guard), so a default-on session without it would ship
+ * unverified drawElement frames. Pure; exported for tests.
+ */
+export function resolveDefaultDrawElement(args: {
+  useDrawElement: boolean;
+  explicitOptIn: boolean;
+  platform: NodeJS.Platform;
+  browserGpuMode: EngineConfig["browserGpuMode"];
+  workerEncode: boolean;
+  /** Set on hosts that cannot run Chrome 151+; Chrome <=150 damages video and stacked fades. */
+  chromeCeiling?: number;
+}): boolean {
+  if (!args.useDrawElement) return false;
+  if (args.explicitOptIn) return true;
+  if (args.chromeCeiling !== undefined) return false;
+  if (!isDrawElementPlatform(args.platform) || args.browserGpuMode === "software") return false;
+  return args.workerEncode;
+}
+
+/**
+ * Why {@link resolveDefaultDrawElement} said no. Call ONLY when the resolved
+ * `useDrawElement` is false — the branches mirror that resolver's, in order.
+ *
+ * Every branch there returns a bare `false` and records nothing, so a render
+ * that never became a drawElement candidate reaches telemetry with no
+ * `de_compile_gate`, no `de_clamp_reason` and no `de_gate_reason`. Those land
+ * in the "Why not drawElement" dashboard's catch-all `other` bucket, which
+ * measured 56,507 renders over 14 days — its second-largest bar, explaining
+ * nothing. The orchestrator's own clamp only fires while `useDrawElement` is
+ * still true, so it cannot cover a config-time refusal by construction.
+ *
+ * Takes only the environmental inputs on purpose: the caller holds the
+ * POST-resolution `useDrawElement`, from which the pre-resolution request is
+ * no longer recoverable. So "none of these three explain it" is itself the
+ * answer — the feature was switched off explicitly.
+ *
+ * Kept separate from the resolver rather than widening its return type: it sits
+ * on the config hot path and several call sites want a plain boolean. Mirror
+ * any branch change in both.
+ */
+export function explainDrawElementDisabled(args: {
+  platform: NodeJS.Platform;
+  browserGpuMode: EngineConfig["browserGpuMode"];
+  workerEncode: boolean;
+  chromeCeiling?: number;
+}): "unsupported_platform" | "old_chrome" | "software_gpu" | "worker_encode_off" | "disabled" {
+  // Platform first: on an unsupported host the GPU mode is beside the point.
+  if (!isDrawElementPlatform(args.platform)) return "unsupported_platform";
+  if (args.chromeCeiling !== undefined) return "old_chrome";
+  if (args.browserGpuMode === "software") return "software_gpu";
+  if (!args.workerEncode) return "worker_encode_off";
+  return "disabled";
+}
+
+/** `pageNavigationTimeout` alone, for callers that need the page-load budget without the rest of the config. */
+export function resolvePageNavigationTimeout(): number {
+  const raw = process.env.PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS;
+  const parsed = raw === undefined || raw === "" ? NaN : Number(raw);
+  return Number.isFinite(parsed) ? parsed : DEFAULT_CONFIG.pageNavigationTimeout;
+}
+
+const RESTRICT_PAGE_NETWORK_ON = new Set(["true", "1", "yes", "on"]);
+const RESTRICT_PAGE_NETWORK_OFF = new Set(["false", "0", "no", "off"]);
+let warnedRestrictPageNetworkValue: string | undefined;
+
+/**
+ * `PRODUCER_RESTRICT_PAGE_NETWORK=true`: the render page may reach only its own server and public addresses.
+ * Unset or blank is off. `true`, `1`, `yes` and `on` turn it on and `false`, `0`, `no` and `off` turn it off,
+ * in any letter case and with surrounding whitespace. Any other value restricts and logs a warning once.
+ * A property of the host (a shared render service), not of one render, so it stays out of EngineConfig snapshots.
+ */
+export function resolveRestrictPageNetwork(): boolean {
+  const raw = process.env.PRODUCER_RESTRICT_PAGE_NETWORK ?? "";
+  const value = raw.trim().toLowerCase();
+  if (value === "" || RESTRICT_PAGE_NETWORK_OFF.has(value)) return false;
+  if (RESTRICT_PAGE_NETWORK_ON.has(value)) return true;
+  if (warnedRestrictPageNetworkValue !== raw) {
+    warnedRestrictPageNetworkValue = raw;
+    console.warn(
+      `[hyperframes] PRODUCER_RESTRICT_PAGE_NETWORK=${JSON.stringify(raw)} is neither true nor false; the render network stays restricted.`,
+    );
+  }
+  return true;
+}
+
 export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
   const env = (key: string): string | undefined => process.env[key];
   const envNum = (key: string, fallback: number): number => {
@@ -754,9 +889,12 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
       DEFAULT_CONFIG.largeRenderThreshold,
     ),
 
-    chromePath: env("PRODUCER_HEADLESS_SHELL_PATH"),
     disableGpu: envBool("PRODUCER_DISABLE_GPU", DEFAULT_CONFIG.disableGpu),
     browserGpuMode: envBrowserGpuMode(),
+    allowSoftwareWebGpu: envBool(
+      "PRODUCER_ALLOW_SOFTWARE_WEBGPU",
+      DEFAULT_CONFIG.allowSoftwareWebGpu,
+    ),
     enableBrowserPool: envBool("PRODUCER_ENABLE_BROWSER_POOL", DEFAULT_CONFIG.enableBrowserPool),
     browserTimeout: envNum("PRODUCER_PUPPETEER_LAUNCH_TIMEOUT_MS", DEFAULT_CONFIG.browserTimeout),
     protocolTimeout: envNum(
@@ -769,11 +907,16 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
 
     forceScreenshot: envBool("PRODUCER_FORCE_SCREENSHOT", DEFAULT_CONFIG.forceScreenshot),
     staticFrameDedup: resolveStaticFrameDedup(),
+    videoLayerPassthrough: envBool(
+      "HF_VIDEO_LAYER_PASSTHROUGH",
+      DEFAULT_CONFIG.videoLayerPassthrough,
+    ),
     useDrawElement: envBool("PRODUCER_EXPERIMENTAL_FAST_CAPTURE", DEFAULT_CONFIG.useDrawElement),
     enableDrawElementWorkerEncode: envBool(
       "HF_DE_WORKER_ENCODE",
       DEFAULT_CONFIG.enableDrawElementWorkerEncode,
     ),
+    useInPageEncode: envBool("HF_INPAGE_ENCODE", DEFAULT_CONFIG.useInPageEncode),
     lowMemoryMode: resolveLowMemoryMode(),
     enablePageSideCompositing: envBool(
       "HF_PAGE_SIDE_COMPOSITING",
@@ -799,6 +942,10 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
         "PRODUCER_STREAMING_ENCODE_MAX_DURATION_SECONDS",
         DEFAULT_CONFIG.streamingEncodeMaxDurationSeconds,
       ),
+    ),
+    streamingEncodeDurationCapEnabled: envBool(
+      "PRODUCER_STREAMING_ENCODE_DURATION_CAP_ENABLED",
+      DEFAULT_CONFIG.streamingEncodeDurationCapEnabled,
     ),
 
     ffmpegEncodeTimeout: envNum("FFMPEG_ENCODE_TIMEOUT_MS", DEFAULT_CONFIG.ffmpegEncodeTimeout),
@@ -833,10 +980,7 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
       "PRODUCER_RENDER_READY_TIMEOUT_MS",
       DEFAULT_CONFIG.renderReadyTimeout,
     ),
-    pageNavigationTimeout: envNum(
-      "PRODUCER_PAGE_NAVIGATION_TIMEOUT_MS",
-      DEFAULT_CONFIG.pageNavigationTimeout,
-    ),
+    pageNavigationTimeout: resolvePageNavigationTimeout(),
 
     verifyRuntime: env("PRODUCER_VERIFY_HYPERFRAME_RUNTIME") !== "false",
     runtimeManifestPath: env("PRODUCER_HYPERFRAME_MANIFEST_PATH"),
@@ -857,38 +1001,46 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
   };
 
   // Default-on drawElement is clamped to hosts where it can actually engage
-  // (macOS with a non-software-GPU browser; SwiftShader drops transparent
-  // sub-layers — crbug 521434899). "auto" passes the clamp: the stock CLI
-  // resolves GPU mode to auto, which probes to hardware on real Macs — and if
-  // it resolves to software after all, the SwiftShader init-time gate still
-  // routes the session to the screenshot baseline. Without the clamp, the
-  // default would needlessly disable page-side shader compositing (below) on
-  // Linux/Docker hosts where DE never runs. An EXPLICIT opt-in (env or caller override)
-  // skips the clamp and keeps the old semantics — attempt DE, let the
-  // init-time gates route away — which debugging relies on.
+  // (macOS or Windows with a non-software-GPU browser; SwiftShader drops
+  // transparent sub-layers — crbug 521434899). "auto" passes the clamp: the
+  // stock CLI resolves GPU mode to auto, which probes to hardware on real
+  // Macs/PCs — and if it resolves to software after all, the SwiftShader
+  // init-time gate still routes the session to the screenshot baseline.
+  // Without the clamp, the default would needlessly disable page-side shader
+  // compositing (below) on Linux/Docker hosts where DE never runs. An
+  // EXPLICIT opt-in (env or caller override) skips the clamp and keeps the
+  // old semantics — attempt DE, let the init-time gates route away — which
+  // debugging relies on.
+  //
+  // win32 opened 2026-07-27: telemetry showed ~206k non-CI hardware-GPU
+  // Windows renders / 30d (~78% of the win32 fleet) held on the slow
+  // screenshot path by the darwin-only clamp — the second-largest perf
+  // population after macOS. The mechanism is platform-neutral (the Chrome
+  // flag ships everywhere); darwin-only was a validation envelope, not an
+  // architectural limit. Opening it rides the same per-render safety
+  // contract macOS shipped with in v0.7.38: compile/init gates +
+  // worker-encode self-verify + screenshot fallback catch damage per
+  // render, and `gpu_renderer` telemetry (captured at DE session init)
+  // segments the D3D11/ANGLE cohort by GPU vendor so backend-specific
+  // damage clusters are attributable. Kill switches unchanged
+  // (PRODUCER_EXPERIMENTAL_FAST_CAPTURE=false; per-render --workers).
+  // Linux stays excluded: the fleet there is headless/Docker SwiftShader.
   const explicitDrawElementOptIn =
     env("PRODUCER_EXPERIMENTAL_FAST_CAPTURE") === "true" || overrides?.useDrawElement === true;
-  if (
-    merged.useDrawElement &&
-    !explicitDrawElementOptIn &&
-    !(process.platform === "darwin" && merged.browserGpuMode !== "software")
-  ) {
-    merged.useDrawElement = false;
-  }
-  // The runtime self-verification net lives in the worker-encode drain — the
-  // serial drawElement path has only the blank guard. Default-on drawElement
-  // therefore requires worker-encode; disabling HF_DE_WORKER_ENCODE without an
-  // explicit drawElement opt-in falls back to the screenshot baseline rather
-  // than shipping unverified drawElement frames.
-  if (merged.useDrawElement && !explicitDrawElementOptIn && !merged.enableDrawElementWorkerEncode) {
-    merged.useDrawElement = false;
-  }
+  merged.useDrawElement = resolveDefaultDrawElement({
+    useDrawElement: merged.useDrawElement,
+    explicitOptIn: explicitDrawElementOptIn,
+    platform: process.platform,
+    browserGpuMode: merged.browserGpuMode,
+    workerEncode: merged.enableDrawElementWorkerEncode,
+    chromeCeiling: chromeMajorCeiling(),
+  });
 
   // Software GPU implies screenshot capture.
   //
   // Two existing platform gates already do most of the work: `browserManager`
   // only launches BeginFrame on Linux + chrome-headless-shell + !forceScreenshot,
-  // and the DE clamp above turns off `useDrawElement` on non-(darwin +
+  // and the DE clamp above turns off `useDrawElement` on non-((darwin|win32) +
   // non-software) hosts. Setting `forceScreenshot` here layers defense-in-depth
   // on top:
   //
@@ -965,7 +1117,7 @@ export function resolveConfig(overrides?: Partial<EngineConfig>): EngineConfig {
     merged.enableStreamingEncode = false;
     merged.streamingEncodeAutoDisabledOnWin32Compound = true;
     console.error(
-      "[hyperframes] Windows compound-workaround auto-detected — disabling streaming-encode " +
+      "[hyperframes] Windows compound-workaround auto-detected, disabling streaming-encode " +
         "(platform=win32, software-GPU forced, workers=1). Field signal ts=1784131903. " +
         "Override: PRODUCER_ENABLE_STREAMING_ENCODE=true.",
     );

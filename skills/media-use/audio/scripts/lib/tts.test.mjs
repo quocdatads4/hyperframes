@@ -1,6 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, chmodSync, rmSync, existsSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+  chmodSync,
+  rmSync,
+  existsSync,
+} from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -9,6 +17,9 @@ import {
   synthesizeOne,
   synthesizeHeygen,
   synthResult,
+  pickProvider,
+  transcribeWav,
+  _resetNpxResolutionWarnForTests,
 } from "./tts.mjs";
 
 test("parseFfmpegDurationBanner reads ffmpeg's stderr Duration line", () => {
@@ -154,4 +165,116 @@ test("synthResult names a non-zero subprocess exit", () => {
   const res = synthResult({ status: 2 }, "/tmp/none.wav", "kokoro (npx hyperframes tts)");
   assert.equal(res.ok, false);
   assert.match(res.error, /kokoro .* exited with status 2/);
+});
+
+// Kokoro runs `hyperframes tts` through the CLI its caller hands over in HYPERFRAMES_CLI_ENTRY; a
+// fake entry records the argv synthesizeOne really builds, so a dropped flag fails here.
+async function kokoroArgv(options) {
+  const dir = mkdtempSync(join(tmpdir(), "tts-kokoro-argv-"));
+  const argvLog = join(dir, "argv.txt");
+  const cli = join(dir, "cli.mjs");
+  writeFileSync(
+    cli,
+    `import { writeFileSync } from "node:fs";\n` +
+      `writeFileSync(${JSON.stringify(argvLog)}, process.argv.slice(2).join("\\n"));\n`,
+  );
+  const originalEntry = process.env.HYPERFRAMES_CLI_ENTRY;
+  try {
+    process.env.HYPERFRAMES_CLI_ENTRY = cli;
+    await synthesizeOne({
+      provider: "kokoro",
+      text: "hi",
+      voiceId: "am_michael",
+      wavAbs: join(dir, "line-0.wav"),
+      hyperframesDir: dir,
+      ...options,
+    });
+    return readFileSync(argvLog, "utf8").trim().split("\n");
+  } finally {
+    if (originalEntry === undefined) delete process.env.HYPERFRAMES_CLI_ENTRY;
+    else process.env.HYPERFRAMES_CLI_ENTRY = originalEntry;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("synthesizeOne(kokoro) forwards a non-default speed to the CLI", async () => {
+  const argv = await kokoroArgv({ speed: 0.8, lang: "es" });
+  assert.equal(argv[0], "tts");
+  assert.deepEqual(argv.slice(-4), ["--lang", "es", "--speed", "0.8"]);
+});
+
+test("synthesizeOne(kokoro) leaves --speed off at the default", async () => {
+  assert.ok(!(await kokoroArgv({})).includes("--speed"));
+});
+
+test(
+  "kokoro and transcription without a handed-over CLI fail with the fix, never npx",
+  { skip: process.platform === "win32" },
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tts-kokoro-no-cli-"));
+    const marker = join(dir, "npx-ran");
+    writeFileSync(join(dir, "npx"), `#!/bin/sh\ntouch "${marker}"\n`);
+    chmodSync(join(dir, "npx"), 0o755);
+    const saved = { PATH: process.env.PATH, entry: process.env.HYPERFRAMES_CLI_ENTRY };
+    const originalError = console.error;
+    const errors = [];
+    try {
+      process.env.PATH = dir;
+      delete process.env.HYPERFRAMES_CLI_ENTRY;
+      console.error = (message) => errors.push(String(message));
+      _resetNpxResolutionWarnForTests();
+      const res = await synthesizeOne({
+        provider: "kokoro",
+        text: "hi",
+        voiceId: "am_michael",
+        wavAbs: join(dir, "line-0.wav"),
+        hyperframesDir: dir,
+      });
+      assert.equal(res.ok, false);
+      assert.match(res.error, /HYPERFRAMES_CLI_ENTRY/);
+      assert.equal(await transcribeWav({ wavRel: "line-0.wav", hyperframesDir: dir }), null);
+      assert.equal(existsSync(marker), false);
+      assert.equal(errors.length, 1);
+    } finally {
+      console.error = originalError;
+      process.env.PATH = saved.PATH;
+      if (saved.entry !== undefined) process.env.HYPERFRAMES_CLI_ENTRY = saved.entry;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test("pickProvider heygen with an unreadable credentials path says to fix that path", () => {
+  const saved = ["HEYGEN_API_KEY", "HYPERFRAMES_API_KEY", "HYPERFRAMES_CONFIG_DIR"].map((k) => [
+    k,
+    process.env[k],
+  ]);
+  const dir = mkdtempSync(join(tmpdir(), "tts-cred-"));
+  try {
+    delete process.env.HEYGEN_API_KEY;
+    delete process.env.HYPERFRAMES_API_KEY;
+    process.env.HYPERFRAMES_CONFIG_DIR = dir;
+    mkdirSync(join(dir, "credentials"));
+    assert.throws(() => pickProvider("heygen"), /fix or remove that path/);
+  } finally {
+    for (const [k, v] of saved) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("synthesizeHeygen refuses under a credit limit before any request", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hf-tts-limit-"));
+  mkdirSync(join(dir, ".hyperframes"));
+  writeFileSync(join(dir, ".hyperframes", "credit-limit.json"), '{"credits": 5}');
+  let asked = false;
+  const r = await synthesizeHeygen(
+    { text: "hi", voiceId: "v", lang: "en", speed: 1, wavAbs: join(dir, "a.wav") },
+    { projectDir: dir, heygenJSON: async () => ((asked = true), {}) },
+  );
+  assert.equal(r.ok, false);
+  assert.match(r.error, /credit limit of 5/);
+  assert.equal(asked, false);
 });

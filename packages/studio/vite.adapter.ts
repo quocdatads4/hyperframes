@@ -1,3 +1,4 @@
+import { isValidProjectId } from "./src/utils/projectRouting";
 // Vite adapter that wires the shared Studio API to the local filesystem and build tools.
 
 import {
@@ -6,11 +7,9 @@ import {
   existsSync,
   writeFileSync,
   realpathSync,
-  mkdirSync,
-  copyFileSync,
   unlinkSync,
 } from "node:fs";
-import { join, relative, resolve, isAbsolute, dirname } from "node:path";
+import { basename, join, relative, resolve, isAbsolute, sep } from "node:path";
 import type { ViteDevServer } from "vite";
 import {
   type ResolvedProject,
@@ -19,17 +18,27 @@ import {
   type BackgroundRemovalRender,
   createBackgroundRemovalJob,
   createProjectSignature,
+  affectsProjectSignature,
+  PREVIEW_BUNDLE_OPTIONS,
+  DEFAULT_HISTORY_ROOT,
+  openProjectHistory,
+  historyCache,
+  originForListeningAddress,
 } from "@hyperframes/studio-server";
+import { encoderJobOptions } from "@hyperframes/studio-server/encoder-options";
 import type { RegistryItem } from "@hyperframes/core/registry";
+import type { BundleOptions } from "@hyperframes/core/compiler";
 import { createRetryingModuleLoader, ensureProducerDist } from "./vite.producer";
 import { createStudioDevRenderBodyScripts } from "./vite.studioMotion";
 import { generateThumbnail, findSystemChrome } from "./vite.browser";
 
-export function isPathWithin(parentDir: string, childPath: string): boolean {
+function isPathWithin(parentDir: string, childPath: string): boolean {
   const childRelativePath = relative(resolve(parentDir), resolve(childPath));
   return (
     childRelativePath === "" ||
-    (!childRelativePath.startsWith("..") && !isAbsolute(childRelativePath))
+    (childRelativePath !== ".." &&
+      !childRelativePath.startsWith(`..${sep}`) &&
+      !isAbsolute(childRelativePath))
   );
 }
 
@@ -37,13 +46,93 @@ export function resolveViteAutoProxy(value: string | undefined): boolean {
   return value !== "false";
 }
 
-export function createViteAdapter(dataDir: string, server: ViteDevServer): StudioApiAdapter {
-  let _bundler:
-    | ((
-        dir: string,
-        options?: { runtime?: "inline" | "placeholder"; inlineColorGradingLuts?: boolean },
-      ) => Promise<string>)
-    | null = null;
+/**
+ * The preview ETag's cache, and the one thing allowed to clear it.
+ *
+ * The signature walks the whole project directory, so it is memoised per project
+ * directory. (The content hash underneath is already gated behind a stat-only
+ * fingerprint, so what this memo saves is the walk, not the hashing — worth
+ * knowing before deciding how aggressive invalidation is allowed to be.)
+ * Getting the invalidation wrong is not a
+ * performance bug: the preview answers a revalidation with 304 and the browser
+ * keeps serving the pre-edit composition, which is how a thumbnail regenerated
+ * after an edit can still show the old frame.
+ *
+ * `watch` is called the first time a project dir is seen, so whoever owns the
+ * watcher can start following it. It must be a watcher that actually sees
+ * project writes: Vite's own is configured to ignore them.
+ */
+export interface ProjectSignatureCache {
+  get(projectDir: string): string;
+  /** Drop the signature of whichever project contains `changedPath`. */
+  invalidate(changedPath: string): void;
+  forget(projectDir: string): void;
+}
+
+export function createProjectSignatureCache({
+  compute = createProjectSignature,
+  watch,
+}: {
+  compute?: (projectDir: string) => string;
+  watch?: (projectDir: string) => void;
+} = {}): ProjectSignatureCache {
+  const signatures = new Map<string, string>();
+  const watched = new Set<string>();
+  return {
+    get(projectDir) {
+      const key = resolve(projectDir);
+      const cached = signatures.get(key);
+      if (cached !== undefined) return cached;
+      if (!watched.has(key)) {
+        watched.add(key);
+        watch?.(key);
+      }
+      const signature = compute(key);
+      signatures.set(key, signature);
+      return signature;
+    },
+    invalidate(changedPath) {
+      // Filtered here rather than at the watcher so no caller can wire up a
+      // subscription that forgets to: the cache owns what can change its value.
+      for (const projectDir of signatures.keys()) {
+        if (affectsProjectSignature(projectDir, changedPath)) signatures.delete(projectDir);
+      }
+    },
+    forget(projectDir) {
+      signatures.delete(resolve(projectDir));
+    },
+  };
+}
+
+const isServableProjectId = (id: string) =>
+  isValidProjectId(id) && !(process.platform === "win32" && id.includes(":"));
+
+export function createViteAdapter(
+  dataDir: string,
+  server: ViteDevServer,
+  signatureCache: ProjectSignatureCache,
+  {
+    historyRoot = DEFAULT_HISTORY_ROOT,
+    openHistory = openProjectHistory,
+    onResolveProject,
+  }: {
+    historyRoot?: string;
+    openHistory?: typeof openProjectHistory;
+    onResolveProject?: (project: ResolvedProject) => void;
+  } = {},
+): StudioApiAdapter {
+  const histories = historyCache((projectDir) =>
+    openHistory({ projectDir, historyRoot }).catch((error: unknown) => {
+      console.warn(`[studio] Project history is off for ${basename(projectDir)}: ${String(error)}`);
+      // By name: the dev server's engine is its own module copy, so its error class is not this import's.
+      if (error instanceof Error && error.name === "HistoryClosedError")
+        histories.forget(projectDir);
+      return null;
+    }),
+  );
+  // Commits any open edit when the dev server stops, so it keeps its label.
+  server.httpServer?.on("close", () => void histories.closeAll());
+  let _bundler: ((dir: string, options?: BundleOptions) => Promise<string>) | null = null;
   let _producerModuleLoader:
     | (() => Promise<{
         createRenderJob: (config: {
@@ -63,13 +152,6 @@ export function createViteAdapter(dataDir: string, server: ViteDevServer): Studi
       }>)
     | null = null;
 
-  const projectSignatureCache = new Map<string, string>();
-  server.watcher.on("all", (_event, file) => {
-    for (const projectDir of projectSignatureCache.keys()) {
-      if (isPathWithin(projectDir, file)) projectSignatureCache.delete(projectDir);
-    }
-  });
-
   const getBundler = async () => {
     if (!_bundler) {
       try {
@@ -81,6 +163,19 @@ export function createViteAdapter(dataDir: string, server: ViteDevServer): Studi
       }
     }
     return _bundler;
+  };
+
+  // The CLI's received-project rule, loaded from source: this adapter only runs in a source checkout.
+  const outsideAssetsAllowed = async (projectDir: string, entryFile: string | undefined) => {
+    const mod = await server.ssrLoadModule(
+      resolve(__dirname, "../cli/src/utils/receivedRender.ts"),
+    );
+    const decide: unknown = mod.outsideAssetsAllowed;
+    if (typeof decide !== "function")
+      throw new Error("receivedRender.ts has no outsideAssetsAllowed");
+    return (
+      decide(projectDir, entryFile, (line: string) => console.warn(`[studio] ${line}`)) === true
+    );
   };
 
   const getProducerModule = async () => {
@@ -131,6 +226,7 @@ export function createViteAdapter(dataDir: string, server: ViteDevServer): Studi
       return readdirSync(dataDir, { withFileTypes: true })
         .filter(
           (d) =>
+            isServableProjectId(d.name) &&
             (d.isDirectory() || d.isSymbolicLink()) &&
             (existsSync(join(dataDir, d.name, "index.html")) ||
               existsSync(join(dataDir, d.name, `${d.name}.html`))),
@@ -147,23 +243,35 @@ export function createViteAdapter(dataDir: string, server: ViteDevServer): Studi
         .sort((a, b) => (a.title ?? "").localeCompare(b.title ?? ""));
     },
 
+    // Studio's undo runs on the project's history: opened once per project; a failed open stays off unless the folder
+    // changed while it opened.
+    history(project: ResolvedProject) {
+      return histories.get(project.dir);
+    },
+
     // fallow-ignore-next-line complexity
     resolveProject(id: string) {
-      let projectDir = join(dataDir, id);
+      if (!isServableProjectId(id)) return null;
+      let projectDir = resolve(dataDir, id);
+      if (!isPathWithin(dataDir, projectDir)) return null;
       if (!existsSync(projectDir)) {
         const sessionsDir = resolve(dataDir, "../sessions");
-        const sessionFile = join(sessionsDir, `${id}.json`);
+        const sessionFile = resolve(sessionsDir, `${id}.json`);
+        if (!isPathWithin(sessionsDir, sessionFile)) return null;
         if (existsSync(sessionFile)) {
           try {
             const session = JSON.parse(readFileSync(sessionFile, "utf-8"));
-            if (session.projectId) {
-              projectDir = join(dataDir, session.projectId);
+            if (typeof session.projectId === "string" && isServableProjectId(session.projectId)) {
+              projectDir = resolve(dataDir, session.projectId);
+              if (!isPathWithin(dataDir, projectDir)) return null;
               if (existsSync(projectDir)) {
-                return {
+                const project = {
                   id: session.projectId,
                   dir: realpathSync(projectDir),
                   title: session.title,
                 };
+                onResolveProject?.(project);
+                return project;
               }
             }
           } catch {
@@ -172,13 +280,15 @@ export function createViteAdapter(dataDir: string, server: ViteDevServer): Studi
         }
         return null;
       }
-      return { id, dir: realpathSync(projectDir) };
+      const project = { id, dir: realpathSync(projectDir) };
+      onResolveProject?.(project);
+      return project;
     },
 
-    async bundle(dir: string) {
+    async bundle(dir, options) {
       const bundler = await getBundler();
       if (!bundler) return null;
-      let html = await bundler(dir, { runtime: "placeholder", inlineColorGradingLuts: false });
+      let html = await bundler(dir, { ...PREVIEW_BUNDLE_OPTIONS, ...options });
       html = html.replace(
         'data-hyperframes-preview-runtime="1" src=""',
         `data-hyperframes-preview-runtime="1" src="${this.runtimeUrl}"`,
@@ -187,30 +297,34 @@ export function createViteAdapter(dataDir: string, server: ViteDevServer): Studi
     },
 
     async transformPreviewHtml({ html }) {
-      const producer = await import("../producer/src/services/deterministicFonts.js");
-      return producer.injectDeterministicFontFaces(html);
+      const fonts = await import("../core/src/fonts/deterministicFonts.js");
+      return fonts.injectDeterministicFontFaces(html);
     },
 
     getProjectSignature(projectDir: string): string {
-      const cacheKey = resolve(projectDir);
-      const cached = projectSignatureCache.get(cacheKey);
-      if (cached) return cached;
-      // Project dirs are symlinked from anywhere on disk (often outside the
-      // studio package), so Vite's default watch roots don't cover them.
-      // Without this, the signature cache never invalidates for external
-      // projects and the preview ETag serves stale 304s after edits.
-      server.watcher.add(cacheKey);
-      const signature = createProjectSignature(cacheKey);
-      projectSignatureCache.set(cacheKey, signature);
-      return signature;
+      return signatureCache.get(projectDir);
     },
 
-    async lint(html: string, opts?: { filePath?: string }) {
+    invalidateProjectSignature(projectDir: string): void {
+      signatureCache.forget(projectDir);
+    },
+
+    async lint(html: string, opts?: { filePath?: string; isSubComposition?: boolean }) {
       const mod = await server.ssrLoadModule("@hyperframes/core/lint");
-      return await mod.lintHyperframeHtml(html, opts);
+      return await mod.lintHyperframeHtml(html, { ...opts, host: "studio" });
+    },
+
+    async lintProject(projectDir: string) {
+      const mod = await server.ssrLoadModule("@hyperframes/core/lint");
+      return await mod.lintProject(projectDir, undefined, { host: "studio" });
     },
 
     runtimeUrl: "/api/runtime.js",
+    serverOrigin: () =>
+      originForListeningAddress(
+        server.httpServer?.address(),
+        server.config.server.https ? "https" : "http",
+      ),
 
     rendersDir: () => resolve(dataDir, "../renders"),
 
@@ -231,7 +345,7 @@ export function createViteAdapter(dataDir: string, server: ViteDevServer): Studi
         state.status = "cancelled";
         for (const fp of [
           opts.outputPath,
-          opts.outputPath.replace(/\.(mp4|webm|mov)$/, ".meta.json"),
+          opts.outputPath.replace(/\.(mp4|webm|mov|gif)$/, ".meta.json"),
         ]) {
           try {
             if (existsSync(fp)) unlinkSync(fp);
@@ -248,15 +362,24 @@ export function createViteAdapter(dataDir: string, server: ViteDevServer): Studi
             if (systemChrome) process.env.PRODUCER_HEADLESS_SHELL_PATH = systemChrome;
           }
           const { createRenderJob, executeRenderJob } = await getProducerModule();
+          const allowOutsideProjectAssets = await outsideAssetsAllowed(
+            opts.project.dir,
+            opts.composition,
+          );
           const renderBodyScripts = createStudioDevRenderBodyScripts(opts.project.dir);
           const job = createRenderJob({
             fps: opts.fps,
             quality: opts.quality as "draft" | "standard" | "high",
             format: opts.format,
+            ...(opts.gifLoop !== undefined ? { gifLoop: opts.gifLoop } : {}),
             ...(renderBodyScripts.length > 0 ? { renderBodyScripts } : {}),
             outputResolution: opts.outputResolution,
             ...(opts.composition ? { entryFile: opts.composition } : {}),
             ...(opts.variables ? { variables: opts.variables } : {}),
+            ...encoderJobOptions(opts),
+            ...(opts.useGpu ? { useGpu: true } : {}),
+            ...(opts.pageMotionBlur ? { pageMotionBlur: opts.pageMotionBlur } : {}),
+            allowOutsideProjectAssets,
           });
           const onProgress = (j: { progress: number; currentStage?: string }) => {
             state.progress = j.progress;
@@ -275,12 +398,17 @@ export function createViteAdapter(dataDir: string, server: ViteDevServer): Studi
             removeCancelledOutput();
             return;
           }
+          if (job.audioLoweredDb !== undefined) state.audioLoweredDb = job.audioLoweredDb;
           state.status = "complete";
           state.progress = 100;
-          const metaPath = opts.outputPath.replace(/\.(mp4|webm|mov)$/, ".meta.json");
+          const metaPath = opts.outputPath.replace(/\.(mp4|webm|mov|gif)$/, ".meta.json");
           writeFileSync(
             metaPath,
-            JSON.stringify({ status: "complete", durationMs: Date.now() - startTime }),
+            JSON.stringify({
+              status: "complete",
+              durationMs: Date.now() - startTime,
+              ...(job.audioLoweredDb !== undefined ? { audioLoweredDb: job.audioLoweredDb } : {}),
+            }),
           );
         } catch (err) {
           if (abortController.signal.aborted) {
@@ -290,7 +418,7 @@ export function createViteAdapter(dataDir: string, server: ViteDevServer): Studi
           state.status = "failed";
           state.error = err instanceof Error ? err.message : String(err);
           try {
-            const metaPath = opts.outputPath.replace(/\.(mp4|webm|mov)$/, ".meta.json");
+            const metaPath = opts.outputPath.replace(/\.(mp4|webm|mov|gif)$/, ".meta.json");
             writeFileSync(metaPath, JSON.stringify({ status: "failed" }));
           } catch {
             /* ignore */
@@ -349,49 +477,6 @@ export function createViteAdapter(dataDir: string, server: ViteDevServer): Studi
         }
       }
       return items;
-    },
-
-    // fallow-ignore-next-line complexity
-    async installRegistryBlock(opts: {
-      project: ResolvedProject;
-      blockName: string;
-    }): Promise<{ written: string[]; block: RegistryItem }> {
-      const registryRoot = resolve(__dirname, "../../registry");
-      let itemDir = join(registryRoot, "blocks", opts.blockName);
-      if (!existsSync(join(itemDir, "registry-item.json"))) {
-        itemDir = join(registryRoot, "components", opts.blockName);
-      }
-      const manifestPath = join(itemDir, "registry-item.json");
-
-      if (!existsSync(manifestPath)) {
-        throw new Error(`Item "${opts.blockName}" not found in registry`);
-      }
-
-      const block = JSON.parse(readFileSync(manifestPath, "utf-8")) as RegistryItem;
-      const written: string[] = [];
-
-      for (const file of block.files) {
-        const sourcePath = join(itemDir, file.path);
-        const targetPath = resolve(opts.project.dir, file.target);
-
-        if (!isPathWithin(opts.project.dir, targetPath)) {
-          throw new Error(`Target path escapes project directory: ${file.target}`);
-        }
-
-        mkdirSync(dirname(targetPath), { recursive: true });
-
-        if (file.type === "hyperframes:composition") {
-          let content = readFileSync(sourcePath, "utf-8");
-          content = `<!-- hyperframes-registry-item: ${block.name} -->\n${content}`;
-          writeFileSync(targetPath, content, "utf-8");
-        } else {
-          copyFileSync(sourcePath, targetPath);
-        }
-
-        written.push(file.target);
-      }
-
-      return { written, block };
     },
   };
 }

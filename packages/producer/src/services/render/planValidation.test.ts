@@ -169,6 +169,26 @@ describe("parseFontFamilyValue", () => {
     expect(parseFontFamilyValue(`'My Custom Font', serif`)).toEqual(["My Custom Font", "serif"]);
   });
 
+  it("keeps a comma inside a quoted family name", () => {
+    expect(parseFontFamilyValue(`"Display, Condensed", serif`)).toEqual([
+      "Display, Condensed",
+      "serif",
+    ]);
+  });
+
+  it("keeps a var() fallback in a single token", () => {
+    expect(parseFontFamilyValue(`var(--brand-font, inherit), sans-serif`)).toEqual([
+      "var(--brand-font, inherit)",
+      "sans-serif",
+    ]);
+  });
+
+  it("keeps a nested var() fallback in a single token", () => {
+    expect(
+      parseFontFamilyValue(`var(--brand-font, var(--fallback-font, "Inter")), sans-serif`),
+    ).toEqual([`var(--brand-font, var(--fallback-font, "Inter"))`, "sans-serif"]);
+  });
+
   it("ignores empty entries (trailing commas)", () => {
     expect(parseFontFamilyValue(`Inter,,sans-serif`)).toEqual(["Inter", "sans-serif"]);
   });
@@ -193,6 +213,11 @@ describe("validateNoSystemFonts", () => {
 
   it("passes a composition with deterministic web fonts as primary", () => {
     expect(() => validateNoSystemFonts(CLEAN_HTML)).not.toThrow();
+  });
+
+  it("passes a font shorthand with a generic primary, as it did before shorthands loaded faces", () => {
+    const html = `<!doctype html><html><head><style>p { font: 16px system-ui; } b { font: bold 56px sans-serif; }</style></head><body>x</body></html>`;
+    expect(() => validateNoSystemFonts(html)).not.toThrow();
   });
 
   it("passes when font-family is absent entirely (plain text composition)", () => {
@@ -288,6 +313,18 @@ describe("validateNoSystemFonts", () => {
     expect(caught).toBeInstanceOf(PlanValidationError);
     expect((caught as PlanValidationError).code).toBe(SYSTEM_FONT_USED);
     expect((caught as Error).message).toContain(`"-apple-system"`);
+  });
+
+  it("checks the fallback of an undefined CSS var() primary", () => {
+    const offending = `<style>body { font-family: var(--ui-font, -apple-system, sans-serif); }</style>`;
+    expect(() => validateNoSystemFonts(offending)).toThrow(`"-apple-system"`);
+    const ok = `<style>body { font-family: var(--ui-font, "Inter", sans-serif); }</style>`;
+    expect(() => validateNoSystemFonts(ok)).not.toThrow();
+  });
+
+  it.each(["serif", "system-ui"])("accepts var(--x,), %s, which the browser inherits", (rest) => {
+    const html = `<style>body { font-family: var(--x,), ${rest}; }</style>`;
+    expect(() => validateNoSystemFonts(html)).not.toThrow();
   });
 
   it("accepts CSS var() primary aliases that resolve to deterministic fonts", () => {
