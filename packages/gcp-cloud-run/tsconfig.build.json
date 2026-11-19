@@ -1,20 +1,7 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "paths": {
-      "@hyperframes/core": ["../core/dist/index.d.ts"],
-      "@hyperframes/core/*": ["../core/dist/*"],
-      "@hyperframes/lint": ["../lint/dist/index.d.ts"],
-      "@hyperframes/producer": ["../producer/dist/index.d.ts"],
-      "@hyperframes/producer/distributed": ["../producer/dist/distributed.d.ts"],
-      "@hyperframes/studio-server": ["../studio-server/dist/index.d.ts"],
-      "@hyperframes/studio-server/encoder-options": [
-        "../studio-server/dist/helpers/encoderOptions.d.ts"
-      ],
-      "@hyperframes/studio-server/request-identity": [
-        "../studio-server/dist/helpers/requestIdentity.d.ts"
-      ]
-    },
+    "paths": {},
     "noEmit": false,
     "outDir": "./dist",
     "rootDir": "./src",
